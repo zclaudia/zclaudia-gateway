@@ -1,0 +1,37 @@
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      network: host
+    restart: unless-stopped
+    ports:
+      - "${GATEWAY_PORT:-3200}:${GATEWAY_PORT:-3200}"
+    environment:
+      - GATEWAY_SECRET=${GATEWAY_SECRET:?Please set GATEWAY_SECRET in .env}
+      - GATEWAY_PORT=${GATEWAY_PORT:-3200}
+      - NTFY_ENABLED=${NTFY_ENABLED:-false}
+      - NTFY_URL=${NTFY_URL:-https://ntfy.sh}
+      - NTFY_TOPIC=${NTFY_TOPIC:-}
+      - NTFY_AUTH_MODE=${NTFY_AUTH_MODE:-none}
+      - NTFY_PUBLISH_TOKEN=${NTFY_PUBLISH_TOKEN:-}
+      - NTFY_SUBSCRIBE_TOKEN=${NTFY_SUBSCRIBE_TOKEN:-}
+      - NTFY_USERNAME=${NTFY_USERNAME:-}
+      - NTFY_PASSWORD=${NTFY_PASSWORD:-}
+      - NTFY_NOTIFY_PERMISSION_REQUEST=${NTFY_NOTIFY_PERMISSION_REQUEST:-true}
+      - NTFY_NOTIFY_PROMPT_REQUEST=${NTFY_NOTIFY_PROMPT_REQUEST:-true}
+      - NTFY_NOTIFY_RUN_COMPLETED=${NTFY_NOTIFY_RUN_COMPLETED:-true}
+      - NTFY_NOTIFY_RUN_FAILED=${NTFY_NOTIFY_RUN_FAILED:-true}
+      - NTFY_NOTIFY_BACKGROUND_PERMISSION=${NTFY_NOTIFY_BACKGROUND_PERMISSION:-true}
+      - NTFY_NOTIFY_PROCESS_LEAK=${NTFY_NOTIFY_PROCESS_LEAK:-true}
+    volumes:
+      - gateway-data:/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:${GATEWAY_PORT:-3200}/health').then(r=>r.ok?process.exit(0):process.exit(1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  gateway-data:
