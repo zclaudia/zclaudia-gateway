@@ -65,11 +65,13 @@ function waitForMessage(ws: WebSocket, type: string, timeoutMs = 1000): Promise<
 async function registerBackend(ws: WebSocket, identity: { deviceId: string; instanceId: string; name?: string }): Promise<string> {
   ws.send(JSON.stringify({
     type: 'peer_hello',
-    protocolVersion: 2,
+    protocolVersion: 3,
+    namespace: 'zclaudia',
+    clientProtocolVersion: 1,
     peerType: 'client+backend',
     gatewaySecret: GATEWAY_SECRET,
     identity,
-    backend: { visible: true, capabilities: [] }
+    backend: { visible: true, capabilities: [], backendProtocolVersion: 1 }
   }));
   const ready = await waitForMessage(ws, 'peer_ready');
   return ready.backend.backendId;

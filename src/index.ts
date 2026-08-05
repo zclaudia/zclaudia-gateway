@@ -30,6 +30,24 @@ function parseAuthModeEnv(value: string | undefined): NotificationAuthMode {
   process.exit(1);
 }
 
+function parseListEnv(value: string | undefined): string[] {
+  if (!value) return [];
+  return value
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry !== '');
+}
+
+function parseSeverityEnv(value: string | undefined): NotificationConfig['minSeverity'] {
+  const normalized = value?.trim().toLowerCase();
+  if (!normalized) return undefined;
+  if (normalized === 'info' || normalized === 'success' || normalized === 'warning' || normalized === 'error') {
+    return normalized;
+  }
+  console.error(`Error: invalid NTFY_MIN_SEVERITY: ${value}. Expected info, success, warning, or error.`);
+  process.exit(1);
+}
+
 function parseNotificationConfigFromEnv(): Partial<NotificationConfig> {
   const ntfyUrl = process.env.NTFY_URL?.trim();
   if (ntfyUrl) {
@@ -44,7 +62,6 @@ function parseNotificationConfigFromEnv(): Partial<NotificationConfig> {
     }
   }
 
-  const eventDefaults = DEFAULT_NOTIFICATION_CONFIG.events;
   const ntfyAuthMode = parseAuthModeEnv(process.env.NTFY_AUTH_MODE);
   const ntfyPublishToken = process.env.NTFY_PUBLISH_TOKEN?.trim() ?? '';
   const ntfySubscribeToken = process.env.NTFY_SUBSCRIBE_TOKEN?.trim() ?? ntfyPublishToken;
@@ -69,14 +86,9 @@ function parseNotificationConfigFromEnv(): Partial<NotificationConfig> {
     ntfySubscribeToken,
     ntfyUsername,
     ntfyPassword,
-    events: {
-      permissionRequest: parseBooleanEnv(process.env.NTFY_NOTIFY_PERMISSION_REQUEST, eventDefaults.permissionRequest),
-      promptRequest: parseBooleanEnv(process.env.NTFY_NOTIFY_PROMPT_REQUEST, eventDefaults.promptRequest),
-      runCompleted: parseBooleanEnv(process.env.NTFY_NOTIFY_RUN_COMPLETED, eventDefaults.runCompleted),
-      runFailed: parseBooleanEnv(process.env.NTFY_NOTIFY_RUN_FAILED, eventDefaults.runFailed),
-      backgroundPermission: parseBooleanEnv(process.env.NTFY_NOTIFY_BACKGROUND_PERMISSION, eventDefaults.backgroundPermission),
-      processLeak: parseBooleanEnv(process.env.NTFY_NOTIFY_PROCESS_LEAK, eventDefaults.processLeak),
-    },
+    eventAllowlist: parseListEnv(process.env.NTFY_EVENT_ALLOWLIST),
+    eventDenylist: parseListEnv(process.env.NTFY_EVENT_DENYLIST),
+    minSeverity: parseSeverityEnv(process.env.NTFY_MIN_SEVERITY),
   };
 }
 

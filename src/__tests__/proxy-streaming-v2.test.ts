@@ -60,7 +60,9 @@ function waitForMessage<T = any>(ws: WebSocket, type: string, timeoutMs = 1000):
 async function registerBackend(ws: WebSocket, name: string) {
   ws.send(JSON.stringify({
     type: 'peer_hello',
-    protocolVersion: 2,
+    protocolVersion: 3,
+    namespace: 'zclaudia',
+    clientProtocolVersion: 1,
     peerType: 'client+backend',
     gatewaySecret: GATEWAY_SECRET,
     identity: {
@@ -72,6 +74,7 @@ async function registerBackend(ws: WebSocket, name: string) {
     backend: {
       visible: true,
       capabilities: [],
+      backendProtocolVersion: 1,
     },
   }));
 

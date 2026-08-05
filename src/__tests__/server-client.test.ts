@@ -81,11 +81,13 @@ const delay = (ms: number) => new Promise(r => setTimeout(r, ms));
 async function registerBackendV2(ws: WebSocket, identity: { deviceId: string; instanceId: string; name?: string }, visible = true): Promise<{ backendId: string; epoch: number }> {
   ws.send(JSON.stringify({
     type: 'peer_hello',
-    protocolVersion: 2,
+    protocolVersion: 3,
+    namespace: 'zclaudia',
+    clientProtocolVersion: 1,
     peerType: 'client+backend',
     gatewaySecret: GATEWAY_SECRET,
     identity,
-    backend: { visible, capabilities: [] }
+    backend: { visible, capabilities: [], backendProtocolVersion: 1 }
   }));
   const ready = await waitForMessage(ws, 'peer_ready');
   return { backendId: ready.backend.backendId, epoch: ready.backend.epoch };
@@ -95,7 +97,9 @@ async function registerBackendV2(ws: WebSocket, identity: { deviceId: string; in
 async function registerClientV2(ws: WebSocket): Promise<{ peerSessionId: string; registrySync: any }> {
   ws.send(JSON.stringify({
     type: 'peer_hello',
-    protocolVersion: 2,
+    protocolVersion: 3,
+    namespace: 'zclaudia',
+    clientProtocolVersion: 1,
     peerType: 'client-only',
     gatewaySecret: GATEWAY_SECRET,
     identity: { deviceId: 'client-dev', instanceId: `client-inst-${Date.now()}-${Math.random()}` }

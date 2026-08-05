@@ -18,9 +18,9 @@ import type {
   RegistrySnapshotMessage,
   BackendHeartbeatMessage,
   HeartbeatAckMessage,
-  BackendDataSnapshotMessage,
-  BackendDataEventMessage,
-  RequestBackendDataSnapshotMessage,
+  BackendResourceSnapshotMessage,
+  BackendResourceEventMessage,
+  RequestBackendResourceSnapshotMessage,
   SubscribeBackendMessage,
   BackendSubscribedMessage,
   UnsubscribeBackendMessage,
@@ -28,11 +28,11 @@ import type {
   BackendClientMessage,
   BackendServerMessage,
   StreamDemandMessage,
-  BackendRunStreamEvent,
-  RunStreamEvent,
-  CatchUpSessionContentMessage,
-  SessionContentPatchMessage,
-  SessionContentPatchErrorMessage,
+  BackendStreamEvent,
+  GatewayStreamEvent,
+  CatchUpContentMessage,
+  ContentPatchMessage,
+  ContentPatchErrorMessage,
   SubscriberDisconnectedMessage,
   GatewayErrorMessage,
   GatewayHttpProxyRequest,
@@ -89,7 +89,9 @@ function validatePeerHelloMessage(message: unknown): string | null {
   const msg = message as Record<string, unknown>;
   if (msg.type !== 'peer_hello') return 'First message must be peer_hello';
   if (typeof msg.gatewaySecret !== 'string') return 'peer_hello.gatewaySecret must be a string';
-  if (msg.protocolVersion !== 2) return 'peer_hello.protocolVersion must be 2';
+  if (msg.protocolVersion !== 3) return 'peer_hello.protocolVersion must be 3';
+  if (typeof msg.namespace !== 'string' || !msg.namespace) return 'peer_hello.namespace must be a non-empty string';
+  if (typeof msg.clientProtocolVersion !== 'number') return 'peer_hello.clientProtocolVersion must be a number';
   if (msg.peerType !== 'client-only' && msg.peerType !== 'client+backend') {
     return 'peer_hello.peerType must be client-only or client+backend';
   }
@@ -104,6 +106,7 @@ function validatePeerHelloMessage(message: unknown): string | null {
     const backend = msg.backend as Record<string, unknown>;
     if (typeof backend.visible !== 'boolean') return 'peer_hello.backend.visible must be a boolean';
     if (!Array.isArray(backend.capabilities)) return 'peer_hello.backend.capabilities must be an array';
+    if (typeof backend.backendProtocolVersion !== 'number') return 'peer_hello.backend.backendProtocolVersion must be a number';
   }
   return null;
 }
@@ -524,8 +527,8 @@ export function createGatewayServer(config: GatewayConfig): Server {
     if (!safeCompare(message.gatewaySecret, config.gatewaySecret)) {
       sendToWs(ws, { type: 'gateway_error', code: 'UNAUTHORIZED', message: 'Invalid gateway secret' } satisfies GatewayErrorMessage); ws.close(); return null;
     }
-    if (message.protocolVersion !== 2) {
-      sendToWs(ws, { type: 'gateway_error', code: 'PROTOCOL_VERSION_MISMATCH', message: `Expected protocol version 2, got ${message.protocolVersion}` } satisfies GatewayErrorMessage); ws.close(); return null;
+    if (message.protocolVersion !== 3) {
+      sendToWs(ws, { type: 'gateway_error', code: 'PROTOCOL_VERSION_MISMATCH', message: `Expected protocol version 3, got ${message.protocolVersion}` } satisfies GatewayErrorMessage); ws.close(); return null;
     }
     const peerSessionId = uuidv4();
     const recoveryToken = crypto.randomBytes(32).toString('hex');
@@ -554,7 +557,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
         handleBackendOwnerReplaced(backendId, previousLease.epoch, epoch, previousLease.peerSessionId);
       }
       state.addLease({ backendId, epoch, peerSessionId, leaseTtlMs: state.config.defaultLeaseTtlMs, lastHeartbeatAt: Date.now(), leaseTimer: null });
-      const presence: BackendPresence = { backendId, instanceId: identity.instanceId, deviceId: identity.deviceId, name: identity.name || '', channel, visible: message.backend.visible, capabilities: message.backend.capabilities, epoch, connectedAt: Date.now(), lastSeenAt: Date.now() };
+      const presence: BackendPresence = { namespace: message.namespace, backendId, instanceId: identity.instanceId, deviceId: identity.deviceId, name: identity.name || '', channel, visible: message.backend.visible, capabilities: message.backend.capabilities, backendProtocolVersion: message.backend.backendProtocolVersion, minClientProtocolVersion: message.backend.minClientProtocolVersion, epoch, connectedAt: Date.now(), lastSeenAt: Date.now() };
       state.registryUpsert(presence);
       state.streamDemand.set(backendId, { subscriberCount: 0, active: false });
       backendInfo = { backendId, epoch, leaseTtlMs: state.config.defaultLeaseTtlMs };
@@ -563,7 +566,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
     state.addPeer(peer);
     recoveryTokens.set(recoveryToken, peerSessionId);
     const registrySync: RegistrySyncPayload = { items: state.getRegistrySnapshot() };
-    const ready: PeerReadyMessage = { type: 'peer_ready', protocolVersion: 2, peerSessionId, recoveryToken, backend: backendInfo, registrySync };
+    const ready: PeerReadyMessage = { type: 'peer_ready', protocolVersion: 3, peerSessionId, recoveryToken, backend: backendInfo, registrySync };
     sendToWs(ws, ready);
 
     if (peer.backendId) {
@@ -582,18 +585,18 @@ export function createGatewayServer(config: GatewayConfig): Server {
     if (!peer) return;
     switch (message.type) {
       case 'backend_heartbeat': handleBackendHeartbeat(peer, message); break;
-      case 'backend_data_snapshot': handleBackendDataSnapshot(peer, message); break;
-      case 'backend_data_event': handleBackendDataEvent(peer, message); break;
-      case 'run_stream_event': handleBackendRunStreamEvent(peer, message); break;
+      case 'backend_resource_snapshot': handleBackendResourceSnapshot(peer, message); break;
+      case 'backend_resource_event': handleBackendResourceEvent(peer, message); break;
+      case 'backend_stream_event': handleBackendStreamEvent(peer, message); break;
       case 'request_registry_snapshot': handleRequestRegistrySnapshot(peer); break;
-      case 'request_backend_data_snapshot': handleRequestBackendDataSnapshot(peer, message); break;
+      case 'request_backend_resource_snapshot': handleRequestBackendResourceSnapshot(peer, message); break;
       case 'subscribe_backend': handleSubscribeBackend(peer, message); break;
       case 'unsubscribe_backend': handleUnsubscribeBackend(peer, message); break;
       case 'backend_client_message': handleBackendClientMessage(peer, message); break;
       case 'backend_server_message': handleBackendServerMessage(peer, message); break;
-      case 'session_content_patch': handleSessionContentPatch(peer, message); break;
-      case 'session_content_patch_error': handleSessionContentPatchError(peer, message); break;
-      case 'catch_up_session_content': handleCatchUpSessionContent(peer, message); break;
+      case 'content_patch': handleContentPatch(peer, message); break;
+      case 'content_patch_error': handleContentPatchError(peer, message); break;
+      case 'catch_up_content': handleCatchUpContent(peer, message); break;
       case 'http_proxy_response': handleHttpProxyResponse(message); break;
       case 'http_proxy_response_start': handleHttpProxyResponseStart(message); break;
       case 'http_proxy_response_chunk': handleHttpProxyResponseChunk(message); break;
@@ -619,7 +622,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
     sendToWs(peer.ws, { type: 'heartbeat_ack', epoch: msg.epoch, streamDemand: state.getStreamDemand(backendId) } satisfies HeartbeatAckMessage);
   }
 
-  function handleBackendDataSnapshot(peer: PeerSession, msg: BackendDataSnapshotMessage): void {
+  function handleBackendResourceSnapshot(peer: PeerSession, msg: BackendResourceSnapshotMessage): void {
     if (!isCurrentBackendOwner(peer)) return;
     const backendId = peer.backendId!;
     // Pure relay: forward to all subscribers, adding backendId for routing
@@ -631,7 +634,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
     }
   }
 
-  function handleBackendDataEvent(peer: PeerSession, msg: BackendDataEventMessage): void {
+  function handleBackendResourceEvent(peer: PeerSession, msg: BackendResourceEventMessage): void {
     if (!isCurrentBackendOwner(peer)) return;
     const backendId = peer.backendId!;
     // Pure relay: forward to all subscribers, adding backendId for routing
@@ -643,12 +646,12 @@ export function createGatewayServer(config: GatewayConfig): Server {
     }
   }
 
-  function handleBackendRunStreamEvent(peer: PeerSession, msg: BackendRunStreamEvent): void {
+  function handleBackendStreamEvent(peer: PeerSession, msg: BackendStreamEvent): void {
     if (!isCurrentBackendOwner(peer)) return;
     const backendId = peer.backendId!;
     const subscribers = state.getSubscribers(backendId);
     if (subscribers.size === 0) return;
-    const clientEvent: RunStreamEvent = { type: 'run_stream_event', eventType: msg.eventType, backendId, sessionId: msg.sessionId, runId: msg.runId, seq: msg.seq, payload: msg.payload };
+    const clientEvent: GatewayStreamEvent = { type: 'backend_stream_event', backendId, streamId: msg.streamId, eventName: msg.eventName, seq: msg.seq, channel: msg.channel, payload: msg.payload, metadata: msg.metadata };
     for (const subId of subscribers) {
       const clientPeer = state.peers.get(subId);
       if (clientPeer) sendToWs(clientPeer.ws, clientEvent);
@@ -663,14 +666,14 @@ export function createGatewayServer(config: GatewayConfig): Server {
     sendToWs(peer.ws, { type: 'registry_snapshot', items: state.getRegistrySnapshot() } satisfies RegistrySnapshotMessage);
   }
 
-  function handleRequestBackendDataSnapshot(peer: PeerSession, msg: RequestBackendDataSnapshotMessage): void {
+  function handleRequestBackendResourceSnapshot(peer: PeerSession, msg: RequestBackendResourceSnapshotMessage): void {
     // Relay request to the backend peer so it can push a fresh snapshot
     const bp = findBackendPeer(msg.backendId);
     if (!bp) {
       sendToWs(peer.ws, { type: 'gateway_error', code: 'BACKEND_OFFLINE', message: `Backend ${msg.backendId} not found or offline`, recovery: 'reconnect' } satisfies GatewayErrorMessage);
       return;
     }
-    sendToWs(bp.ws, { type: 'request_backend_data_snapshot', backendId: msg.backendId } satisfies RequestBackendDataSnapshotMessage);
+    sendToWs(bp.ws, { type: 'request_backend_resource_snapshot', backendId: msg.backendId, resourceTypes: msg.resourceTypes, targetPeerSessionId: msg.targetPeerSessionId } satisfies RequestBackendResourceSnapshotMessage);
   }
 
   function handleSubscribeBackend(peer: PeerSession, msg: SubscribeBackendMessage): void {
@@ -689,7 +692,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
     const demandChanged = state.addSubscription(msg.backendId, peer.peerSessionId);
     if (demandChanged) {
       const bp = findBackendPeer(msg.backendId);
-      if (bp) sendToWs(bp.ws, { type: 'stream_demand', active: true } satisfies StreamDemandMessage);
+      if (bp) sendToWs(bp.ws, { type: 'backend_stream_demand', active: true } satisfies StreamDemandMessage);
     }
     sendToWs(peer.ws, { type: 'backend_subscribed', backendId: msg.backendId, epoch: lease.epoch, capabilities: presence.capabilities } satisfies BackendSubscribedMessage);
     // Request a fresh data snapshot for new subscriptions.
@@ -699,10 +702,10 @@ export function createGatewayServer(config: GatewayConfig): Server {
       const bp = findBackendPeer(msg.backendId);
       if (bp) {
         sendToWs(bp.ws, {
-          type: 'request_backend_data_snapshot',
+          type: 'request_backend_resource_snapshot',
           backendId: msg.backendId,
           targetPeerSessionId: peer.peerSessionId,
-        } satisfies RequestBackendDataSnapshotMessage);
+        } satisfies RequestBackendResourceSnapshotMessage);
       }
     }
   }
@@ -716,7 +719,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
       sendToWs(bp.ws, { type: 'subscriber_disconnected', backendId: msg.backendId, peerSessionId: peer.peerSessionId } satisfies SubscriberDisconnectedMessage);
     }
     if (demandChanged && bp) {
-      sendToWs(bp.ws, { type: 'stream_demand', active: false } satisfies StreamDemandMessage);
+      sendToWs(bp.ws, { type: 'backend_stream_demand', active: false } satisfies StreamDemandMessage);
     }
   }
 
@@ -755,7 +758,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
     }
   }
 
-  function handleSessionContentPatch(peer: PeerSession, msg: SessionContentPatchMessage): void {
+  function handleContentPatch(peer: PeerSession, msg: ContentPatchMessage): void {
     if (!isCurrentBackendOwner(peer)) return;
     const backendId = peer.backendId!;
     if (msg.backendId !== backendId) return;
@@ -766,7 +769,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
     }
   }
 
-  function handleSessionContentPatchError(peer: PeerSession, msg: SessionContentPatchErrorMessage): void {
+  function handleContentPatchError(peer: PeerSession, msg: ContentPatchErrorMessage): void {
     if (!isCurrentBackendOwner(peer)) return;
     const backendId = peer.backendId!;
     if (msg.backendId !== backendId) return;
@@ -777,14 +780,14 @@ export function createGatewayServer(config: GatewayConfig): Server {
     }
   }
 
-  function handleCatchUpSessionContent(peer: PeerSession, msg: CatchUpSessionContentMessage): void {
+  function handleCatchUpContent(peer: PeerSession, msg: CatchUpContentMessage): void {
     const subscribers = state.getSubscribers(msg.backendId);
     if (!subscribers.has(peer.peerSessionId)) {
       sendToWs(peer.ws, { type: 'gateway_error', code: 'BACKEND_NOT_SUBSCRIBED', message: 'Not subscribed to backend', recovery: 'resubscribe' } satisfies GatewayErrorMessage); return;
     }
     const bp = findBackendPeer(msg.backendId);
     if (!bp) { sendToWs(peer.ws, { type: 'gateway_error', code: 'BACKEND_OFFLINE', message: 'Backend offline', recovery: 'reconnect' } satisfies GatewayErrorMessage); return; }
-    sendToWs(bp.ws, { type: 'catch_up_session_content', backendId: msg.backendId, sessionId: msg.sessionId, afterOffset: msg.afterOffset });
+    sendToWs(bp.ws, { type: 'catch_up_content', backendId: msg.backendId, contentStreamId: msg.contentStreamId, afterOffset: msg.afterOffset } satisfies CatchUpContentMessage);
   }
 
   // ========================================================================
@@ -868,7 +871,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
       for (const bid of affectedBackends) {
         if (!state.getStreamDemand(bid)) {
           const bp = findBackendPeer(bid);
-          if (bp) sendToWs(bp.ws, { type: 'stream_demand', active: false } satisfies StreamDemandMessage);
+          if (bp) sendToWs(bp.ws, { type: 'backend_stream_demand', active: false } satisfies StreamDemandMessage);
         }
       }
       peer.ws.terminate();
@@ -911,7 +914,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
         // Notify backend to clean up this client's server-side state
         sendToWs(bp.ws, { type: 'subscriber_disconnected', backendId, peerSessionId } satisfies SubscriberDisconnectedMessage);
         if (!state.getStreamDemand(backendId)) {
-          sendToWs(bp.ws, { type: 'stream_demand', active: false } satisfies StreamDemandMessage);
+          sendToWs(bp.ws, { type: 'backend_stream_demand', active: false } satisfies StreamDemandMessage);
         }
       }
     }

@@ -72,11 +72,13 @@ function waitForMessage(ws: WebSocket, type: string, timeoutMs = 1000): Promise<
 function sendBackendHello(ws: WebSocket, secret: string | null, identity: { deviceId: string; instanceId: string; name?: string }, visible = true) {
   ws.send(JSON.stringify({
     type: 'peer_hello',
-    protocolVersion: 2,
+    protocolVersion: 3,
+    namespace: 'zclaudia',
+    clientProtocolVersion: 1,
     peerType: 'client+backend',
     gatewaySecret: secret,
     identity,
-    backend: { visible, capabilities: [] }
+    backend: { visible, capabilities: [], backendProtocolVersion: 1 }
   }));
 }
 
@@ -84,7 +86,9 @@ function sendBackendHello(ws: WebSocket, secret: string | null, identity: { devi
 function sendClientHello(ws: WebSocket, secret: string | null) {
   ws.send(JSON.stringify({
     type: 'peer_hello',
-    protocolVersion: 2,
+    protocolVersion: 3,
+    namespace: 'zclaudia',
+    clientProtocolVersion: 1,
     peerType: 'client-only',
     gatewaySecret: secret,
     identity: { deviceId: 'client-dev', instanceId: 'client-inst' }

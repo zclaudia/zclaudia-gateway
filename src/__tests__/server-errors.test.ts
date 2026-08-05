@@ -68,11 +68,13 @@ const delay = (ms: number) => new Promise(r => setTimeout(r, ms));
 async function registerBackendV2(ws: WebSocket, identity: { deviceId: string; instanceId: string; name?: string }): Promise<{ backendId: string; epoch: number }> {
   ws.send(JSON.stringify({
     type: 'peer_hello',
-    protocolVersion: 2,
+    protocolVersion: 3,
+    namespace: 'zclaudia',
+    clientProtocolVersion: 1,
     peerType: 'client+backend',
     gatewaySecret: GATEWAY_SECRET,
     identity,
-    backend: { visible: true, capabilities: [] }
+    backend: { visible: true, capabilities: [], backendProtocolVersion: 1 }
   }));
   const ready = await waitForMessage(ws, 'peer_ready');
   return { backendId: ready.backend.backendId, epoch: ready.backend.epoch };
@@ -323,11 +325,13 @@ describeIfLoopback('Gateway Error Handling', () => {
       // Start auth but don't wait for response
       ws.send(JSON.stringify({
         type: 'peer_hello',
-        protocolVersion: 2,
+        protocolVersion: 3,
+        namespace: 'zclaudia',
+        clientProtocolVersion: 1,
         peerType: 'client+backend',
         gatewaySecret: GATEWAY_SECRET,
         identity: { deviceId: 'early-disconnect-device', instanceId: 'inst-early-disconnect-device', name: 'Early Disconnect' },
-        backend: { visible: true, capabilities: [] }
+        backend: { visible: true, capabilities: [], backendProtocolVersion: 1 }
       }));
 
       // Disconnect immediately
@@ -383,11 +387,13 @@ describeIfLoopback('Gateway Error Handling', () => {
 
       ws.send(JSON.stringify({
         type: 'peer_hello',
-        protocolVersion: 2,
+        protocolVersion: 3,
+        namespace: 'zclaudia',
+        clientProtocolVersion: 1,
         peerType: 'client+backend',
         gatewaySecret: null,
         identity: { deviceId: 'null-test-device', instanceId: 'inst-null-test-device', name: null },
-        backend: { visible: true, capabilities: [] }
+        backend: { visible: true, capabilities: [], backendProtocolVersion: 1 }
       }));
 
       // Should be rejected — null gatewaySecret fails validation
@@ -403,11 +409,13 @@ describeIfLoopback('Gateway Error Handling', () => {
 
       ws.send(JSON.stringify({
         type: 'peer_hello',
-        protocolVersion: 2,
+        protocolVersion: 3,
+        namespace: 'zclaudia',
+        clientProtocolVersion: 1,
         peerType: 'client+backend',
         gatewaySecret: '',
         identity: { deviceId: '', instanceId: '', name: '' },
-        backend: { visible: true, capabilities: [] }
+        backend: { visible: true, capabilities: [], backendProtocolVersion: 1 }
       }));
 
       // Should be rejected — empty secret won't match

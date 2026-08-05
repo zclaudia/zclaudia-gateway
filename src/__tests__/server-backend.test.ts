@@ -81,11 +81,13 @@ const delay = (ms: number) => new Promise(r => setTimeout(r, ms));
 async function registerBackendV2(ws: WebSocket, identity: { deviceId: string; instanceId: string; name?: string }, visible = true): Promise<{ backendId: string; epoch: number; peerSessionId: string }> {
   ws.send(JSON.stringify({
     type: 'peer_hello',
-    protocolVersion: 2,
+    protocolVersion: 3,
+    namespace: 'zclaudia',
+    clientProtocolVersion: 1,
     peerType: 'client+backend',
     gatewaySecret: GATEWAY_SECRET,
     identity,
-    backend: { visible, capabilities: [] }
+    backend: { visible, capabilities: [], backendProtocolVersion: 1 }
   }));
   const ready = await waitForMessage(ws, 'peer_ready');
   return { backendId: ready.backend.backendId, epoch: ready.backend.epoch, peerSessionId: ready.peerSessionId };
@@ -95,7 +97,9 @@ async function registerBackendV2(ws: WebSocket, identity: { deviceId: string; in
 async function registerClientV2(ws: WebSocket): Promise<{ peerSessionId: string; registrySync: any }> {
   ws.send(JSON.stringify({
     type: 'peer_hello',
-    protocolVersion: 2,
+    protocolVersion: 3,
+    namespace: 'zclaudia',
+    clientProtocolVersion: 1,
     peerType: 'client-only',
     gatewaySecret: GATEWAY_SECRET,
     identity: { deviceId: 'client-dev', instanceId: `client-inst-${Date.now()}-${Math.random()}` }
@@ -271,7 +275,7 @@ describeIfLoopback('Gateway Backend Message Handling', () => {
       expect(msg.payload.action).toBe('response');
     });
 
-    test('should ignore session_content_patch with mismatched backendId', async () => {
+    test('should ignore content_patch with mismatched backendId', async () => {
       const clientWs = new WebSocket(WS_URL);
       await waitForOpen(clientWs);
       openClients.push(clientWs);
@@ -287,7 +291,7 @@ describeIfLoopback('Gateway Backend Message Handling', () => {
       await waitForMessage(clientWs, 'backend_subscribed');
 
       backendWs.send(JSON.stringify({
-        type: 'session_content_patch',
+        type: 'content_patch',
         backendId: 'wrong-backend',
         sessionId: 'session-1',
         messages: [],
@@ -295,10 +299,10 @@ describeIfLoopback('Gateway Backend Message Handling', () => {
       }));
 
       await delay(50);
-      expect(clientCollector.find((message) => message.type === 'session_content_patch')).toBeUndefined();
+      expect(clientCollector.find((message) => message.type === 'content_patch')).toBeUndefined();
     });
 
-    test('should ignore session_content_patch_error with mismatched backendId', async () => {
+    test('should ignore content_patch_error with mismatched backendId', async () => {
       const clientWs = new WebSocket(WS_URL);
       await waitForOpen(clientWs);
       openClients.push(clientWs);
@@ -314,7 +318,7 @@ describeIfLoopback('Gateway Backend Message Handling', () => {
       await waitForMessage(clientWs, 'backend_subscribed');
 
       backendWs.send(JSON.stringify({
-        type: 'session_content_patch_error',
+        type: 'content_patch_error',
         backendId: 'wrong-backend',
         sessionId: 'session-1',
         afterOffset: 0,
@@ -322,7 +326,7 @@ describeIfLoopback('Gateway Backend Message Handling', () => {
       }));
 
       await delay(50);
-      expect(clientCollector.find((message) => message.type === 'session_content_patch_error')).toBeUndefined();
+      expect(clientCollector.find((message) => message.type === 'content_patch_error')).toBeUndefined();
     });
   });
 

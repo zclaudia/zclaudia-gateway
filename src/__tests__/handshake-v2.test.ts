@@ -83,11 +83,13 @@ describe('Gateway handshake v2', () => {
 
     ws.send(JSON.stringify({
       type: 'peer_hello',
-      protocolVersion: 2,
+      protocolVersion: 3,
+      namespace: 'zclaudia',
+      clientProtocolVersion: 1,
       peerType: 'client+backend',
       gatewaySecret: null,
       identity: { deviceId: 'device-a', instanceId: 'instance-a' },
-      backend: { visible: true, capabilities: [] },
+      backend: { visible: true, capabilities: [], backendProtocolVersion: 1 },
     }));
 
     const error = await waitForMessage<{ type: 'gateway_error'; message: string }>(ws, 'gateway_error');
@@ -104,7 +106,9 @@ describe('Gateway handshake v2', () => {
 
     ws.send(JSON.stringify({
       type: 'peer_hello',
-      protocolVersion: 2,
+      protocolVersion: 3,
+      namespace: 'zclaudia',
+      clientProtocolVersion: 1,
       peerType: 'client+backend',
       gatewaySecret: GATEWAY_SECRET,
       identity: {
@@ -113,7 +117,7 @@ describe('Gateway handshake v2', () => {
         channel: 'test',
         name: 'Valid Backend',
       },
-      backend: { visible: true, capabilities: [] },
+      backend: { visible: true, capabilities: [], backendProtocolVersion: 1 },
     }));
 
     const ready = await waitForMessage<{ type: 'peer_ready'; backend?: { backendId: string } }>(ws, 'peer_ready');

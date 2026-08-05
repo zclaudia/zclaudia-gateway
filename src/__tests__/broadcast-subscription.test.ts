@@ -121,11 +121,13 @@ describe('Gateway v2 backend data relay', () => {
     backendCollector = new MessageCollector(backendWs);
     backendWs.send(JSON.stringify({
       type: 'peer_hello',
-      protocolVersion: 2,
+      protocolVersion: 3,
+      namespace: 'zclaudia',
+      clientProtocolVersion: 1,
       peerType: 'client+backend',
       gatewaySecret: GATEWAY_SECRET,
       identity: { deviceId: 'test-device-broadcast', instanceId: 'inst-test-device-broadcast', name: 'Test Backend' },
-      backend: { visible: true, capabilities: [] }
+      backend: { visible: true, capabilities: [], backendProtocolVersion: 1 }
     }));
     const regResult = await backendCollector.waitFor('peer_ready');
     backendId = regResult.backend.backendId;
@@ -147,7 +149,9 @@ describe('Gateway v2 backend data relay', () => {
 
     clientWs.send(JSON.stringify({
       type: 'peer_hello',
-      protocolVersion: 2,
+      protocolVersion: 3,
+      namespace: 'zclaudia',
+      clientProtocolVersion: 1,
       peerType: 'client-only',
       gatewaySecret: GATEWAY_SECRET,
       identity: { deviceId: 'client-dev', instanceId: `client-inst-${Date.now()}-${Math.random()}` }
@@ -158,25 +162,25 @@ describe('Gateway v2 backend data relay', () => {
     clientWs.send(JSON.stringify({ type: 'subscribe_backend', backendId }));
     await collector.waitFor('backend_subscribed');
 
-    // Backend receives request_backend_data_snapshot — respond with snapshot
-    const snapshotRequest = await backendCollector.waitFor('request_backend_data_snapshot');
+    // Backend receives request_backend_resource_snapshot — respond with snapshot
+    const snapshotRequest = await backendCollector.waitFor('request_backend_resource_snapshot');
     expect(snapshotRequest.targetPeerSessionId).toBeTruthy();
     backendWs.send(JSON.stringify({
-      type: 'backend_data_snapshot',
+      type: 'backend_resource_snapshot',
       sessions: [{ sessionId: 'sess-1', title: 'Session 1', createdAt: Date.now(), updatedAt: Date.now(), runStatus: 'idle' }],
       projects: [],
     }));
-    await collector.waitFor('backend_data_snapshot');
+    await collector.waitFor('backend_resource_snapshot');
 
     return { ws: clientWs, collector };
   }
 
-  testIfLoopback('backend_data_snapshot is relayed to subscribers', async () => {
+  testIfLoopback('backend_resource_snapshot is relayed to subscribers', async () => {
     const clientA = await connectAndSubscribeClient();
 
     // Backend publishes another snapshot
     backendWs.send(JSON.stringify({
-      type: 'backend_data_snapshot',
+      type: 'backend_resource_snapshot',
       sessions: [
         { sessionId: 'sess-1', title: 'Session 1', createdAt: Date.now(), updatedAt: Date.now(), runStatus: 'idle' },
         { sessionId: 'sess-2', title: 'Session 2', createdAt: Date.now(), updatedAt: Date.now(), runStatus: 'running' },
@@ -184,30 +188,30 @@ describe('Gateway v2 backend data relay', () => {
       projects: [],
     }));
 
-    const snapshot = await clientA.collector.waitFor('backend_data_snapshot');
+    const snapshot = await clientA.collector.waitFor('backend_resource_snapshot');
     expect(snapshot.backendId).toBe(backendId);
     expect(snapshot.sessions).toBeInstanceOf(Array);
     expect(snapshot.sessions.length).toBe(2);
     expect(snapshot.sessions[0].sessionId).toBe('sess-1');
   });
 
-  testIfLoopback('backend_data_event is relayed to subscribers', async () => {
+  testIfLoopback('backend_resource_event is relayed to subscribers', async () => {
     const clientA = await connectAndSubscribeClient();
     const clientB = await connectAndSubscribeClient();
 
     // Backend publishes a data event
     backendWs.send(JSON.stringify({
-      type: 'backend_data_event',
+      type: 'backend_resource_event',
       op: 'session_upsert',
       item: { sessionId: 'sess-2', title: 'Session 2', createdAt: Date.now(), updatedAt: Date.now(), runStatus: 'idle' },
     }));
 
-    const eventA = await clientA.collector.waitFor('backend_data_event');
+    const eventA = await clientA.collector.waitFor('backend_resource_event');
     expect(eventA.backendId).toBe(backendId);
     expect(eventA.op).toBe('session_upsert');
     expect(eventA.item.sessionId).toBe('sess-2');
 
-    const eventB = await clientB.collector.waitFor('backend_data_event');
+    const eventB = await clientB.collector.waitFor('backend_resource_event');
     expect(eventB.backendId).toBe(backendId);
     expect(eventB.op).toBe('session_upsert');
   });
@@ -222,7 +226,9 @@ describe('Gateway v2 backend data relay', () => {
 
     lateClientWs.send(JSON.stringify({
       type: 'peer_hello',
-      protocolVersion: 2,
+      protocolVersion: 3,
+      namespace: 'zclaudia',
+      clientProtocolVersion: 1,
       peerType: 'client-only',
       gatewaySecret: GATEWAY_SECRET,
       identity: { deviceId: 'late-client-dev', instanceId: `late-client-inst-${Date.now()}-${Math.random()}` }
@@ -232,11 +238,11 @@ describe('Gateway v2 backend data relay', () => {
     lateClientWs.send(JSON.stringify({ type: 'subscribe_backend', backendId }));
     await lateCollector.waitFor('backend_subscribed');
 
-    const snapshotRequest = await backendCollector.waitFor('request_backend_data_snapshot');
+    const snapshotRequest = await backendCollector.waitFor('request_backend_resource_snapshot');
     expect(snapshotRequest.targetPeerSessionId).toBeTruthy();
 
     backendWs.send(JSON.stringify({
-      type: 'backend_data_snapshot',
+      type: 'backend_resource_snapshot',
       sessions: [{ sessionId: 'sess-late', title: 'Late Session', createdAt: Date.now(), updatedAt: Date.now(), runStatus: 'waiting' }],
       projects: [],
     }));
@@ -264,7 +270,7 @@ describe('Gateway v2 backend data relay', () => {
       },
     }));
 
-    const snapshot = await lateCollector.waitFor('backend_data_snapshot');
+    const snapshot = await lateCollector.waitFor('backend_resource_snapshot');
     expect(snapshot.sessions).toHaveLength(1);
     expect(snapshot.sessions[0].sessionId).toBe('sess-late');
 
@@ -284,16 +290,16 @@ describe('Gateway v2 backend data relay', () => {
     expect(existingHeartbeats).toHaveLength(0);
   });
 
-  testIfLoopback('project backend_data_event is relayed to subscribers', async () => {
+  testIfLoopback('project backend_resource_event is relayed to subscribers', async () => {
     const client = await connectAndSubscribeClient();
 
     backendWs.send(JSON.stringify({
-      type: 'backend_data_event',
+      type: 'backend_resource_event',
       op: 'project_upsert',
       item: { projectId: 'proj-2', name: 'Project 2', createdAt: Date.now(), updatedAt: Date.now() },
     }));
 
-    const event = await client.collector.waitFor('backend_data_event');
+    const event = await client.collector.waitFor('backend_resource_event');
     expect(event.backendId).toBe(backendId);
     expect(event.op).toBe('project_upsert');
     expect(event.item.projectId).toBe('proj-2');
@@ -309,7 +315,9 @@ describe('Gateway v2 backend data relay', () => {
     const clientBCollector = new MessageCollector(clientBWs);
     clientBWs.send(JSON.stringify({
       type: 'peer_hello',
-      protocolVersion: 2,
+      protocolVersion: 3,
+      namespace: 'zclaudia',
+      clientProtocolVersion: 1,
       peerType: 'client-only',
       gatewaySecret: GATEWAY_SECRET,
       identity: { deviceId: 'client-dev', instanceId: `client-inst-nosub-${Date.now()}` }
@@ -318,15 +326,15 @@ describe('Gateway v2 backend data relay', () => {
 
     // Backend publishes a data event
     backendWs.send(JSON.stringify({
-      type: 'backend_data_event',
+      type: 'backend_resource_event',
       op: 'session_upsert',
       item: { sessionId: 'sess-2', title: 'Session 2', createdAt: Date.now(), updatedAt: Date.now(), runStatus: 'idle' },
     }));
 
     await delay(DELIVERY_SETTLE_MS);
 
-    const eventsA = clientA.collector.findAll(m => m.type === 'backend_data_event');
-    const eventsB = clientBCollector.findAll(m => m.type === 'backend_data_event');
+    const eventsA = clientA.collector.findAll(m => m.type === 'backend_resource_event');
+    const eventsB = clientBCollector.findAll(m => m.type === 'backend_resource_event');
 
     expect(eventsA).toHaveLength(1);
     expect(eventsB).toHaveLength(0);
@@ -343,7 +351,7 @@ describe('Gateway v2 backend data relay', () => {
 
     // Backend publishes a data event
     backendWs.send(JSON.stringify({
-      type: 'backend_data_event',
+      type: 'backend_resource_event',
       op: 'session_upsert',
       item: { sessionId: 'sess-2', title: 'Session 2', createdAt: Date.now(), updatedAt: Date.now(), runStatus: 'idle' },
     }));
@@ -351,7 +359,7 @@ describe('Gateway v2 backend data relay', () => {
     await delay(DELIVERY_SETTLE_MS);
 
     // Should not have received the event after the initial snapshot
-    const events = client.collector.findAll(m => m.type === 'backend_data_event');
+    const events = client.collector.findAll(m => m.type === 'backend_resource_event');
     expect(events).toHaveLength(0);
   });
 });
@@ -379,11 +387,13 @@ describe('Gateway v2 backend subscriptions', () => {
     backendCollectorA = new MessageCollector(backendWsA);
     backendWsA.send(JSON.stringify({
       type: 'peer_hello',
-      protocolVersion: 2,
+      protocolVersion: 3,
+      namespace: 'zclaudia',
+      clientProtocolVersion: 1,
       peerType: 'client+backend',
       gatewaySecret: GATEWAY_SECRET,
       identity: { deviceId: 'device-sub-a', instanceId: 'inst-device-sub-a', name: 'Backend A' },
-      backend: { visible: true, capabilities: [] }
+      backend: { visible: true, capabilities: [], backendProtocolVersion: 1 }
     }));
     const regA = await backendCollectorA.waitFor('peer_ready');
     backendIdA = regA.backend.backendId;
@@ -395,11 +405,13 @@ describe('Gateway v2 backend subscriptions', () => {
     backendCollectorB = new MessageCollector(backendWsB);
     backendWsB.send(JSON.stringify({
       type: 'peer_hello',
-      protocolVersion: 2,
+      protocolVersion: 3,
+      namespace: 'zclaudia',
+      clientProtocolVersion: 1,
       peerType: 'client+backend',
       gatewaySecret: GATEWAY_SECRET,
       identity: { deviceId: 'device-sub-b', instanceId: 'inst-device-sub-b', name: 'Backend B' },
-      backend: { visible: true, capabilities: [] }
+      backend: { visible: true, capabilities: [], backendProtocolVersion: 1 }
     }));
     const regB = await backendCollectorB.waitFor('peer_ready');
     backendIdB = regB.backend.backendId;
@@ -422,7 +434,9 @@ describe('Gateway v2 backend subscriptions', () => {
 
     clientWs.send(JSON.stringify({
       type: 'peer_hello',
-      protocolVersion: 2,
+      protocolVersion: 3,
+      namespace: 'zclaudia',
+      clientProtocolVersion: 1,
       peerType: 'client-only',
       gatewaySecret: GATEWAY_SECRET,
       identity: { deviceId: 'client-dev', instanceId: `client-inst-${Date.now()}-${Math.random()}` }
@@ -521,7 +535,9 @@ describe('Gateway v2 backend subscriptions', () => {
 
     clientWs.send(JSON.stringify({
       type: 'peer_hello',
-      protocolVersion: 2,
+      protocolVersion: 3,
+      namespace: 'zclaudia',
+      clientProtocolVersion: 1,
       peerType: 'client-only',
       gatewaySecret: GATEWAY_SECRET,
       identity: { deviceId: 'reg-client', instanceId: 'reg-client-inst' }
@@ -534,11 +550,13 @@ describe('Gateway v2 backend subscriptions', () => {
     const collectorC = new MessageCollector(backendWsC);
     backendWsC.send(JSON.stringify({
       type: 'peer_hello',
-      protocolVersion: 2,
+      protocolVersion: 3,
+      namespace: 'zclaudia',
+      clientProtocolVersion: 1,
       peerType: 'client+backend',
       gatewaySecret: GATEWAY_SECRET,
       identity: { deviceId: 'device-c', instanceId: 'inst-device-c', name: 'Backend C' },
-      backend: { visible: true, capabilities: [] }
+      backend: { visible: true, capabilities: [], backendProtocolVersion: 1 }
     }));
     await collectorC.waitFor('peer_ready');
 
