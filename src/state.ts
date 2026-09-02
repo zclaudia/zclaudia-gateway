@@ -21,6 +21,13 @@ export interface PeerSession {
   peerSessionId: PeerSessionId;
   ws: WebSocket;
   peerType: 'client-only' | 'client+backend';
+  /**
+   * Isolation domain. Currently taken from peer_hello (self-declared);
+   * will be derived from server-side credentials once the Phase 1
+   * credential split lands. All registry/subscription visibility is
+   * scoped to this value.
+   */
+  namespace: string;
   deviceId: string;
   instanceId: string;
   channel: string;
@@ -148,9 +155,15 @@ export class GatewayState {
     this.registry.items.delete(backendId);
   }
 
-  /** Get the current registry snapshot as an array. */
-  getRegistrySnapshot(): BackendPresence[] {
-    return Array.from(this.registry.items.values());
+  /**
+   * Get the current registry snapshot as an array, scoped to a namespace.
+   * Namespaces are isolation domains: a peer must never see backends
+   * outside its own namespace.
+   */
+  getRegistrySnapshot(namespace: string): BackendPresence[] {
+    return Array.from(this.registry.items.values()).filter(
+      (item) => item.namespace === namespace,
+    );
   }
 
   // ==========================================================================

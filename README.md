@@ -56,7 +56,8 @@ docker compose up -d        # 容器部署（读取 .env）
 | --- | --- | --- | --- |
 | `GATEWAY_SECRET` | ✅ | — | 共享认证密钥 |
 | `GATEWAY_PORT` | | `3200` | 监听端口 |
-| `GATEWAY_TRUST_PROXY` | | `false` | 信任 `X-Forwarded-For`（仅置于可信反代之后时开启） |
+| `GATEWAY_TRUST_PROXY` | | `false` | 信任 `X-Forwarded-For`（仅置于可信反代之后时开启，见 ADR-0001） |
+| `GATEWAY_ALLOWED_ORIGINS` | | 无（通配符） | 逗号分隔的 CORS Origin allowlist，设置后仅列表内 Origin 可跨域（带 credentials） |
 | `ZCLAUDIA_DATA_DIR` | | `~/.zclaudia` | SQLite 数据目录（实际路径 `<dir>/gateway/gateway.db`） |
 | `NTFY_*` | | 见 [.env.example](.env.example) 与 [src/index.ts](src/index.ts) | ntfy 推送通知配置 |
 
@@ -71,9 +72,9 @@ docker compose up -d        # 容器部署（读取 .env）
 
 **安全模型（Phase 1 重构对象）**
 
-- 全体客户端与 Backend 共享**单一 secret**，无 per-client/per-device 身份，无法单独撤销。
-- `peer_hello.namespace` 由客户端自我声明且**未被强制执行**：registry 快照对所有 peer 全量下发，不按 namespace 过滤。因此当前**不能**将多个应用接入同一 Gateway 实例。
-- CORS 为 `Access-Control-Allow-Origin: *`。
+- 全体客户端与 Backend 共享**单一 secret**，无 per-client/per-device 身份，无法单独撤销（凭证拆分见 ADR-0002 与 ROADMAP Phase 1）。
+- namespace 隔离已在 registry 下发、订阅和定向消息层面强制执行（同实例上不同 namespace 互不可见，有集成测试覆盖）；但 `peer_hello.namespace` 目前仍由客户端自我声明——在凭证体系落地前，隔离防的是应用间的意外串扰，不防持有 secret 的恶意声明。
+- CORS 默认 `Access-Control-Allow-Origin: *`；设置 `GATEWAY_ALLOWED_ORIGINS` 后收紧为 Origin allowlist（带 credentials）。
 - WS 认证密钥在消息体中传输（受 TLS 保护的前提下）。
 
 **尺寸与速率限制**

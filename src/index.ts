@@ -92,10 +92,13 @@ function parseNotificationConfigFromEnv(): Partial<NotificationConfig> {
   };
 }
 
+const allowedOrigins = parseListEnv(process.env.GATEWAY_ALLOWED_ORIGINS);
+
 const server = createGatewayServer({
   gatewaySecret: GATEWAY_SECRET,
   notificationConfig: parseNotificationConfigFromEnv(),
   trustProxy: process.env.GATEWAY_TRUST_PROXY === 'true',
+  allowedOrigins: allowedOrigins.length > 0 ? allowedOrigins : undefined,
 });
 
 server.listen(PORT, () => {

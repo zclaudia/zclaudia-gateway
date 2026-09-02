@@ -62,6 +62,12 @@ interface GatewayConfig {
   proxyStreamingTimeoutMs?: number;
   /** Trust X-Forwarded-For header for IP extraction. Only enable behind a trusted reverse proxy. */
   trustProxy?: boolean;
+  /**
+   * CORS Origin allowlist. When set, only listed origins receive CORS
+   * headers (echoed origin, credentials allowed). When unset, keeps the
+   * legacy wildcard behavior for backward compatibility.
+   */
+  allowedOrigins?: string[];
 }
 
 function isVitestProcess(): boolean {
@@ -83,6 +89,13 @@ function safeCompare(a: string, b: string): boolean {
 function sendToWs(ws: WebSocket, message: unknown): void {
   if (ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(message));
+  }
+}
+
+/** Proxy failure carrying the HTTP status the client should receive. */
+class ProxyError extends Error {
+  constructor(readonly statusCode: number, readonly code: string, message: string) {
+    super(message);
   }
 }
 
@@ -175,8 +188,20 @@ export function createGatewayServer(config: GatewayConfig): Server {
   }, 5 * 60_000);
 
   // --- CORS ---
+  const allowedOrigins = config.allowedOrigins;
   app.use((req: Request, res: Response, next: () => void) => {
-    res.setHeader('Access-Control-Allow-Origin', '*');
+    if (allowedOrigins) {
+      const origin = req.headers.origin;
+      if (origin && allowedOrigins.includes(origin)) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+        res.setHeader('Access-Control-Allow-Credentials', 'true');
+        res.setHeader('Vary', 'Origin');
+      }
+      // Origins outside the allowlist get no CORS headers: the browser
+      // blocks the cross-origin read. Non-browser clients are unaffected.
+    } else {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+    }
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Request-Id');
     if (req.method === 'OPTIONS') {
@@ -235,16 +260,19 @@ export function createGatewayServer(config: GatewayConfig): Server {
     }
     const token = authHeader.slice(7);
     const peerSessionId = recoveryTokens.get(token);
-    if (!peerSessionId || !state.peers.has(peerSessionId)) {
+    const peer = peerSessionId ? state.peers.get(peerSessionId) : undefined;
+    if (!peer) {
       res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Invalid recovery token' } });
       return;
     }
+    res.locals.peer = peer;
     next();
   }
 
   // --- Poll Recovery: Registry ---
   app.get('/sync/registry', requireRecoveryToken, (_req: Request, res: Response) => {
-    res.json({ items: state.getRegistrySnapshot() });
+    const peer = res.locals.peer as PeerSession;
+    res.json({ items: state.getRegistrySnapshot(peer.namespace) });
   });
 
   // --- Notification Config ---
@@ -347,7 +375,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
       if (clientRequestId) proxyRequest.headers['x-request-id'] = clientRequestId as string;
 
       const response = await new Promise<GatewayHttpProxyResponse | null>((resolve, reject) => {
-        const timeout = setTimeout(() => { pendingHttpRequests.delete(requestId); reject(new Error('Proxy request timeout')); }, proxyRequestTimeoutMs);
+        const timeout = setTimeout(() => { pendingHttpRequests.delete(requestId); reject(new ProxyError(504, 'GATEWAY_TIMEOUT', 'Proxy request timeout')); }, proxyRequestTimeoutMs);
         pendingHttpRequests.set(requestId, { resolve, reject, timeout, res, backendId });
         sendToWs(backendPeer.ws, proxyRequest);
       });
@@ -358,8 +386,13 @@ export function createGatewayServer(config: GatewayConfig): Server {
         ? Buffer.from(response.body, 'base64')
         : response.body;
       res.status(response.statusCode).send(responseBody);
-    } catch {
-      if (!res.headersSent) res.status(500).json({ success: false, error: { code: 'PROXY_ERROR', message: 'Failed to proxy request' } });
+    } catch (error) {
+      if (res.headersSent) return;
+      if (error instanceof ProxyError) {
+        res.status(error.statusCode).json({ success: false, error: { code: error.code, message: error.message } });
+      } else {
+        res.status(500).json({ success: false, error: { code: 'PROXY_ERROR', message: 'Failed to proxy request' } });
+      }
     }
   });
 
@@ -546,6 +579,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
       peerSessionId,
       ws,
       peerType,
+      namespace: message.namespace,
       deviceId: identity.deviceId,
       instanceId: identity.instanceId,
       channel,
@@ -573,7 +607,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
 
     state.addPeer(peer);
     recoveryTokens.set(recoveryToken, peerSessionId);
-    const registrySync: RegistrySyncPayload = { items: state.getRegistrySnapshot() };
+    const registrySync: RegistrySyncPayload = { items: state.getRegistrySnapshot(peer.namespace) };
     const ready: PeerReadyMessage = { type: 'peer_ready', protocolVersion: 3, peerSessionId, recoveryToken, backend: backendInfo, registrySync };
     sendToWs(ws, ready);
 
@@ -605,10 +639,10 @@ export function createGatewayServer(config: GatewayConfig): Server {
       case 'content_patch': handleContentPatch(peer, message); break;
       case 'content_patch_error': handleContentPatchError(peer, message); break;
       case 'catch_up_content': handleCatchUpContent(peer, message); break;
-      case 'http_proxy_response': handleHttpProxyResponse(message); break;
-      case 'http_proxy_response_start': handleHttpProxyResponseStart(message); break;
-      case 'http_proxy_response_chunk': handleHttpProxyResponseChunk(message); break;
-      case 'http_proxy_response_end': handleHttpProxyResponseEnd(message); break;
+      case 'http_proxy_response': handleHttpProxyResponse(peer, message); break;
+      case 'http_proxy_response_start': handleHttpProxyResponseStart(peer, message); break;
+      case 'http_proxy_response_chunk': handleHttpProxyResponseChunk(peer, message); break;
+      case 'http_proxy_response_end': handleHttpProxyResponseEnd(peer, message); break;
       case 'push_notification_request': handlePushNotificationRequest(peer, message); break;
       case 'ping': sendToWs(peer.ws, { type: 'pong', ts: message.ts }); break;
       default: sendToWs(peer.ws, { type: 'gateway_error', code: 'INVALID_MESSAGE', message: `Unknown message type: ${message.type}` } satisfies GatewayErrorMessage);
@@ -630,28 +664,36 @@ export function createGatewayServer(config: GatewayConfig): Server {
     sendToWs(peer.ws, { type: 'heartbeat_ack', epoch: msg.epoch, streamDemand: state.getStreamDemand(backendId) } satisfies HeartbeatAckMessage);
   }
 
-  function handleBackendResourceSnapshot(peer: PeerSession, msg: BackendResourceSnapshotMessage): void {
+  /**
+   * Relay a backend's resource snapshot/event to its subscribers.
+   * If the message carries targetPeerSessionId (additive, not yet in the
+   * protocol types), deliver only to that subscriber — this lets backends
+   * answer snapshot requests without broadcasting to everyone.
+   */
+  function relayToSubscribers(peer: PeerSession, msg: BackendResourceSnapshotMessage | BackendResourceEventMessage): void {
     if (!isCurrentBackendOwner(peer)) return;
     const backendId = peer.backendId!;
-    // Pure relay: forward to all subscribers, adding backendId for routing
     const subscribers = state.getSubscribers(backendId);
     const relayMsg = { ...msg, backendId };
+    const target = (msg as { targetPeerSessionId?: string }).targetPeerSessionId;
+    if (target) {
+      if (!subscribers.has(target)) return;
+      const p = state.peers.get(target);
+      if (p) sendToWs(p.ws, relayMsg);
+      return;
+    }
     for (const subId of subscribers) {
       const p = state.peers.get(subId);
       if (p) sendToWs(p.ws, relayMsg);
     }
   }
 
+  function handleBackendResourceSnapshot(peer: PeerSession, msg: BackendResourceSnapshotMessage): void {
+    relayToSubscribers(peer, msg);
+  }
+
   function handleBackendResourceEvent(peer: PeerSession, msg: BackendResourceEventMessage): void {
-    if (!isCurrentBackendOwner(peer)) return;
-    const backendId = peer.backendId!;
-    // Pure relay: forward to all subscribers, adding backendId for routing
-    const subscribers = state.getSubscribers(backendId);
-    const relayMsg = { ...msg, backendId };
-    for (const subId of subscribers) {
-      const p = state.peers.get(subId);
-      if (p) sendToWs(p.ws, relayMsg);
-    }
+    relayToSubscribers(peer, msg);
   }
 
   function handleBackendStreamEvent(peer: PeerSession, msg: BackendStreamEvent): void {
@@ -671,22 +713,32 @@ export function createGatewayServer(config: GatewayConfig): Server {
   // ========================================================================
 
   function handleRequestRegistrySnapshot(peer: PeerSession): void {
-    sendToWs(peer.ws, { type: 'registry_snapshot', items: state.getRegistrySnapshot() } satisfies RegistrySnapshotMessage);
+    sendToWs(peer.ws, { type: 'registry_snapshot', items: state.getRegistrySnapshot(peer.namespace) } satisfies RegistrySnapshotMessage);
   }
 
   function handleRequestBackendResourceSnapshot(peer: PeerSession, msg: RequestBackendResourceSnapshotMessage): void {
-    // Relay request to the backend peer so it can push a fresh snapshot
+    // Only subscribers may ask a backend for a snapshot (subscription is
+    // namespace-gated at subscribe time, so this transitively enforces
+    // namespace isolation too).
+    if (!state.getSubscribers(msg.backendId).has(peer.peerSessionId)) {
+      sendToWs(peer.ws, { type: 'gateway_error', code: 'BACKEND_NOT_SUBSCRIBED', message: 'Not subscribed to backend', recovery: 'resubscribe' } satisfies GatewayErrorMessage);
+      return;
+    }
     const bp = findBackendPeer(msg.backendId);
     if (!bp) {
       sendToWs(peer.ws, { type: 'gateway_error', code: 'BACKEND_OFFLINE', message: `Backend ${msg.backendId} not found or offline`, recovery: 'reconnect' } satisfies GatewayErrorMessage);
       return;
     }
-    sendToWs(bp.ws, { type: 'request_backend_resource_snapshot', backendId: msg.backendId, resourceTypes: msg.resourceTypes, targetPeerSessionId: msg.targetPeerSessionId } satisfies RequestBackendResourceSnapshotMessage);
+    // Pin the target to the requesting peer: a client must not be able to
+    // direct another subscriber's snapshot refresh.
+    sendToWs(bp.ws, { type: 'request_backend_resource_snapshot', backendId: msg.backendId, resourceTypes: msg.resourceTypes, targetPeerSessionId: peer.peerSessionId } satisfies RequestBackendResourceSnapshotMessage);
   }
 
   function handleSubscribeBackend(peer: PeerSession, msg: SubscribeBackendMessage): void {
     const presence = state.registry.items.get(msg.backendId);
-    if (!presence) {
+    // Cross-namespace subscription is answered exactly like a nonexistent
+    // backend so the response is not an existence oracle for other namespaces.
+    if (!presence || presence.namespace !== peer.namespace) {
       sendToWs(peer.ws, { type: 'gateway_error', code: 'BACKEND_OFFLINE', message: `Backend ${msg.backendId} not found or offline`, recovery: 'reconnect' } satisfies GatewayErrorMessage);
       return;
     }
@@ -751,8 +803,12 @@ export function createGatewayServer(config: GatewayConfig): Server {
     const backendId = peer.backendId!;
     if (msg.backendId !== backendId) return;
 
-    // If targetPeerSessionId is set, route to that specific client
+    // If targetPeerSessionId is set, route to that specific client — but only
+    // if the target is actually subscribed to this backend. Without this
+    // check a backend could message arbitrary peers (including peers in
+    // other namespaces) by guessing session IDs.
     if (msg.targetPeerSessionId) {
+      if (!state.getSubscribers(backendId).has(msg.targetPeerSessionId)) return;
       const targetPeer = state.peers.get(msg.targetPeerSessionId);
       if (targetPeer) sendToWs(targetPeer.ws, msg);
       return;
@@ -802,13 +858,24 @@ export function createGatewayServer(config: GatewayConfig): Server {
   // HTTP Proxy Response Handlers
   // ========================================================================
 
-  function handleHttpProxyResponse(msg: GatewayHttpProxyResponse): void {
-    const pending = pendingHttpRequests.get(msg.requestId);
-    if (pending) { clearTimeout(pending.timeout); pendingHttpRequests.delete(msg.requestId); pending.resolve(msg); }
+  /**
+   * A proxy response is only accepted from the current owner of the backend
+   * the request was sent to. Anything else (another peer guessing request
+   * IDs, a stale pre-epoch-change backend) is dropped.
+   */
+  function ownsProxyRequest(peer: PeerSession, backendId: string): boolean {
+    return peer.backendId === backendId && isCurrentBackendOwner(peer);
   }
-  function handleHttpProxyResponseStart(msg: GatewayHttpProxyResponseStart): void {
+
+  function handleHttpProxyResponse(peer: PeerSession, msg: GatewayHttpProxyResponse): void {
+    const pending = pendingHttpRequests.get(msg.requestId);
+    if (!pending || !ownsProxyRequest(peer, pending.backendId)) return;
+    clearTimeout(pending.timeout); pendingHttpRequests.delete(msg.requestId); pending.resolve(msg);
+  }
+  function handleHttpProxyResponseStart(peer: PeerSession, msg: GatewayHttpProxyResponseStart): void {
     const pending = pendingHttpRequests.get(msg.requestId);
     if (!pending?.res) return;
+    if (!ownsProxyRequest(peer, pending.backendId)) return;
     clearTimeout(pending.timeout); pendingHttpRequests.delete(msg.requestId);
     const res = pending.res;
     if (msg.headers) { for (const [key, value] of Object.entries(msg.headers)) res.setHeader(key, value); }
@@ -823,9 +890,10 @@ export function createGatewayServer(config: GatewayConfig): Server {
     pendingStreamingRequests.set(msg.requestId, { res, resolve: pending.resolve as unknown as () => void, timeout: streamTimeout, backendId: pending.backendId });
     pending.resolve(null);
   }
-  function handleHttpProxyResponseChunk(msg: GatewayHttpProxyResponseChunk): void {
+  function handleHttpProxyResponseChunk(peer: PeerSession, msg: GatewayHttpProxyResponseChunk): void {
     const streaming = pendingStreamingRequests.get(msg.requestId);
     if (!streaming) return;
+    if (!ownsProxyRequest(peer, streaming.backendId)) return;
     if (streaming.res.writableEnded || streaming.res.destroyed) {
       pendingStreamingRequests.delete(msg.requestId);
       clearTimeout(streaming.timeout);
@@ -835,9 +903,10 @@ export function createGatewayServer(config: GatewayConfig): Server {
     streaming.timeout = setTimeout(() => { abortStreamingResponse(msg.requestId, streaming.res, 'Proxy streaming timeout'); }, proxyStreamingTimeoutMs);
     streaming.res.write(Buffer.from(msg.data, 'base64'));
   }
-  function handleHttpProxyResponseEnd(msg: GatewayHttpProxyResponseEnd): void {
+  function handleHttpProxyResponseEnd(peer: PeerSession, msg: GatewayHttpProxyResponseEnd): void {
     const streaming = pendingStreamingRequests.get(msg.requestId);
     if (!streaming) return;
+    if (!ownsProxyRequest(peer, streaming.backendId)) return;
     clearTimeout(streaming.timeout); pendingStreamingRequests.delete(msg.requestId);
     if (!streaming.res.writableEnded) streaming.res.end(); streaming.resolve();
   }
@@ -893,7 +962,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
       if (pending.backendId === backendId) {
         clearTimeout(pending.timeout);
         pendingHttpRequests.delete(requestId);
-        pending.reject(new Error('Backend disconnected'));
+        pending.reject(new ProxyError(502, 'BACKEND_OFFLINE', 'Backend disconnected'));
       }
     }
     for (const [requestId, streaming] of pendingStreamingRequests) {
@@ -936,8 +1005,17 @@ export function createGatewayServer(config: GatewayConfig): Server {
   // ========================================================================
 
   function broadcastRegistrySnapshot(excludePeerSessionId?: string): void {
-    const msg: RegistrySnapshotMessage = { type: 'registry_snapshot', items: state.getRegistrySnapshot() };
-    for (const peer of state.peers.values()) { if (peer.peerSessionId !== excludePeerSessionId) sendToWs(peer.ws, msg); }
+    // Each peer only ever sees its own namespace's slice of the registry.
+    const perNamespace = new Map<string, RegistrySnapshotMessage>();
+    for (const peer of state.peers.values()) {
+      if (peer.peerSessionId === excludePeerSessionId) continue;
+      let msg = perNamespace.get(peer.namespace);
+      if (!msg) {
+        msg = { type: 'registry_snapshot', items: state.getRegistrySnapshot(peer.namespace) };
+        perNamespace.set(peer.namespace, msg);
+      }
+      sendToWs(peer.ws, msg);
+    }
   }
 
   function notifySubscribersBackendGone(backendId: string, reason: BackendUnsubscribedMessage['reason']): void {
