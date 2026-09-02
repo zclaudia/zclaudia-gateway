@@ -76,11 +76,44 @@ client                     Gateway                      backend
 - 控制连接用完整凭证认证（Phase 1 凭证体系），数据面只认控制面预授权的 ticket——
   两个平面使用不同强度的凭证。
 
-## 6. 限制与配额
+## 6. Topic 广播原语
 
-- 单 Peer 并发 channel 上限（默认 32，可配置）。
+一对多分发不走 Channel（否则 Backend 上行带宽随订阅者数放大），走 Topic：
+Backend 向 Topic 发一份，Gateway 在带宽充裕侧复制给各订阅者。
+
+| 消息 | 方向 | 字段 |
+| --- | --- | --- |
+| `topic_subscribe` | client → GW | `backendId`、`topic` |
+| `topic_subscribed` / `topic_unsubscribed` | GW → client | `backendId`、`topic` |
+| `topic_unsubscribe` | client → GW | `backendId`、`topic` |
+| `topic_publish` | backend → GW | `topic`、`payload`（GW 不解析） |
+| `topic_message` | GW → 订阅者 | `backendId`、`topic`、`payload` |
+
+授权模型（与定向 Channel 不同）：订阅要求与目标 Backend 同 namespace（跨界响应与
+不存在的 Backend 一致）；发布仅限 Backend 当前租约持有者。Backend 下线/换代次时其
+全部 Topic 订阅被清除，订阅者从 registry 感知重建。
+
+## 7. v4 HTTP 流式映射（kind = `http`）
+
+客户端仍用普通 HTTP 访问 `/api/proxy/:backendId/*`；当目标 Backend 是 v4 会话时，
+Gateway 自动改走 Channel 桥接（客户端与 v3 Backend 完全不感知）：
+
+1. Gateway 为该请求创建一条 **internal channel**（客户端端点是 HTTP 请求/响应流本身，
+   不经拨号），向 Backend 发 `channel_offer {kind: 'http'}`；Backend 照常拨数据连接。
+2. 请求方向：Gateway 先发一个文本帧 `{"type":"http_request", method, path, headers}`
+   （headers 经 allowlist 过滤），随后请求体以二进制帧流式发送，
+   结束时发文本帧 `{"type":"http_request_end"}`。
+3. 响应方向：Backend 先回一个文本帧 `{"type":"http_response", status, headers}`，
+   随后响应体以二进制帧流式发送，**关闭数据连接即响应结束**。
+4. 取消与超时端到端传播：客户端断开 → channel 拆除 → Backend 数据连接关闭；
+   响应元数据超时 → 504；Backend 离线/拒绝 → 502。
+5. 全程无 JSON/base64 编码的响应体，两侧背压生效，Gateway 内存有界。
+
+## 8. 限制与配额
+
+- 单 Peer 并发 channel 上限（默认 32，可配置；internal http channel 计入 Backend 侧配额）。
 - 数据帧大小上限沿用 WS maxPayload（大文件由 SDK 分帧流式发送）。
-- 后续批次：per-channel 字节速率、Topic 广播原语、v4 HTTP 流式映射。
+- 后续批次：per-channel 字节速率限制。
 
 ## 7. 与 v3 的关系
 

@@ -114,6 +114,18 @@ const MESSAGE_SPECS: Record<string, MessageSpec> = {
   channel_close: {
     channelId: { kind: 'non-empty-string' },
   },
+  // v4 topic broadcast primitive
+  topic_subscribe: {
+    backendId: { kind: 'non-empty-string' },
+    topic: { kind: 'non-empty-string' },
+  },
+  topic_unsubscribe: {
+    backendId: { kind: 'non-empty-string' },
+    topic: { kind: 'non-empty-string' },
+  },
+  topic_publish: {
+    topic: { kind: 'non-empty-string' },
+  },
 };
 
 function checkField(value: unknown, spec: FieldSpec): string | null {

@@ -231,7 +231,17 @@ export function createGatewayServer(config: GatewayConfig): Server {
   });
 
   // Preserve raw bytes for proxy uploads before JSON/body-parser mutation.
-  app.use('/api/proxy', express.raw({ type: '*/*', limit: '100mb' }));
+  // v4 backends are proxied via streaming channels (docs/protocol-v4.md §7):
+  // their request bodies must NOT be buffered, so the raw parser only runs
+  // for legacy v3 backends.
+  const proxyRawParser = express.raw({ type: '*/*', limit: '100mb' });
+  app.use('/api/proxy', (req: Request, res: Response, next: () => void) => {
+    const backendId = req.path.split('/')[1];
+    const lease = backendId ? state.leases.get(backendId) : undefined;
+    const backendPeer = lease ? state.peers.get(lease.peerSessionId) : undefined;
+    if (backendPeer?.protocolVersion === 4) { next(); return; }
+    proxyRawParser(req, res, next);
+  });
   app.use(express.json({ limit: '15mb' }));
 
   // ========================================================================
@@ -498,6 +508,11 @@ export function createGatewayServer(config: GatewayConfig): Server {
       const requestId = uuidv4();
       // Path logged without query string — queries may carry sensitive values.
       audit('proxy.request', { backendId, method: req.method, path: `/${fullPath}`, ip: clientIp, auth: auth.kind === 'credential' ? auth.credential.id : 'legacy' });
+      // v4 backend: stream through an internal channel — no buffering, no base64.
+      if (backendPeer.protocolVersion === 4) {
+        proxyViaChannel(req, res, backendId, lease.epoch, backendPeer, targetPath);
+        return;
+      }
       const contentType = req.headers['content-type'];
       const encodedBody = ['GET', 'HEAD'].includes(req.method)
         ? {}
@@ -585,6 +600,12 @@ export function createGatewayServer(config: GatewayConfig): Server {
     /** Ticket tokens, kept so teardown can invalidate unused ones. */
     ticketTokens: string[];
     pairingTimeout: NodeJS.Timeout;
+    /**
+     * Internal HTTP channel (docs/protocol-v4.md §7): the client end is an
+     * HTTP request/response pair on the gateway itself, not a dialed socket.
+     */
+    onBackendSocket?: (ws: WebSocket) => void;
+    internalRes?: Response;
   }
 
   const channels = new Map<string, ChannelRecord>();
@@ -610,6 +631,18 @@ export function createGatewayServer(config: GatewayConfig): Server {
     channels.delete(channelId);
     clearTimeout(ch.pairingTimeout);
     for (const token of ch.ticketTokens) channelTickets.delete(token);
+    // Internal HTTP channel: map the teardown reason onto the HTTP response.
+    if (ch.internalRes) {
+      const res = ch.internalRes;
+      if (!res.headersSent) {
+        const status = reason === 'timeout' ? 504 : 502;
+        const code = reason === 'timeout' ? 'GATEWAY_TIMEOUT' : 'BACKEND_OFFLINE';
+        res.status(status).json({ success: false, error: { code, message: `Proxy channel ${reason}` } });
+      } else if (!res.writableEnded && !res.destroyed) {
+        // Mid-stream failure: truncate hard rather than fake a clean end.
+        res.destroy(new Error(`Proxy channel ${reason}`));
+      }
+    }
     for (const socket of [ch.clientSocket, ch.backendSocket]) {
       if (socket && socket.readyState === WebSocket.OPEN) socket.close(1000, reason);
       else socket?.terminate();
@@ -687,6 +720,13 @@ export function createGatewayServer(config: GatewayConfig): Server {
       if (!channels.has(channelId)) { ws.terminate(); return; }
       if (ticket.role === 'client') ch.clientSocket = ws;
       else ch.backendSocket = ws;
+      // Internal HTTP channel: the gateway itself is the client end.
+      if (ch.onBackendSocket && ch.backendSocket && !ch.piped) {
+        ch.piped = true;
+        clearTimeout(ch.pairingTimeout);
+        ch.onBackendSocket(ch.backendSocket);
+        return;
+      }
       if (ch.clientSocket && ch.backendSocket && !ch.piped) {
         clearTimeout(ch.pairingTimeout);
         wireChannel(ch);
@@ -742,6 +782,168 @@ export function createGatewayServer(config: GatewayConfig): Server {
     if (!ch) return;
     if (ch.clientPeerSessionId !== peer.peerSessionId && ch.backendPeerSessionId !== peer.peerSessionId) return;
     teardownChannel(msg.channelId, 'closed');
+  }
+
+  /**
+   * v4 HTTP streaming proxy (docs/protocol-v4.md §7): bridge an incoming
+   * HTTP request onto an internal channel. The backend dials the data
+   * socket as usual; the gateway's end is the req/res stream pair.
+   */
+  function proxyViaChannel(req: Request, res: Response, backendId: string, epoch: number, backendPeer: PeerSession, targetPath: string): void {
+    if (countChannelsForPeer(backendPeer.peerSessionId) >= maxChannelsPerPeer) {
+      res.status(429).json({ success: false, error: { code: 'RATE_LIMITED', message: 'Too many open channels' } });
+      return;
+    }
+    const channelId = crypto.randomBytes(16).toString('hex');
+    const backendTicket = issueChannelTicket(channelId, 'backend');
+    const ch: ChannelRecord = {
+      channelId,
+      backendId,
+      epoch,
+      kind: 'http',
+      clientPeerSessionId: '',
+      backendPeerSessionId: backendPeer.peerSessionId,
+      piped: false,
+      ticketTokens: [backendTicket],
+      pairingTimeout: setTimeout(() => teardownChannel(channelId, 'timeout'), channelTicketTtlMs),
+      internalRes: res,
+      onBackendSocket: (ws) => bridgeHttpChannel(ch, ws, req, res, targetPath),
+    };
+    channels.set(channelId, ch);
+    // Client abort propagates end-to-end: response close tears the channel
+    // down, which closes the backend's data socket.
+    res.once('close', () => teardownChannel(channelId, 'closed'));
+    sendToWs(backendPeer.ws, { type: 'channel_offer', channelId, kind: 'http', ticket: backendTicket, dataPath: `/channel/${channelId}` });
+  }
+
+  function bridgeHttpChannel(ch: ChannelRecord, ws: WebSocket, req: Request, res: Response, targetPath: string): void {
+    const HIGH_WATER = 4 * 1024 * 1024;
+    // --- Request direction: meta frame, then binary body frames, then end frame ---
+    const requestHeaders: Record<string, string> = {};
+    for (const headerName of PROXY_REQUEST_HEADER_ALLOWLIST) {
+      const value = req.headers[headerName];
+      if (typeof value === 'string') requestHeaders[headerName] = value;
+    }
+    ws.send(JSON.stringify({ type: 'http_request', method: req.method, path: targetPath, headers: requestHeaders }));
+    req.on('data', (chunk: Buffer) => {
+      if (ws.readyState !== WebSocket.OPEN) return;
+      ws.send(chunk, { binary: true });
+      if (ws.bufferedAmount > HIGH_WATER) {
+        req.pause();
+        const drain = setInterval(() => {
+          if (ws.bufferedAmount <= HIGH_WATER / 4 || ws.readyState !== WebSocket.OPEN) {
+            clearInterval(drain);
+            req.resume();
+          }
+        }, 20);
+      }
+    });
+    req.on('end', () => {
+      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'http_request_end' }));
+    });
+
+    // --- Response direction: meta frame, then binary body frames, close = end ---
+    let metaReceived = false;
+    let responseTimer: NodeJS.Timeout | null = setTimeout(() => teardownChannel(ch.channelId, 'timeout'), proxyRequestTimeoutMs);
+    let idleTimer: NodeJS.Timeout | null = null;
+    const resetIdle = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => teardownChannel(ch.channelId, 'timeout'), proxyStreamingTimeoutMs);
+    };
+    ws.on('message', (data: Buffer, isBinary: boolean) => {
+      if (!metaReceived) {
+        if (responseTimer) { clearTimeout(responseTimer); responseTimer = null; }
+        if (isBinary) { teardownChannel(ch.channelId, 'closed'); return; }
+        let meta: { status?: unknown; headers?: Record<string, string> };
+        try { meta = JSON.parse(data.toString()); } catch { teardownChannel(ch.channelId, 'closed'); return; }
+        metaReceived = true;
+        const status = typeof meta.status === 'number' && Number.isInteger(meta.status) && meta.status >= 100 && meta.status <= 599
+          ? meta.status : 502;
+        for (const [key, value] of Object.entries(filterProxyResponseHeaders(meta.headers))) res.setHeader(key, value);
+        const clientRequestId = req.headers['x-request-id'];
+        if (typeof clientRequestId === 'string') res.setHeader('x-request-id', clientRequestId);
+        res.status(status);
+        // Flush headers even for empty bodies so the client isn't left waiting.
+        res.write('');
+        resetIdle();
+        return;
+      }
+      if (isBinary) {
+        resetIdle();
+        const writable = res.write(data);
+        if (!writable) {
+          ws.pause();
+          res.once('drain', () => ws.resume());
+        }
+      }
+      // Text frames after meta are reserved (trailers); ignored for now.
+    });
+    ws.on('close', () => {
+      if (responseTimer) clearTimeout(responseTimer);
+      if (idleTimer) clearTimeout(idleTimer);
+      if (metaReceived) {
+        // Normal completion: backend closing the socket ends the response.
+        if (!res.writableEnded && !res.destroyed) res.end();
+        ch.internalRes = undefined;
+        teardownChannel(ch.channelId, 'closed');
+      } else {
+        // Socket closed before any response: surfaces as 502 via teardown.
+        teardownChannel(ch.channelId, 'closed');
+      }
+    });
+    ws.on('error', () => teardownChannel(ch.channelId, 'closed'));
+  }
+
+  // ========================================================================
+  // v4 Topic broadcast (docs/protocol-v4.md §6)
+  // ========================================================================
+
+  /** backendId → topic → subscribing peerSessionIds */
+  const topicSubs = new Map<string, Map<string, Set<string>>>();
+
+  function handleTopicSubscribe(peer: PeerSession, msg: { backendId: string; topic: string }): void {
+    if (peer.protocolVersion !== 4) {
+      sendToWs(peer.ws, { type: 'gateway_error', code: 'INVALID_MESSAGE', message: 'topic_subscribe requires protocol v4' } satisfies GatewayErrorMessage);
+      return;
+    }
+    const presence = state.registry.items.get(msg.backendId);
+    if (!presence || presence.namespace !== peer.namespace) {
+      sendToWs(peer.ws, { type: 'gateway_error', code: 'BACKEND_OFFLINE', message: `Backend ${msg.backendId} not found or offline` } satisfies GatewayErrorMessage);
+      return;
+    }
+    let topics = topicSubs.get(msg.backendId);
+    if (!topics) { topics = new Map(); topicSubs.set(msg.backendId, topics); }
+    let subs = topics.get(msg.topic);
+    if (!subs) { subs = new Set(); topics.set(msg.topic, subs); }
+    subs.add(peer.peerSessionId);
+    sendToWs(peer.ws, { type: 'topic_subscribed', backendId: msg.backendId, topic: msg.topic });
+  }
+
+  function handleTopicUnsubscribe(peer: PeerSession, msg: { backendId: string; topic: string }): void {
+    topicSubs.get(msg.backendId)?.get(msg.topic)?.delete(peer.peerSessionId);
+    sendToWs(peer.ws, { type: 'topic_unsubscribed', backendId: msg.backendId, topic: msg.topic });
+  }
+
+  /** Backend publishes once; gateway fans out on its own (well-provisioned) side. */
+  function handleTopicPublish(peer: PeerSession, msg: { topic: string; payload?: unknown }): void {
+    if (!isCurrentBackendOwner(peer)) return;
+    const subs = topicSubs.get(peer.backendId!)?.get(msg.topic);
+    if (!subs || subs.size === 0) return;
+    const outbound = { type: 'topic_message', backendId: peer.backendId, topic: msg.topic, payload: msg.payload };
+    for (const subId of subs) {
+      const subscriber = state.peers.get(subId);
+      if (subscriber) sendToWs(subscriber.ws, outbound);
+    }
+  }
+
+  function removeTopicSubscriptionsForPeer(peerSessionId: string): void {
+    for (const topics of topicSubs.values()) {
+      for (const subs of topics.values()) subs.delete(peerSessionId);
+    }
+  }
+
+  function removeTopicsForBackend(backendId: string): void {
+    topicSubs.delete(backendId);
   }
 
   httpServer.on('connection', (socket) => {
@@ -1014,6 +1216,9 @@ export function createGatewayServer(config: GatewayConfig): Server {
       case 'channel_open': handleChannelOpen(peer, message); break;
       case 'channel_reject': handleChannelReject(peer, message); break;
       case 'channel_close': handleChannelClose(peer, message); break;
+      case 'topic_subscribe': handleTopicSubscribe(peer, message); break;
+      case 'topic_unsubscribe': handleTopicUnsubscribe(peer, message); break;
+      case 'topic_publish': handleTopicPublish(peer, message); break;
       case 'ping': sendToWs(peer.ws, { type: 'pong', ts: message.ts }); break;
       default: sendToWs(peer.ws, { type: 'gateway_error', code: 'INVALID_MESSAGE', message: `Unknown message type: ${message.type}` } satisfies GatewayErrorMessage);
     }
@@ -1308,6 +1513,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
     if (!lease) return;
     const peer = state.peers.get(lease.peerSessionId);
     closeChannelsForBackend(backendId, 'backend_offline');
+    removeTopicsForBackend(backendId);
     rejectPendingProxyRequests(backendId);
     notifySubscribersBackendGone(backendId, 'backend_offline');
     state.registryRemove(backendId);
@@ -1361,6 +1567,8 @@ export function createGatewayServer(config: GatewayConfig): Server {
     }
     // Close any remaining channels where this peer is the client end
     closeChannelsForPeer(peerSessionId);
+    removeTopicSubscriptionsForPeer(peerSessionId);
+    if (peer.backendId) removeTopicsForBackend(peer.backendId);
     // Clean up this peer's subscriptions: notify backends and update stream demand
     const affectedBackends = state.removeAllSubscriptions(peerSessionId);
     for (const backendId of affectedBackends) {
@@ -1436,6 +1644,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
     // v4: the gateway is the authority on epoch invalidation — all channels
     // bound to the previous epoch are closed here, not inferred client-side.
     closeChannelsForBackend(backendId, 'epoch_changed');
+    removeTopicsForBackend(backendId);
     notifySubscribersBackendGone(backendId, 'epoch_changed');
     state.removeLease(backendId);
 
