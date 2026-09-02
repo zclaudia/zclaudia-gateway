@@ -330,7 +330,10 @@ describeIfLoopback('Gateway HTTP Endpoints', () => {
       });
 
       expect(response.status).toBe(200);
-      expect(response.headers.get('X-Custom')).toBe('header');
+      // Phase 1 header allowlist: non-allowlisted headers are dropped,
+      // allowlisted ones (content-type) pass through
+      expect(response.headers.get('X-Custom')).toBeNull();
+      expect(response.headers.get('Content-Type')).toContain('text/plain');
       const body = await response.text();
       expect(body).toBe('Hello World!');
 

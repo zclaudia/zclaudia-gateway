@@ -114,6 +114,9 @@ docker compose up -d        # 容器部署（读取 .env）
 ### 传输语义
 
 - 代理的二进制内容以 base64 编码经 JSON 消息传输（约 33% 膨胀）；整体响应模式会在内存中完整缓存响应体。真正的流式与二进制帧是 Protocol v4（ROADMAP Phase 2）的目标。
+- 代理 Header 为默认拒绝的 allowlist（见 [src/validation.ts](src/validation.ts)）：请求侧仅转发 content-type/accept/range/条件请求头等；响应侧仅转发内容类头（`Set-Cookie` 与服务器指纹头永不透传）。
+- 所有入站协议消息经 runtime 校验，只校验 Gateway 路由所需字段——协议 .d.ts 与真实 v3 流量存在偏差（如快照实际携带 `sessions`/`projects`），完整 schema 收紧推迟到 v4。
+- 认证、连接、订阅、代理与凭证生命周期输出结构化 `[audit]` 日志行。
 - 资源快照/事件默认对全部订阅者广播；消息携带 `targetPeerSessionId`（可选的加法字段）时仅递送给该订阅者，zclaudia backend 尚未采用。
 
 ## 设计决策

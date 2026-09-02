@@ -46,6 +46,7 @@ import type {
 } from '@zclaudia/protocol/gateway';
 import type { NotificationConfig } from '@zclaudia/protocol/notifications';
 import { GatewayStorage, CREDENTIAL_TOKEN_PREFIXES, type CredentialInfo, type CredentialType } from './storage.js';
+import { validateGatewayMessage, filterProxyResponseHeaders, PROXY_REQUEST_HEADER_ALLOWLIST } from './validation.js';
 import { GatewayState, type PeerSession } from './state.js';
 import { encodeProxyRequestBody } from './proxy-body.js';
 import { GatewayPushNotificationService } from './push-notification.js';
@@ -149,6 +150,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
   const trustProxy = config.trustProxy ?? false;
 
   const app = express();
+  app.disable('x-powered-by');
 
   // --- Rate limiting ---
   // Strict limit for failed auth attempts (brute-force protection)
@@ -485,6 +487,8 @@ export function createGatewayServer(config: GatewayConfig): Server {
       const queryString = req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : '';
       const targetPath = `/${fullPath}${queryString}`;
       const requestId = uuidv4();
+      // Path logged without query string — queries may carry sensitive values.
+      audit('proxy.request', { backendId, method: req.method, path: `/${fullPath}`, ip: clientIp, auth: auth.kind === 'credential' ? auth.credential.id : 'legacy' });
       const contentType = req.headers['content-type'];
       const encodedBody = ['GET', 'HEAD'].includes(req.method)
         ? {}
@@ -498,9 +502,12 @@ export function createGatewayServer(config: GatewayConfig): Server {
         headers: {},
         ...encodedBody,
       };
-      if (contentType) proxyRequest.headers['content-type'] = contentType;
+      // Default-deny: only allowlisted request headers reach the backend.
+      for (const headerName of PROXY_REQUEST_HEADER_ALLOWLIST) {
+        const value = req.headers[headerName];
+        if (typeof value === 'string') proxyRequest.headers[headerName] = value;
+      }
       const clientRequestId = req.headers['x-request-id'];
-      if (clientRequestId) proxyRequest.headers['x-request-id'] = clientRequestId as string;
 
       const response = await new Promise<GatewayHttpProxyResponse | null>((resolve, reject) => {
         const timeout = setTimeout(() => { pendingHttpRequests.delete(requestId); reject(new ProxyError(504, 'GATEWAY_TIMEOUT', 'Proxy request timeout')); }, proxyRequestTimeoutMs);
@@ -508,7 +515,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
         sendToWs(backendPeer.ws, proxyRequest);
       });
       if (response === null) return;
-      if (response.headers) { for (const [key, value] of Object.entries(response.headers)) res.setHeader(key, value); }
+      for (const [key, value] of Object.entries(filterProxyResponseHeaders(response.headers))) res.setHeader(key, value);
       if (clientRequestId) res.setHeader('x-request-id', clientRequestId);
       const responseBody = response.bodyEncoding === 'base64'
         ? Buffer.from(response.body, 'base64')
@@ -697,6 +704,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
     // issued credential token (zgd_/zgb_ prefix).
     const auth = resolveToken(message.gatewaySecret);
     if (!auth) {
+      audit('peer.auth_failed', { namespace: message.namespace, peerType: message.peerType });
       sendToWs(ws, { type: 'gateway_error', code: 'UNAUTHORIZED', message: 'Invalid gateway secret' } satisfies GatewayErrorMessage); ws.close(); return null;
     }
     if (auth.kind === 'credential') {
@@ -759,7 +767,13 @@ export function createGatewayServer(config: GatewayConfig): Server {
     if (peer.backendId) {
       broadcastRegistrySnapshot(peerSessionId);
     }
-    console.log(`[Gateway] Peer ${peerSessionId} connected (${peerType}, backend=${peer.backendId || 'none'})`);
+    audit('peer.connected', {
+      peerSessionId,
+      namespace: peer.namespace,
+      peerType,
+      backendId: peer.backendId ?? 'none',
+      credentialId: peer.credentialId ?? 'legacy',
+    });
     return peerSessionId;
   }
 
@@ -770,6 +784,12 @@ export function createGatewayServer(config: GatewayConfig): Server {
   function handlePeerMessage(peerSessionId: string, message: any): void {
     const peer = state.peers.get(peerSessionId);
     if (!peer) return;
+    const validationError = validateGatewayMessage(message);
+    if (validationError) {
+      audit('message.invalid', { peerSessionId, type: message?.type, error: validationError });
+      sendToWs(peer.ws, { type: 'gateway_error', code: 'INVALID_MESSAGE', message: validationError } satisfies GatewayErrorMessage);
+      return;
+    }
     switch (message.type) {
       case 'backend_heartbeat': handleBackendHeartbeat(peer, message); break;
       case 'backend_resource_snapshot': handleBackendResourceSnapshot(peer, message); break;
@@ -894,6 +914,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
     }
     // Check if this peer is already subscribed before adding
     const alreadySubscribed = peer.subscribedBackends.has(msg.backendId);
+    if (!alreadySubscribed) audit('backend.subscribed', { peerSessionId: peer.peerSessionId, backendId: msg.backendId });
     const demandChanged = state.addSubscription(msg.backendId, peer.peerSessionId);
     if (demandChanged) {
       const bp = findBackendPeer(msg.backendId);
@@ -916,6 +937,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
   }
 
   function handleUnsubscribeBackend(peer: PeerSession, msg: UnsubscribeBackendMessage): void {
+    audit('backend.unsubscribed', { peerSessionId: peer.peerSessionId, backendId: msg.backendId });
     const demandChanged = state.removeSubscription(msg.backendId, peer.peerSessionId);
     sendToWs(peer.ws, { type: 'backend_unsubscribed', backendId: msg.backendId, reason: 'client_unsubscribed' } satisfies BackendUnsubscribedMessage);
     // Notify backend to clean up this client's server-side state (virtualClient, terminal, etc.)
@@ -1023,7 +1045,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
     if (!ownsProxyRequest(peer, pending.backendId)) return;
     clearTimeout(pending.timeout); pendingHttpRequests.delete(msg.requestId);
     const res = pending.res;
-    if (msg.headers) { for (const [key, value] of Object.entries(msg.headers)) res.setHeader(key, value); }
+    for (const [key, value] of Object.entries(filterProxyResponseHeaders(msg.headers))) res.setHeader(key, value);
     res.status(msg.statusCode);
     const streamTimeout = setTimeout(() => { abortStreamingResponse(msg.requestId, res, 'Proxy streaming timeout'); }, proxyStreamingTimeoutMs);
     res.once('close', () => {
@@ -1120,7 +1142,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
   function handlePeerDisconnect(peerSessionId: string): void {
     const peer = state.peers.get(peerSessionId);
     if (!peer) return;
-    console.log(`[Gateway] Peer ${peerSessionId} disconnected`);
+    audit('peer.disconnected', { peerSessionId, namespace: peer.namespace, backendId: peer.backendId ?? 'none' });
     if (peer.backendId && isCurrentBackendOwner(peer)) {
       rejectPendingProxyRequests(peer.backendId);
       notifySubscribersBackendGone(peer.backendId, 'backend_offline');
