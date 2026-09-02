@@ -8,6 +8,7 @@
 | --- | --- | --- |
 | [0001](0001-deployment-and-tls-termination.md) | 部署形态与 TLS 终止 | Accepted |
 | [0002](0002-identity-issuance.md) | 身份签发：Gateway 最小认证 | Accepted |
+| [0003](0003-channel-transport.md) | Channel 传输承载：每 Channel 一条 WS 连接 | Accepted |
 
 ## 待定决策
 

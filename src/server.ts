@@ -66,6 +66,10 @@ interface GatewayConfig {
   authTimeoutMs?: number;
   proxyRequestTimeoutMs?: number;
   proxyStreamingTimeoutMs?: number;
+  /** v4: one-time channel dial ticket TTL (= pairing timeout). Default 30s. */
+  channelTicketTtlMs?: number;
+  /** v4: max concurrent channels a single peer may hold open. Default 32. */
+  maxChannelsPerPeer?: number;
   /** Trust X-Forwarded-For header for IP extraction. Only enable behind a trusted reverse proxy. */
   trustProxy?: boolean;
   /**
@@ -110,7 +114,7 @@ function validatePeerHelloMessage(message: unknown): string | null {
   const msg = message as Record<string, unknown>;
   if (msg.type !== 'peer_hello') return 'First message must be peer_hello';
   if (typeof msg.gatewaySecret !== 'string') return 'peer_hello.gatewaySecret must be a string';
-  if (msg.protocolVersion !== 3) return 'peer_hello.protocolVersion must be 3';
+  if (msg.protocolVersion !== 3 && msg.protocolVersion !== 4) return 'peer_hello.protocolVersion must be 3 or 4';
   if (typeof msg.namespace !== 'string' || !msg.namespace) return 'peer_hello.namespace must be a non-empty string';
   if (typeof msg.clientProtocolVersion !== 'number') return 'peer_hello.clientProtocolVersion must be a number';
   if (msg.peerType !== 'client-only' && msg.peerType !== 'client+backend') {
@@ -147,6 +151,8 @@ export function createGatewayServer(config: GatewayConfig): Server {
   const authTimeoutMs = config.authTimeoutMs ?? 10_000;
   const proxyRequestTimeoutMs = config.proxyRequestTimeoutMs ?? 30_000;
   const proxyStreamingTimeoutMs = config.proxyStreamingTimeoutMs ?? 60_000;
+  const channelTicketTtlMs = config.channelTicketTtlMs ?? 30_000;
+  const maxChannelsPerPeer = config.maxChannelsPerPeer ?? 32;
   const trustProxy = config.trustProxy ?? false;
 
   const app = express();
@@ -194,6 +200,9 @@ export function createGatewayServer(config: GatewayConfig): Server {
     }
     for (const [ip, entry] of proxyRequests) {
       if (now > entry.resetAt) proxyRequests.delete(ip);
+    }
+    for (const [token, ticket] of channelTickets) {
+      if (now > ticket.expiresAt) channelTickets.delete(token);
     }
   }, 5 * 60_000);
 
@@ -542,8 +551,198 @@ export function createGatewayServer(config: GatewayConfig): Server {
   const sockets = new Set<Socket>();
   const wsConnectionsPerIp = new Map<string, number>();
   const MAX_WS_CONNECTIONS_PER_IP = 10;
-  const wss = new WebSocketServer({ server: httpServer, path: '/ws', maxPayload: 50 * 1024 * 1024 });
+  // Control plane (/ws) and data plane (/channel/:id) are separate WS
+  // servers routed manually off the single HTTP server (ADR-0003).
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 50 * 1024 * 1024 });
+  const channelWss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 * 1024 });
   let cleanedUp = false;
+
+  httpServer.on('upgrade', (req, socket, head) => {
+    const pathname = new URL(req.url ?? '/', 'http://localhost').pathname;
+    if (pathname === '/ws') {
+      wss.handleUpgrade(req, socket as Socket, head, (ws) => wss.emit('connection', ws, req));
+    } else if (pathname.startsWith('/channel/')) {
+      handleChannelUpgrade(req, socket as Socket, head, pathname);
+    } else {
+      socket.destroy();
+    }
+  });
+
+  // ========================================================================
+  // v4 Channels (docs/protocol-v4.md, ADR-0003)
+  // ========================================================================
+
+  interface ChannelRecord {
+    channelId: string;
+    backendId: string;
+    epoch: number;
+    kind?: string;
+    clientPeerSessionId: string;
+    backendPeerSessionId: string;
+    clientSocket?: WebSocket;
+    backendSocket?: WebSocket;
+    piped: boolean;
+    /** Ticket tokens, kept so teardown can invalidate unused ones. */
+    ticketTokens: string[];
+    pairingTimeout: NodeJS.Timeout;
+  }
+
+  const channels = new Map<string, ChannelRecord>();
+  const channelTickets = new Map<string, { channelId: string; role: 'client' | 'backend'; expiresAt: number }>();
+
+  function issueChannelTicket(channelId: string, role: 'client' | 'backend'): string {
+    const token = crypto.randomBytes(24).toString('base64url');
+    channelTickets.set(token, { channelId, role, expiresAt: Date.now() + channelTicketTtlMs });
+    return token;
+  }
+
+  function countChannelsForPeer(peerSessionId: string): number {
+    let count = 0;
+    for (const ch of channels.values()) {
+      if (ch.clientPeerSessionId === peerSessionId || ch.backendPeerSessionId === peerSessionId) count++;
+    }
+    return count;
+  }
+
+  function teardownChannel(channelId: string, reason: string): void {
+    const ch = channels.get(channelId);
+    if (!ch) return;
+    channels.delete(channelId);
+    clearTimeout(ch.pairingTimeout);
+    for (const token of ch.ticketTokens) channelTickets.delete(token);
+    for (const socket of [ch.clientSocket, ch.backendSocket]) {
+      if (socket && socket.readyState === WebSocket.OPEN) socket.close(1000, reason);
+      else socket?.terminate();
+    }
+    const closedMsg = { type: 'channel_closed', channelId, reason };
+    for (const sessionId of [ch.clientPeerSessionId, ch.backendPeerSessionId]) {
+      const peer = state.peers.get(sessionId);
+      if (peer) sendToWs(peer.ws, closedMsg);
+    }
+    audit('channel.closed', { channelId, reason });
+  }
+
+  function closeChannelsForBackend(backendId: string, reason: string): void {
+    for (const ch of [...channels.values()]) {
+      if (ch.backendId === backendId) teardownChannel(ch.channelId, reason);
+    }
+  }
+
+  function closeChannelsForPeer(peerSessionId: string): void {
+    for (const ch of [...channels.values()]) {
+      if (ch.clientPeerSessionId === peerSessionId || ch.backendPeerSessionId === peerSessionId) {
+        teardownChannel(ch.channelId, 'closed');
+      }
+    }
+  }
+
+  /**
+   * Frame-level relay preserving the text/binary flag (a stream pipe would
+   * coerce everything to binary). Backpressure: when the receiver's send
+   * buffer exceeds the high-water mark, pause the sender's socket until it
+   * drains — memory stays bounded per channel.
+   */
+  function wireChannel(ch: ChannelRecord): void {
+    const a = ch.clientSocket!;
+    const b = ch.backendSocket!;
+    ch.piped = true;
+    const HIGH_WATER = 4 * 1024 * 1024;
+    const relay = (from: WebSocket, to: WebSocket) => {
+      from.on('message', (data: Buffer, isBinary: boolean) => {
+        if (to.readyState !== WebSocket.OPEN) return;
+        to.send(data, { binary: isBinary });
+        if (to.bufferedAmount > HIGH_WATER) {
+          from.pause();
+          const drain = setInterval(() => {
+            if (to.bufferedAmount <= HIGH_WATER / 4 || to.readyState !== WebSocket.OPEN) {
+              clearInterval(drain);
+              from.resume();
+            }
+          }, 20);
+        }
+      });
+      from.on('close', () => teardownChannel(ch.channelId, 'closed'));
+      from.on('error', () => teardownChannel(ch.channelId, 'closed'));
+    };
+    relay(a, b);
+    relay(b, a);
+    audit('channel.open', { channelId: ch.channelId, backendId: ch.backendId, kind: ch.kind ?? '' });
+  }
+
+  function handleChannelUpgrade(req: IncomingMessage, socket: Socket, head: Buffer, pathname: string): void {
+    const url = new URL(req.url ?? '/', 'http://localhost');
+    const channelId = pathname.slice('/channel/'.length);
+    const token = url.searchParams.get('ticket') ?? '';
+    const ticket = channelTickets.get(token);
+    // One-time: consume before any further checks.
+    if (ticket) channelTickets.delete(token);
+    const ch = channelId ? channels.get(channelId) : undefined;
+    if (!ticket || !ch || ticket.channelId !== channelId || Date.now() > ticket.expiresAt) {
+      audit('channel.dial_rejected', { channelId: channelId || 'none' });
+      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    channelWss.handleUpgrade(req, socket, head, (ws) => {
+      if (!channels.has(channelId)) { ws.terminate(); return; }
+      if (ticket.role === 'client') ch.clientSocket = ws;
+      else ch.backendSocket = ws;
+      if (ch.clientSocket && ch.backendSocket && !ch.piped) {
+        clearTimeout(ch.pairingTimeout);
+        wireChannel(ch);
+      }
+    });
+  }
+
+  function handleChannelOpen(peer: PeerSession, msg: { target: string; kind?: string }): void {
+    if (peer.protocolVersion !== 4) {
+      sendToWs(peer.ws, { type: 'gateway_error', code: 'INVALID_MESSAGE', message: 'channel_open requires protocol v4' } satisfies GatewayErrorMessage);
+      return;
+    }
+    const presence = state.registry.items.get(msg.target);
+    const lease = state.leases.get(msg.target);
+    const backendPeer = lease ? state.peers.get(lease.peerSessionId) : undefined;
+    // Same non-oracle answer for nonexistent, offline, and cross-namespace.
+    if (!presence || !lease || !backendPeer || presence.namespace !== peer.namespace) {
+      sendToWs(peer.ws, { type: 'gateway_error', code: 'BACKEND_OFFLINE', message: `Backend ${msg.target} not found or offline` } satisfies GatewayErrorMessage);
+      return;
+    }
+    if (countChannelsForPeer(peer.peerSessionId) >= maxChannelsPerPeer) {
+      sendToWs(peer.ws, { type: 'gateway_error', code: 'RATE_LIMITED', message: 'Too many open channels' } satisfies GatewayErrorMessage);
+      return;
+    }
+    const channelId = crypto.randomBytes(16).toString('hex');
+    const clientTicket = issueChannelTicket(channelId, 'client');
+    const backendTicket = issueChannelTicket(channelId, 'backend');
+    const ch: ChannelRecord = {
+      channelId,
+      backendId: msg.target,
+      epoch: lease.epoch,
+      kind: msg.kind,
+      clientPeerSessionId: peer.peerSessionId,
+      backendPeerSessionId: lease.peerSessionId,
+      piped: false,
+      ticketTokens: [clientTicket, backendTicket],
+      pairingTimeout: setTimeout(() => teardownChannel(channelId, 'timeout'), channelTicketTtlMs),
+    };
+    channels.set(channelId, ch);
+    const dataPath = `/channel/${channelId}`;
+    sendToWs(backendPeer.ws, { type: 'channel_offer', channelId, kind: msg.kind, sourcePeerSessionId: peer.peerSessionId, ticket: backendTicket, dataPath });
+    sendToWs(peer.ws, { type: 'channel_ready', channelId, ticket: clientTicket, dataPath });
+  }
+
+  function handleChannelReject(peer: PeerSession, msg: { channelId: string; reason?: string }): void {
+    const ch = channels.get(msg.channelId);
+    if (!ch || ch.backendPeerSessionId !== peer.peerSessionId) return;
+    teardownChannel(msg.channelId, 'rejected');
+  }
+
+  function handleChannelClose(peer: PeerSession, msg: { channelId: string }): void {
+    const ch = channels.get(msg.channelId);
+    if (!ch) return;
+    if (ch.clientPeerSessionId !== peer.peerSessionId && ch.backendPeerSessionId !== peer.peerSessionId) return;
+    teardownChannel(msg.channelId, 'closed');
+  }
 
   httpServer.on('connection', (socket) => {
     sockets.add(socket);
@@ -557,6 +756,8 @@ export function createGatewayServer(config: GatewayConfig): Server {
     clearInterval(leaseCheckInterval);
     clearInterval(registryPollInterval);
     clearInterval(rateLimitCleanup);
+    for (const ch of [...channels.values()]) teardownChannel(ch.channelId, 'closed');
+    channelWss.close();
     state.destroy();
     storage.close();
   }
@@ -720,8 +921,8 @@ export function createGatewayServer(config: GatewayConfig): Server {
         sendToWs(ws, { type: 'gateway_error', code: 'UNAUTHORIZED', message: 'This credential cannot register a backend' } satisfies GatewayErrorMessage); ws.close(); return null;
       }
     }
-    if (message.protocolVersion !== 3) {
-      sendToWs(ws, { type: 'gateway_error', code: 'PROTOCOL_VERSION_MISMATCH', message: `Expected protocol version 3, got ${message.protocolVersion}` } satisfies GatewayErrorMessage); ws.close(); return null;
+    if (message.protocolVersion !== 3 && message.protocolVersion !== 4) {
+      sendToWs(ws, { type: 'gateway_error', code: 'PROTOCOL_VERSION_MISMATCH', message: `Expected protocol version 3 or 4, got ${message.protocolVersion}` } satisfies GatewayErrorMessage); ws.close(); return null;
     }
     const peerSessionId = uuidv4();
     const recoveryToken = crypto.randomBytes(32).toString('hex');
@@ -730,6 +931,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
     const peer: PeerSession = {
       peerSessionId,
       ws,
+      protocolVersion: message.protocolVersion as 3 | 4,
       peerType,
       namespace: message.namespace,
       credentialId: auth.kind === 'credential' ? auth.credential.id : undefined,
@@ -761,7 +963,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
     state.addPeer(peer);
     recoveryTokens.set(recoveryToken, peerSessionId);
     const registrySync: RegistrySyncPayload = { items: state.getRegistrySnapshot(peer.namespace) };
-    const ready: PeerReadyMessage = { type: 'peer_ready', protocolVersion: 3, peerSessionId, recoveryToken, backend: backendInfo, registrySync };
+    const ready: PeerReadyMessage = { type: 'peer_ready', protocolVersion: peer.protocolVersion, peerSessionId, recoveryToken, backend: backendInfo, registrySync };
     sendToWs(ws, ready);
 
     if (peer.backendId) {
@@ -809,6 +1011,9 @@ export function createGatewayServer(config: GatewayConfig): Server {
       case 'http_proxy_response_chunk': handleHttpProxyResponseChunk(peer, message); break;
       case 'http_proxy_response_end': handleHttpProxyResponseEnd(peer, message); break;
       case 'push_notification_request': handlePushNotificationRequest(peer, message); break;
+      case 'channel_open': handleChannelOpen(peer, message); break;
+      case 'channel_reject': handleChannelReject(peer, message); break;
+      case 'channel_close': handleChannelClose(peer, message); break;
       case 'ping': sendToWs(peer.ws, { type: 'pong', ts: message.ts }); break;
       default: sendToWs(peer.ws, { type: 'gateway_error', code: 'INVALID_MESSAGE', message: `Unknown message type: ${message.type}` } satisfies GatewayErrorMessage);
     }
@@ -1102,6 +1307,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
     const lease = state.leases.get(backendId);
     if (!lease) return;
     const peer = state.peers.get(lease.peerSessionId);
+    closeChannelsForBackend(backendId, 'backend_offline');
     rejectPendingProxyRequests(backendId);
     notifySubscribersBackendGone(backendId, 'backend_offline');
     state.registryRemove(backendId);
@@ -1144,12 +1350,17 @@ export function createGatewayServer(config: GatewayConfig): Server {
     if (!peer) return;
     audit('peer.disconnected', { peerSessionId, namespace: peer.namespace, backendId: peer.backendId ?? 'none' });
     if (peer.backendId && isCurrentBackendOwner(peer)) {
+      // Close backend-side channels first so they carry backend_offline,
+      // not the generic per-peer 'closed' from the cleanup below.
+      closeChannelsForBackend(peer.backendId, 'backend_offline');
       rejectPendingProxyRequests(peer.backendId);
       notifySubscribersBackendGone(peer.backendId, 'backend_offline');
       state.registryRemove(peer.backendId);
       broadcastRegistrySnapshot(peerSessionId);
       state.removeBackend(peer.backendId);
     }
+    // Close any remaining channels where this peer is the client end
+    closeChannelsForPeer(peerSessionId);
     // Clean up this peer's subscriptions: notify backends and update stream demand
     const affectedBackends = state.removeAllSubscriptions(peerSessionId);
     for (const backendId of affectedBackends) {
@@ -1222,6 +1433,9 @@ export function createGatewayServer(config: GatewayConfig): Server {
     nextEpoch: number,
     previousPeerSessionId: string,
   ): void {
+    // v4: the gateway is the authority on epoch invalidation — all channels
+    // bound to the previous epoch are closed here, not inferred client-side.
+    closeChannelsForBackend(backendId, 'epoch_changed');
     notifySubscribersBackendGone(backendId, 'epoch_changed');
     state.removeLease(backendId);
 

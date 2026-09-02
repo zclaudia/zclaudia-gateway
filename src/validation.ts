@@ -102,6 +102,18 @@ const MESSAGE_SPECS: Record<string, MessageSpec> = {
   ping: {
     ts: { kind: 'number', optional: true },
   },
+  // v4 channel control messages (docs/protocol-v4.md)
+  channel_open: {
+    target: { kind: 'non-empty-string' },
+    kind: { kind: 'string', optional: true },
+  },
+  channel_reject: {
+    channelId: { kind: 'non-empty-string' },
+    reason: { kind: 'string', optional: true },
+  },
+  channel_close: {
+    channelId: { kind: 'non-empty-string' },
+  },
 };
 
 function checkField(value: unknown, spec: FieldSpec): string | null {

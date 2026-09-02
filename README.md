@@ -25,7 +25,8 @@ mobile ── HTTP /api/proxy ┘      │
 
 | Gateway 版本 | 协议版本（`peer_hello.protocolVersion`） | 协议包 | 说明 |
 | --- | --- | --- | --- |
-| 0.1.x（当前） | **3** | `@zclaudia/protocol` ^0.2.0 | 唯一支持的版本，其余一律拒绝（`PROTOCOL_VERSION_MISMATCH`） |
+| 0.1.x（当前） | **3** | `@zclaudia/protocol` ^0.2.0 | 完整支持，行为不变 |
+| 0.1.x（当前） | **4**（Draft） | 规范见 [docs/protocol-v4.md](docs/protocol-v4.md) | v3 全部消息 + Channel（控制面协商 + 每 Channel 一条独立 WS 数据连接，[ADR-0003](docs/adr/0003-channel-transport.md)）；与 v3 同实例共存 |
 | — | 1 / 2 | — | 已废弃，无兼容层 |
 
 `clientProtocolVersion` / `backendProtocolVersion` 是应用层版本号，Gateway 只透传不解释。

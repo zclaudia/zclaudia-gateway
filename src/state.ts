@@ -20,6 +20,8 @@ import type { WebSocket } from 'ws';
 export interface PeerSession {
   peerSessionId: PeerSessionId;
   ws: WebSocket;
+  /** Negotiated protocol version for this session (v3 and v4 coexist). */
+  protocolVersion: 3 | 4;
   peerType: 'client-only' | 'client+backend';
   /**
    * Isolation domain. Currently taken from peer_hello (self-declared);
