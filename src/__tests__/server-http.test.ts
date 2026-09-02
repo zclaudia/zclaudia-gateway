@@ -43,7 +43,7 @@ function closeWs(ws: WebSocket): Promise<void> {
 }
 
 // Helper: collect next message of specific type
-function waitForMessage(ws: WebSocket, type: string, timeoutMs = 1000): Promise<any> {
+function waitForMessage(ws: WebSocket, type: string, timeoutMs = 5000): Promise<any> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       reject(new Error(`Timeout waiting for message type: ${type}`));

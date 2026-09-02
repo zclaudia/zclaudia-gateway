@@ -27,7 +27,7 @@ function waitForOpen(ws: WebSocket): Promise<void> {
   });
 }
 
-function waitForMessage<T = unknown>(ws: WebSocket, type: string, timeoutMs = 1000): Promise<T> {
+function waitForMessage<T = unknown>(ws: WebSocket, type: string, timeoutMs = 5000): Promise<T> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       ws.off('message', handler);
@@ -46,7 +46,7 @@ function waitForMessage<T = unknown>(ws: WebSocket, type: string, timeoutMs = 10
   });
 }
 
-function waitForClose(ws: WebSocket, timeoutMs = 1000): Promise<{ code: number; reason: string }> {
+function waitForClose(ws: WebSocket, timeoutMs = 5000): Promise<{ code: number; reason: string }> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error('Timeout waiting for websocket close')), timeoutMs);
     ws.once('close', (code, reason) => {

@@ -5,8 +5,7 @@ import { describe, test, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import Database from 'better-sqlite3';
-import { GatewayStorage, initDatabase } from '../storage.js';
+import { GatewayStorage } from '../storage.js';
 
 describe('GatewayStorage', () => {
   let testDataDir: string;
@@ -150,27 +149,6 @@ describe('GatewayStorage', () => {
   });
 });
 
-describe('initDatabase', () => {
-  let testDataDir: string;
-
-  beforeEach(() => {
-    testDataDir = path.join(os.tmpdir(), `gateway-test-${Date.now()}`);
-    process.env.ZCLAUDIA_DATA_DIR = testDataDir;
-  });
-
-  afterEach(() => {
-    delete process.env.ZCLAUDIA_DATA_DIR;
-    if (fs.existsSync(testDataDir)) {
-      fs.rmSync(testDataDir, { recursive: true, force: true });
-    }
-  });
-
-  test('should create database file', () => {
-    // Mock the DATA_DIR by temporarily modifying the module
-    const originalDir = path.join(os.homedir(), '.zclaudia', 'gateway');
-    
-    // Just verify the function creates a valid database
-    // Note: We can't easily mock the DATA_DIR constant since it's evaluated at import time
-    // So we test the actual behavior which creates in ~/.zclaudia/gateway
-  });
-});
+// NOTE: no test suite for initDatabase's default DATA_DIR (~/.zclaudia/gateway):
+// the constant is evaluated at import time and cannot be mocked without
+// refactoring storage.ts to accept an injectable path.

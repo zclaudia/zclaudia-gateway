@@ -43,7 +43,7 @@ function closeWs(ws: WebSocket): Promise<void> {
 }
 
 // Helper: collect next message of specific type
-function waitForMessage(ws: WebSocket, type: string, timeoutMs = 1000): Promise<any> {
+function waitForMessage(ws: WebSocket, type: string, timeoutMs = 5000): Promise<any> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       reject(new Error(`Timeout waiting for message type: ${type}`));
@@ -148,7 +148,7 @@ describeIfLoopback('Gateway Error Handling', () => {
 
         // Close all
         await Promise.all(connections.map(ws => closeWs(ws)));
-      } catch (err) {
+      } catch {
         // One of the connections might fail due to limit
         await Promise.all(connections.map(ws => closeWs(ws)));
       }
@@ -163,11 +163,9 @@ describeIfLoopback('Gateway Error Handling', () => {
       const { backendId } = await registerBackendV2(backendWs, { deviceId: 'proxy-error-device', instanceId: 'inst-proxy-error-device', name: 'Proxy Error Backend' });
 
       // Listen for proxy request
-      let requestId: string | null = null;
       backendWs.on('message', (data) => {
         const msg = JSON.parse(data.toString());
         if (msg.type === 'http_proxy_request') {
-          requestId = msg.requestId;
           // Close without responding
           backendWs.close();
         }

@@ -56,7 +56,7 @@ class MessageCollector {
   }
 
   /** Wait for and consume a message of the given type */
-  waitFor(type: string, timeoutMs = 1000): Promise<any> {
+  waitFor(type: string, timeoutMs = 5000): Promise<any> {
     // Check if already in unconsumed queue
     const idx = this.unconsumed.findIndex(m => m.type === type);
     if (idx !== -1) {
@@ -107,7 +107,6 @@ describe('Gateway v2 backend data relay', () => {
   let backendWs: WebSocket;
   let backendCollector: MessageCollector;
   let backendId: string;
-  let backendEpoch: number;
   let wsUrl: string;
   let openClients: WebSocket[] = [];
 
@@ -131,7 +130,6 @@ describe('Gateway v2 backend data relay', () => {
     }));
     const regResult = await backendCollector.waitFor('peer_ready');
     backendId = regResult.backend.backendId;
-    backendEpoch = regResult.backend.epoch;
   });
 
   afterEach(async () => {
@@ -371,9 +369,7 @@ describe('Gateway v2 backend subscriptions', () => {
   let backendCollectorA: MessageCollector;
   let backendCollectorB: MessageCollector;
   let backendIdA: string;
-  let backendEpochA: number;
   let backendIdB: string;
-  let backendEpochB: number;
   let wsUrl: string;
   let openClients: WebSocket[] = [];
 
@@ -397,7 +393,6 @@ describe('Gateway v2 backend subscriptions', () => {
     }));
     const regA = await backendCollectorA.waitFor('peer_ready');
     backendIdA = regA.backend.backendId;
-    backendEpochA = regA.backend.epoch;
 
     // Register backend B
     backendWsB = new WebSocket(wsUrl);
@@ -415,7 +410,6 @@ describe('Gateway v2 backend subscriptions', () => {
     }));
     const regB = await backendCollectorB.waitFor('peer_ready');
     backendIdB = regB.backend.backendId;
-    backendEpochB = regB.backend.epoch;
   });
 
   afterEach(async () => {

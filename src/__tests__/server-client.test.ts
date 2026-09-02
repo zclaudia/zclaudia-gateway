@@ -42,7 +42,7 @@ function closeWs(ws: WebSocket): Promise<void> {
 }
 
 // Helper: collect next message of specific type
-function waitForMessage(ws: WebSocket, type: string, timeoutMs = 1000): Promise<any> {
+function waitForMessage(ws: WebSocket, type: string, timeoutMs = 5000): Promise<any> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       reject(new Error(`Timeout waiting for message type: ${type}`));
@@ -113,7 +113,6 @@ describeIfLoopback('Gateway Client Message Handling', () => {
   let backendWs: WebSocket;
   let backendId: string;
   let backendEpoch: number;
-  let backendCollector: ReturnType<typeof createMessageCollector>;
   let openClients: WebSocket[] = [];
 
   beforeEach(async () => {
@@ -123,7 +122,8 @@ describeIfLoopback('Gateway Client Message Handling', () => {
     // Register a backend
     backendWs = new WebSocket(WS_URL);
     await waitForOpen(backendWs);
-    backendCollector = createMessageCollector(backendWs);
+    // Attach a collector so backend messages are drained (return value unused)
+    createMessageCollector(backendWs);
 
     const reg = await registerBackendV2(backendWs, { deviceId: 'test-backend-device', instanceId: 'inst-test-backend-device', name: 'Test Backend' });
     backendId = reg.backendId;

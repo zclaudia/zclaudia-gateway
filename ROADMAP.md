@@ -1,6 +1,6 @@
 # zclaudia-gateway 通用化 Roadmap
 
-> 状态：Draft（2026-09-01 修订一：wire 格式变更集中到 v4、Tenant 机制降级为字段预留、新增 Channel 传输承载 ADR、Go SDK 推迟、时间估算标注为乐观值。修订二：基于 zclaudia 与 comfy-mobile-ui 代码调研补充 Channel 身份四元组、三载体拨号认证（ticket 为客户端主路径）、Topic 升级为一等原语、epoch 失效语义、Comfy 设备凭证 origin 迁移与保活要求）
+> 状态：Draft（2026-09-01 修订一：wire 格式变更集中到 v4、Tenant 机制降级为字段预留、新增 Channel 传输承载 ADR、Go SDK 推迟、时间估算标注为乐观值。修订二：基于 zclaudia 与 comfy-mobile-ui 代码调研补充 Channel 身份四元组、三载体拨号认证（ticket 为客户端主路径）、Topic 升级为一等原语、epoch 失效语义、Comfy 设备凭证 origin 迁移与保活要求。2026-09-02 修订三：Phase 3 后检查点、namespace 共存测试、基于 hermes-client-mobile 调研重写 Phase 4——Hermes 本体为 Python、现有 Go proxy 242 行可移植、per-client 身份为核心增量、媒体签名 URL 为硬需求、事件缺 session_id 需 Hermes 侧协议配合）
 >
 > 更新日期：2026-09-01
 >
@@ -168,6 +168,7 @@ Adapter 使用统一 Backend SDK 连接中心 Gateway。本地服务的私有 To
 
 - 客户端凭证不能注册、替换或冒充 Backend；
 - 不同 Namespace 之间的 registry、消息和 HTTP 请求完全隔离；
+- 显式集成测试：同一 Gateway 实例上注册两个不同 namespace 的 Backend，双方的客户端在 registry 中互相不可见、订阅互相被拒（这是三个应用共用同一实例的前提条件）；
 - 伪造 request ID、target peer 或 Backend 响应不能跨 Channel 生效；
 - 本地 Session Token、Cookie 和内部认证 Header 不会泄漏到远程客户端；
 - 现有 v3 客户端无需修改即可通过本阶段的全部变更；
@@ -269,22 +270,37 @@ response.end
 
 目标：通过一个 JSON-RPC 应用验证通用 Channel 与本地 Adapter 模型。
 
+可行性依据（2026-09 对 hermes-client-mobile 的代码调研）：
+
+- Hermes 本体是 **Python 进程**（`hermes_cli.main serve`，监听 `127.0.0.1:9119`），客户端是 Tauri Android 应用（bearer-on-handshake 已在用，Hermes 客户端是三个应用中唯一可直接走 header 主路径的）；
+- 现有 Hermes Gateway 是 242 行零依赖的 Go 无状态反向代理：路径 allowlist、REST 注入 `X-Hermes-Session-Token` header、WS 注入 `?token=` query、响应侧清洗 `Set-Cookie`/session header、macOS 上 session token 从进程环境动态抓取且永不落盘——安全策略可整体继承，且逻辑量小到可低成本移植进 Node Adapter；
+- **单一静态 access token、零 per-client 身份**：两台设备是同一个 principal，Hermes 无法区分调用方——per-client 凭证是本阶段的核心增量；
+- 64 MB base64 附件限制确认（`attachments.ts` 客户端限制，服务端无对应限制），实际为约 85 MB 的单帧 JSON 文本经 WS 传输；
+- **协议缺口**：Hermes 事件流不带 session_id，客户端用启发式把无归属事件钉到活跃会话上（`stream-model.ts`）——这层串线风险 Gateway/Adapter 无法单方修复，需要 Hermes 侧在事件上补 session_id，Gateway 层能保证的上限是 per-client 隔离；
+- 媒体加载是裸 `<img src>` 指向 `/api/*`，WebView 不会带 Authorization，现状会 401（客户端已有"图片已失效"兜底掩盖此问题）——签名 URL/带 token 路径是硬需求而非可选项；
+- 无任何心跳（Tauri WS adapter 未建模 Ping/Pong 帧）；断线恢复 = `session.resume` 全量重拉，无 replay，与 v4"快速重开不做无缝恢复"的决策一致；
+- 客户端另有约 27 个 `/api/*` REST 管理路由，与 WS 同源同凭证——HTTP Channel 映射需求确认；
+- ⚠️ JSON-RPC wire framing（id 格式、错误形状、超时）位于 `@hermes/shared`（`~/.hermes/hermes-agent`，调研机器上不存在）——**Phase 2 Hermes 原型开工前需 checkout 该仓库验证**。
+
 工作项：
 
-- 以 Node Sidecar 形式实现 `gateway-adapter-hermes`（复用 `@zclaudia/gateway-backend`，本地转发到 Hermes 进程）；Go 版 Backend SDK 推迟到协议稳定且确有需要时再实现，本阶段只输出语言无关的协议规范文档；
+- 以 Node Sidecar 形式实现 `gateway-adapter-hermes`（复用 `@zclaudia/gateway-backend`，移植现有 Go proxy 的 allowlist 与凭证替换逻辑）；Go 版 Backend SDK 推迟到协议稳定且确有需要时再实现，本阶段只输出语言无关的协议规范文档；
 - 将现有 Hermes Gateway 的职责迁移到 `gateway-adapter-hermes`；
-- 每个远程 source Peer 使用独立本地 Hermes WebSocket；
-- Adapter 在本地注入 `X-Hermes-Session-Token`；
+- 每个远程 source Peer 使用独立本地 Hermes WebSocket（现有 Go proxy 已按连接对接上游，语义保持）；
+- Adapter 在本地注入 `X-Hermes-Session-Token`（REST header）与 `?token=`（WS query），并保持响应侧清洗；
+- 以 Gateway 凭证体系替换单一静态 access token，实现 per-client 身份；
 - 提供 Hermes Virtual WebSocket，使现有 `JsonRpcGatewayClient` 尽量无需修改；
-- 将 `/api/*` 映射到受控的 HTTP Channel；
-- 重新设计大附件传输，避免 64 MB JSON/Base64 消息；
-- 为媒体资源采用 authenticated fetch、短期签名 URL 或受控流式代理；
-- 支持断线重连、Channel 恢复和重复请求保护。
+- 将 `/api/*` 管理路由映射到受控的 HTTP Channel；
+- 重新设计大附件传输，避免约 85 MB 的 base64 单帧消息（迁移到 v4 流式上传通道）；
+- 为媒体资源实现短期签名 URL 或带 token 路径（`<img>` 无法携带 Authorization，现状 401）；
+- Gateway 对 Hermes 长连接主动心跳（客户端栈完全无保活）；
+- 支持断线重连、Channel 恢复和重复请求保护；
+- 向 Hermes 侧提出事件补 session_id 的协议变更（会话级串线的根治依赖此项）。
 
 验收标准：
 
 - Hermes 私有 Session Token 只存在于 Hermes 主机；
-- 两个远程客户端的本地 WebSocket 会话和响应不会相互串线；
+- 两个远程客户端各自持有独立凭证，可单独撤销；本地 WebSocket 会话和响应不会跨客户端串线；
 - JSON-RPC、HTTP、上传、下载和媒体访问通过端到端测试；
 - Hermes 可以在保留旧 Gateway 回退路径的情况下灰度迁移。
 
@@ -364,6 +380,8 @@ Phase 4 Hermes   Phase 5 ComfyUI
 ```
 
 推荐 Hermes 先于 ComfyUI：Hermes 可以先验证通用 Adapter 和 JSON-RPC Channel；ComfyUI 对二进制、流式传输和认证的要求更高，适合作为数据面成熟后的完整验证项目。
+
+**Phase 3 后检查点**：Phase 0–3 是确定要做的核心（安全 + 流式数据面 + zclaudia 迁移，硬收益全部在此兑现）；Phase 4 和 Phase 5 是两个独立裁决的迁移项目，各自按"迁移成本 vs 退役一套自建 Gateway 的维护节省"评估。Phase 3 完成时用真实数据重新决策：新核心的稳定性表现、zclaudia 迁移的实际耗时与估算偏差、Hermes 痛点的紧急程度。ComfyUI 现有 Gateway 是三者中最完善的，Phase 5 可以无限期推迟而没有任何东西损坏。
 
 ## 7. 初步时间估算
 
