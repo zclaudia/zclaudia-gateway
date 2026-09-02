@@ -1,7 +1,9 @@
 /**
- * Gateway Sync Protocol — Server Implementation
+ * Gateway Sync Protocol v3 — Server Implementation
  *
- * See docs/design/gateway-sync-protocol-v2.md for full specification.
+ * No prose spec exists; the wire format is defined by the types in
+ * @zclaudia/protocol (src/gateway.ts) and the behavior is pinned by
+ * the tests in src/__tests__/. See README.md for an overview.
  */
 
 import { createServer as createHttpServer, IncomingMessage, Server } from 'http';
@@ -200,16 +202,25 @@ export function createGatewayServer(config: GatewayConfig): Server {
     });
   });
 
+  /**
+   * Accepted Bearer token formats (must be identical across all HTTP auth paths):
+   *   1. `Bearer <gatewaySecret>`          — what all current clients send
+   *   2. `Bearer <clientId>:<gatewaySecret>` — legacy composite; clientId is ignored
+   * A secret containing ':' still works via the whole-token comparison in (1).
+   */
+  function isValidGatewayToken(token: string): boolean {
+    if (safeCompare(token, config.gatewaySecret)) return true;
+    const colonIndex = token.indexOf(':');
+    return colonIndex !== -1 && safeCompare(token.slice(colonIndex + 1), config.gatewaySecret);
+  }
+
   function requireGatewayAuth(req: Request, res: Response, next: () => void): void {
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
       res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Authorization required' } });
       return;
     }
-    const token = authHeader.slice(7);
-    const colonIndex = token.indexOf(':');
-    const secret = colonIndex !== -1 ? token.slice(colonIndex + 1) : token;
-    if (!safeCompare(secret, config.gatewaySecret)) {
+    if (!isValidGatewayToken(authHeader.slice(7))) {
       res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Invalid credentials' } });
       return;
     }
@@ -290,10 +301,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
         res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Authorization required' } });
         return;
       }
-      const token = authHeader.slice(7);
-      const colonIndex = token.indexOf(':');
-      const gwSecret = colonIndex !== -1 ? token.slice(0, colonIndex) : token;
-      if (!safeCompare(gwSecret, config.gatewaySecret)) {
+      if (!isValidGatewayToken(authHeader.slice(7))) {
         if (!checkAuthFailLimit(clientIp)) {
           res.status(429).json({ success: false, error: { code: 'RATE_LIMITED', message: 'Too many requests' } });
           return;
@@ -350,7 +358,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
         ? Buffer.from(response.body, 'base64')
         : response.body;
       res.status(response.statusCode).send(responseBody);
-    } catch (error) {
+    } catch {
       if (!res.headersSent) res.status(500).json({ success: false, error: { code: 'PROXY_ERROR', message: 'Failed to proxy request' } });
     }
   });

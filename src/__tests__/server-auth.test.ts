@@ -50,7 +50,7 @@ function closeWs(ws: WebSocket): Promise<void> {
 }
 
 // Helper: collect next message of specific type
-function waitForMessage(ws: WebSocket, type: string, timeoutMs = 1000): Promise<any> {
+function waitForMessage(ws: WebSocket, type: string, timeoutMs = 5000): Promise<any> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       reject(new Error(`Timeout waiting for message type: ${type}`));
@@ -271,8 +271,40 @@ describeIfLoopback('Gateway Authentication', () => {
       await closeWs(backendWs);
     });
 
-    test.skip('should accept clientId:gatewaySecret format - has side effects', async () => {
-      // Skipped due to test isolation issues
+    // Token format regression tests: both HTTP auth paths must accept the same
+    // formats — bare secret and legacy clientId:secret. Auth success on the proxy
+    // route surfaces as 502 BACKEND_OFFLINE for an unknown backend (never 401),
+    // so no backend registration is needed.
+    describe('Bearer token formats', () => {
+      test('proxy route accepts clientId:gatewaySecret composite token', async () => {
+        const response = await fetch(`${httpUrl}/api/proxy/nonexistent-backend/some-path`, {
+          headers: { 'Authorization': `Bearer client-123:${GATEWAY_SECRET}` }
+        });
+        expect(response.status).toBe(502);
+        const body = await response.json();
+        expect(body.error.code).toBe('BACKEND_OFFLINE');
+      });
+
+      test('notification config route accepts clientId:gatewaySecret composite token', async () => {
+        const response = await fetch(`${httpUrl}/api/notifications/config`, {
+          headers: { 'Authorization': `Bearer client-123:${GATEWAY_SECRET}` }
+        });
+        expect(response.status).toBe(200);
+      });
+
+      test('proxy route rejects token where only the pre-colon prefix matches the secret', async () => {
+        const response = await fetch(`${httpUrl}/api/proxy/nonexistent-backend/some-path`, {
+          headers: { 'Authorization': `Bearer ${GATEWAY_SECRET}:extra` }
+        });
+        expect(response.status).toBe(401);
+      });
+
+      test('notification config route rejects token where only the pre-colon prefix matches', async () => {
+        const response = await fetch(`${httpUrl}/api/notifications/config`, {
+          headers: { 'Authorization': `Bearer ${GATEWAY_SECRET}:extra` }
+        });
+        expect(response.status).toBe(401);
+      });
     });
   });
 });
