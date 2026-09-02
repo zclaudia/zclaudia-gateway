@@ -94,8 +94,15 @@ function parseNotificationConfigFromEnv(): Partial<NotificationConfig> {
 
 const allowedOrigins = parseListEnv(process.env.GATEWAY_ALLOWED_ORIGINS);
 
+const ADMIN_TOKEN = process.env.GATEWAY_ADMIN_TOKEN?.trim();
+if (ADMIN_TOKEN !== undefined && ADMIN_TOKEN === GATEWAY_SECRET) {
+  console.error('Error: GATEWAY_ADMIN_TOKEN must differ from GATEWAY_SECRET');
+  process.exit(1);
+}
+
 const server = createGatewayServer({
   gatewaySecret: GATEWAY_SECRET,
+  adminToken: ADMIN_TOKEN || undefined,
   notificationConfig: parseNotificationConfigFromEnv(),
   trustProxy: process.env.GATEWAY_TRUST_PROXY === 'true',
   allowedOrigins: allowedOrigins.length > 0 ? allowedOrigins : undefined,

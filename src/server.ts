@@ -45,7 +45,7 @@ import type {
   PushNotificationRequestMessage,
 } from '@zclaudia/protocol/gateway';
 import type { NotificationConfig } from '@zclaudia/protocol/notifications';
-import { GatewayStorage } from './storage.js';
+import { GatewayStorage, CREDENTIAL_TOKEN_PREFIXES, type CredentialInfo, type CredentialType } from './storage.js';
 import { GatewayState, type PeerSession } from './state.js';
 import { encodeProxyRequestBody } from './proxy-body.js';
 import { GatewayPushNotificationService } from './push-notification.js';
@@ -56,6 +56,11 @@ import { GatewayPushNotificationService } from './push-notification.js';
 
 interface GatewayConfig {
   gatewaySecret: string;
+  /**
+   * Admin token for the credential management API (/api/admin/*).
+   * When unset, the admin API is disabled. Must differ from gatewaySecret.
+   */
+  adminToken?: string;
   notificationConfig?: Partial<NotificationConfig>;
   authTimeoutMs?: number;
   proxyRequestTimeoutMs?: number;
@@ -131,6 +136,9 @@ function validatePeerHelloMessage(message: unknown): string | null {
 // ============================================================================
 
 export function createGatewayServer(config: GatewayConfig): Server {
+  if (config.adminToken !== undefined && config.adminToken === config.gatewaySecret) {
+    throw new Error('adminToken must differ from gatewaySecret');
+  }
   const storage = new GatewayStorage();
   const pushNotificationService = new GatewayPushNotificationService(config.notificationConfig);
   const state = new GatewayState();
@@ -239,16 +247,47 @@ export function createGatewayServer(config: GatewayConfig): Server {
     return colonIndex !== -1 && safeCompare(token.slice(colonIndex + 1), config.gatewaySecret);
   }
 
+  /**
+   * Resolved identity of a presented token.
+   * 'legacy' — the shared gateway secret: full access, self-declared
+   *   namespace (compatibility mode until all clients migrate).
+   * 'credential' — an issued, revocable credential: namespace and
+   *   capabilities derive from the server-side record, never the client.
+   */
+  type AuthContext =
+    | { kind: 'legacy' }
+    | { kind: 'credential'; credential: CredentialInfo };
+
+  function isCredentialToken(token: string): boolean {
+    return Object.values(CREDENTIAL_TOKEN_PREFIXES).some((prefix) => token.startsWith(prefix));
+  }
+
+  function resolveToken(token: string): AuthContext | null {
+    if (isCredentialToken(token)) {
+      const credential = storage.findValidCredential(token);
+      if (!credential) return null;
+      return { kind: 'credential', credential };
+    }
+    return isValidGatewayToken(token) ? { kind: 'legacy' } : null;
+  }
+
+  function audit(event: string, fields: Record<string, unknown>): void {
+    const parts = Object.entries(fields).map(([k, v]) => `${k}=${v}`).join(' ');
+    console.log(`[audit] ${event} ${parts}`);
+  }
+
   function requireGatewayAuth(req: Request, res: Response, next: () => void): void {
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
       res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Authorization required' } });
       return;
     }
-    if (!isValidGatewayToken(authHeader.slice(7))) {
+    const auth = resolveToken(authHeader.slice(7));
+    if (!auth) {
       res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Invalid credentials' } });
       return;
     }
+    res.locals.auth = auth;
     next();
   }
 
@@ -294,6 +333,84 @@ export function createGatewayServer(config: GatewayConfig): Server {
     }
   });
 
+  // --- Admin: credential management (ADR-0002) ---
+  function requireAdmin(req: Request, res: Response, next: () => void): void {
+    if (!config.adminToken) {
+      res.status(503).json({ success: false, error: { code: 'ADMIN_DISABLED', message: 'Admin API is not configured' } });
+      return;
+    }
+    const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ') || !safeCompare(authHeader.slice(7), config.adminToken)) {
+      if (!checkAuthFailLimit(clientIp)) {
+        res.status(429).json({ success: false, error: { code: 'RATE_LIMITED', message: 'Too many requests' } });
+        return;
+      }
+      audit('admin.auth_failed', { ip: clientIp });
+      res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Invalid admin token' } });
+      return;
+    }
+    next();
+  }
+
+  app.post('/api/admin/credentials', requireAdmin, (req: Request, res: Response) => {
+    const { type, namespace, name, ttlDays } = (req.body ?? {}) as {
+      type?: unknown; namespace?: unknown; name?: unknown; ttlDays?: unknown;
+    };
+    if (type !== 'device' && type !== 'backend') {
+      res.status(400).json({ success: false, error: { code: 'INVALID_REQUEST', message: 'type must be device or backend' } });
+      return;
+    }
+    if (typeof namespace !== 'string' || !namespace) {
+      res.status(400).json({ success: false, error: { code: 'INVALID_REQUEST', message: 'namespace must be a non-empty string' } });
+      return;
+    }
+    if (name !== undefined && typeof name !== 'string') {
+      res.status(400).json({ success: false, error: { code: 'INVALID_REQUEST', message: 'name must be a string' } });
+      return;
+    }
+    let ttlMs: number | null | undefined;
+    if (ttlDays !== undefined) {
+      if (ttlDays === null) {
+        ttlMs = null;
+      } else if (typeof ttlDays === 'number' && Number.isFinite(ttlDays) && ttlDays > 0) {
+        ttlMs = ttlDays * 24 * 60 * 60 * 1000;
+      } else {
+        res.status(400).json({ success: false, error: { code: 'INVALID_REQUEST', message: 'ttlDays must be a positive number or null' } });
+        return;
+      }
+    }
+    const { credential, token } = storage.createCredential({
+      type: type as CredentialType,
+      namespace,
+      name: typeof name === 'string' ? name : undefined,
+      ttlMs,
+    });
+    audit('credential.issued', { id: credential.id, type: credential.type, namespace: credential.namespace, name: credential.name });
+    res.status(201).json({ success: true, data: { ...credential, token } });
+  });
+
+  app.get('/api/admin/credentials', requireAdmin, (_req: Request, res: Response) => {
+    res.json({ success: true, data: storage.listCredentials() });
+  });
+
+  app.delete('/api/admin/credentials/:id', requireAdmin, (req: Request, res: Response) => {
+    const revoked = storage.revokeCredential(req.params.id);
+    if (!revoked) {
+      res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Credential not found or already revoked' } });
+      return;
+    }
+    audit('credential.revoked', { id: req.params.id });
+    // Disconnect any live peers authenticated with this credential
+    for (const peer of state.peers.values()) {
+      if (peer.credentialId === req.params.id) {
+        audit('credential.peer_disconnected', { id: req.params.id, peerSessionId: peer.peerSessionId });
+        peer.ws.close(1008, 'Credential revoked');
+      }
+    }
+    res.json({ success: true, data: { id: req.params.id } });
+  });
+
   // --- HTTP Proxy ---
   const pendingHttpRequests = new Map<string, {
     resolve: (response: GatewayHttpProxyResponse | null) => void;
@@ -329,7 +446,8 @@ export function createGatewayServer(config: GatewayConfig): Server {
         res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Authorization required' } });
         return;
       }
-      if (!isValidGatewayToken(authHeader.slice(7))) {
+      const auth = resolveToken(authHeader.slice(7));
+      if (!auth) {
         if (!checkAuthFailLimit(clientIp)) {
           res.status(429).json({ success: false, error: { code: 'RATE_LIMITED', message: 'Too many requests' } });
           return;
@@ -347,6 +465,16 @@ export function createGatewayServer(config: GatewayConfig): Server {
       if (!lease) {
         res.status(502).json({ success: false, error: { code: 'BACKEND_OFFLINE', message: 'Backend not found or offline' } });
         return;
+      }
+      // Credential-based callers may only reach backends in their own
+      // namespace; answered like an offline backend to avoid an existence
+      // oracle. Legacy shared-secret callers are unrestricted (compat).
+      if (auth.kind === 'credential') {
+        const presence = state.registry.items.get(backendId);
+        if (!presence || presence.namespace !== auth.credential.namespace) {
+          res.status(502).json({ success: false, error: { code: 'BACKEND_OFFLINE', message: 'Backend not found or offline' } });
+          return;
+        }
       }
       const backendPeer = state.peers.get(lease.peerSessionId);
       if (!backendPeer) {
@@ -565,8 +693,24 @@ export function createGatewayServer(config: GatewayConfig): Server {
   // ========================================================================
 
   function handlePeerHello(ws: WebSocket, message: PeerHelloMessage): string | null {
-    if (!safeCompare(message.gatewaySecret, config.gatewaySecret)) {
+    // The gatewaySecret field carries either the legacy shared secret or an
+    // issued credential token (zgd_/zgb_ prefix).
+    const auth = resolveToken(message.gatewaySecret);
+    if (!auth) {
       sendToWs(ws, { type: 'gateway_error', code: 'UNAUTHORIZED', message: 'Invalid gateway secret' } satisfies GatewayErrorMessage); ws.close(); return null;
+    }
+    if (auth.kind === 'credential') {
+      // Namespace derives from the server-side credential record; a declared
+      // namespace that disagrees is an error, never a grant.
+      if (auth.credential.namespace !== message.namespace) {
+        audit('peer.namespace_mismatch', { credentialId: auth.credential.id, declared: message.namespace });
+        sendToWs(ws, { type: 'gateway_error', code: 'UNAUTHORIZED', message: 'Namespace not permitted by credential' } satisfies GatewayErrorMessage); ws.close(); return null;
+      }
+      // A device credential must never be able to register (or impersonate) a backend.
+      if (message.peerType === 'client+backend' && auth.credential.type !== 'backend') {
+        audit('peer.backend_registration_denied', { credentialId: auth.credential.id });
+        sendToWs(ws, { type: 'gateway_error', code: 'UNAUTHORIZED', message: 'This credential cannot register a backend' } satisfies GatewayErrorMessage); ws.close(); return null;
+      }
     }
     if (message.protocolVersion !== 3) {
       sendToWs(ws, { type: 'gateway_error', code: 'PROTOCOL_VERSION_MISMATCH', message: `Expected protocol version 3, got ${message.protocolVersion}` } satisfies GatewayErrorMessage); ws.close(); return null;
@@ -580,6 +724,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
       ws,
       peerType,
       namespace: message.namespace,
+      credentialId: auth.kind === 'credential' ? auth.credential.id : undefined,
       deviceId: identity.deviceId,
       instanceId: identity.instanceId,
       channel,

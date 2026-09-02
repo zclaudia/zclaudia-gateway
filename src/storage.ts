@@ -7,6 +7,7 @@ import * as fs from 'fs';
 interface MemoryStorageState {
   devices: Map<string, DeviceMapping>;
   instances: Map<string, InstanceMapping>;
+  credentials: Map<string, CredentialRecord>;
   maxEpoch: number;
 }
 
@@ -53,6 +54,44 @@ export interface InstanceMapping {
   updatedAt: number;
 }
 
+// ============================================================================
+// Credentials (ADR-0002: gateway-native minimal auth)
+// ============================================================================
+
+/**
+ * 'device' — client-only credential for user devices; cannot register a backend.
+ * 'backend' — enrollment credential for a machine running an application backend.
+ */
+export type CredentialType = 'device' | 'backend';
+
+export const CREDENTIAL_TOKEN_PREFIXES: Record<CredentialType, string> = {
+  device: 'zgd_',
+  backend: 'zgb_',
+};
+
+/** Default TTL for device credentials (matches comfy gateway precedent). */
+export const DEFAULT_DEVICE_TTL_MS = 180 * 24 * 60 * 60 * 1000;
+
+export interface CredentialRecord {
+  id: string;
+  type: CredentialType;
+  /** SHA-256 hex digest of the full token. Plaintext is never stored. */
+  tokenHash: string;
+  namespace: string;
+  name: string;
+  createdAt: number;
+  expiresAt: number | null;
+  revokedAt: number | null;
+  lastUsedAt: number | null;
+}
+
+/** Public view of a credential — everything except the token hash. */
+export type CredentialInfo = Omit<CredentialRecord, 'tokenHash'>;
+
+export function hashCredentialToken(token: string): string {
+  return crypto.createHash('sha256').update(token).digest('hex');
+}
+
 export function initDatabase(dbPath: string = getDbPath()): Database.Database {
   const db = new Database(dbPath);
 
@@ -91,6 +130,21 @@ export function initDatabase(dbPath: string = getDbPath()): Database.Database {
     INSERT OR IGNORE INTO counters (key, value) VALUES ('max_epoch', 0);
     INSERT OR IGNORE INTO counters (key, value) VALUES ('registry_revision', 0);
 
+    -- Phase 1: revocable credentials (digests only, never plaintext)
+    CREATE TABLE IF NOT EXISTS credentials (
+      id TEXT PRIMARY KEY,
+      type TEXT NOT NULL,
+      token_hash TEXT UNIQUE NOT NULL,
+      namespace TEXT NOT NULL,
+      name TEXT NOT NULL DEFAULT '',
+      created_at INTEGER NOT NULL,
+      expires_at INTEGER,
+      revoked_at INTEGER,
+      last_used_at INTEGER
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_credentials_token_hash ON credentials(token_hash);
+
   `);
 
   return db;
@@ -111,6 +165,7 @@ export class GatewayStorage {
         state = {
           devices: new Map(),
           instances: new Map(),
+          credentials: new Map(),
           maxEpoch: 0,
         };
         memoryStorageStates.set(key, state);
@@ -350,6 +405,118 @@ export class GatewayStorage {
    */
   private generateBackendId(): string {
     return crypto.randomBytes(4).toString('hex');
+  }
+
+  // =========================================================================
+  // Credentials (ADR-0002)
+  // =========================================================================
+
+  /**
+   * Issue a new credential. Returns the record and the plaintext token —
+   * the only time the plaintext ever exists; only its digest is stored.
+   */
+  createCredential(input: {
+    type: CredentialType;
+    namespace: string;
+    name?: string;
+    /** null = never expires. Undefined = type default (device 180d, backend none). */
+    ttlMs?: number | null;
+  }): { credential: CredentialInfo; token: string } {
+    const token = CREDENTIAL_TOKEN_PREFIXES[input.type] + crypto.randomBytes(32).toString('base64url');
+    const now = Date.now();
+    const ttlMs = input.ttlMs === undefined
+      ? (input.type === 'device' ? DEFAULT_DEVICE_TTL_MS : null)
+      : input.ttlMs;
+    const record: CredentialRecord = {
+      id: crypto.randomUUID(),
+      type: input.type,
+      tokenHash: hashCredentialToken(token),
+      namespace: input.namespace,
+      name: input.name ?? '',
+      createdAt: now,
+      expiresAt: ttlMs === null ? null : now + ttlMs,
+      revokedAt: null,
+      lastUsedAt: null,
+    };
+
+    if (this.memoryState) {
+      this.memoryState.credentials.set(record.id, record);
+    } else {
+      this.sqlite.prepare(`
+        INSERT INTO credentials (id, type, token_hash, namespace, name, created_at, expires_at, revoked_at, last_used_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(record.id, record.type, record.tokenHash, record.namespace, record.name,
+        record.createdAt, record.expiresAt, record.revokedAt, record.lastUsedAt);
+    }
+    const { tokenHash: _tokenHash, ...credential } = record;
+    return { credential, token };
+  }
+
+  /**
+   * Resolve a presented token to its credential if (and only if) it is
+   * valid: known, not revoked, not expired. Touches lastUsedAt on success.
+   */
+  findValidCredential(token: string): CredentialInfo | null {
+    const hash = hashCredentialToken(token);
+    const now = Date.now();
+
+    let record: CredentialRecord | undefined;
+    if (this.memoryState) {
+      record = Array.from(this.memoryState.credentials.values()).find((c) => c.tokenHash === hash);
+    } else {
+      const row = this.sqlite.prepare(`
+        SELECT id, type, token_hash as tokenHash, namespace, name,
+               created_at as createdAt, expires_at as expiresAt,
+               revoked_at as revokedAt, last_used_at as lastUsedAt
+        FROM credentials WHERE token_hash = ?
+      `).get(hash) as CredentialRecord | undefined;
+      record = row;
+    }
+
+    if (!record) return null;
+    if (record.revokedAt !== null) return null;
+    if (record.expiresAt !== null && now > record.expiresAt) return null;
+
+    if (this.memoryState) {
+      record.lastUsedAt = now;
+    } else {
+      this.sqlite.prepare('UPDATE credentials SET last_used_at = ? WHERE id = ?').run(now, record.id);
+    }
+    const { tokenHash: _tokenHash, ...info } = record;
+    return info;
+  }
+
+  /** List all credentials (revoked and expired included), newest first. */
+  listCredentials(): CredentialInfo[] {
+    if (this.memoryState) {
+      return Array.from(this.memoryState.credentials.values())
+        .sort((a, b) => b.createdAt - a.createdAt)
+        .map((record) => {
+          const { tokenHash: _tokenHash, ...info } = record;
+          return info;
+        });
+    }
+    return this.sqlite.prepare(`
+      SELECT id, type, namespace, name,
+             created_at as createdAt, expires_at as expiresAt,
+             revoked_at as revokedAt, last_used_at as lastUsedAt
+      FROM credentials ORDER BY created_at DESC
+    `).all() as CredentialInfo[];
+  }
+
+  /** Revoke a credential by id. Returns false if unknown or already revoked. */
+  revokeCredential(id: string): boolean {
+    const now = Date.now();
+    if (this.memoryState) {
+      const record = this.memoryState.credentials.get(id);
+      if (!record || record.revokedAt !== null) return false;
+      record.revokedAt = now;
+      return true;
+    }
+    const result = this.sqlite.prepare(
+      'UPDATE credentials SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL',
+    ).run(now, id);
+    return result.changes > 0;
   }
 
   close(): void {

@@ -32,10 +32,20 @@ mobile ── HTTP /api/proxy ┘      │
 
 ## 认证
 
-- **WebSocket**：连接后首条消息必须是 `peer_hello`，`gatewaySecret` 字段随消息体传输（10 秒内未认证即断开）。
-- **HTTP**：`Authorization: Bearer <token>`，token 接受两种格式（两处端点行为一致，有回归测试锁定）：
-  1. `<gatewaySecret>` —— 所有现有客户端使用的格式；
-  2. `<clientId>:<gatewaySecret>` —— 历史遗留的复合格式，clientId 被忽略。
+两套并行体系（迁移期共存，见 [ADR-0002](docs/adr/0002-identity-issuance.md)）：
+
+### 签发凭证（推荐）
+
+由 Admin API 签发的可撤销凭证，namespace 与能力从服务端记录派生，不信任客户端声明。
+
+- `zgd_*` 设备凭证：仅可作为 client-only 连接与访问本 namespace 的 HTTP 代理；默认 180 天过期。
+- `zgb_*` Backend 凭证：可注册 Backend；默认不过期。
+- 撤销立即生效：在线连接被断开（close 1008），后续认证被拒。
+- 管理端点（需 `GATEWAY_ADMIN_TOKEN`）：`POST/GET /api/admin/credentials`、`DELETE /api/admin/credentials/:id`。
+
+### 共享 secret（legacy 兼容）
+
+`GATEWAY_SECRET` 继续在 WS（`peer_hello.gatewaySecret`）和 HTTP（`Bearer <secret>` 或 `Bearer <clientId>:<secret>`）两侧有效，不受 namespace 限制。待三个应用全部迁移到签发凭证后按 ROADMAP 弃用。
 
 ## 本地开发
 
@@ -58,6 +68,7 @@ docker compose up -d        # 容器部署（读取 .env）
 | `GATEWAY_PORT` | | `3200` | 监听端口 |
 | `GATEWAY_TRUST_PROXY` | | `false` | 信任 `X-Forwarded-For`（仅置于可信反代之后时开启，见 ADR-0001） |
 | `GATEWAY_ALLOWED_ORIGINS` | | 无（通配符） | 逗号分隔的 CORS Origin allowlist，设置后仅列表内 Origin 可跨域（带 credentials） |
+| `GATEWAY_ADMIN_TOKEN` | | 无（Admin API 禁用） | 凭证管理 API 的管理员 token，必须不同于 `GATEWAY_SECRET` |
 | `ZCLAUDIA_DATA_DIR` | | `~/.zclaudia` | SQLite 数据目录（实际路径 `<dir>/gateway/gateway.db`） |
 | `NTFY_*` | | 见 [.env.example](.env.example) 与 [src/index.ts](src/index.ts) | ntfy 推送通知配置 |
 
@@ -65,19 +76,20 @@ docker compose up -d        # 容器部署（读取 .env）
 
 以下是当前实现的**有意约束**，不是 bug；通用化过程中的演进计划见 ROADMAP 对应阶段。
 
-**单节点与状态易失**
+### 单节点与状态易失
 
 - 仅支持单实例部署。peers、registry、租约、订阅、进行中的代理请求、recovery token 全部在内存中，**进程重启即全部丢失**，客户端需重连并重新订阅（zclaudia 客户端已按此语义实现）。
 - SQLite 仅持久化 deviceId/instanceId → backendId 的映射和 epoch 计数器，保证 Backend 重连后 ID 与代次稳定。
 
-**安全模型（Phase 1 重构对象）**
+### 安全模型（Phase 1 重构对象）
 
-- 全体客户端与 Backend 共享**单一 secret**，无 per-client/per-device 身份，无法单独撤销（凭证拆分见 ADR-0002 与 ROADMAP Phase 1）。
-- namespace 隔离已在 registry 下发、订阅和定向消息层面强制执行（同实例上不同 namespace 互不可见，有集成测试覆盖）；但 `peer_hello.namespace` 目前仍由客户端自我声明——在凭证体系落地前，隔离防的是应用间的意外串扰，不防持有 secret 的恶意声明。
+- 可撤销的设备/Backend 凭证已可用（见"认证"一节），凭证认证下 namespace 从服务端记录派生；但**共享 secret 仍在兼容期内有效**且不受 namespace 限制——在三个应用迁移完成、legacy 路径关闭之前，安全边界以持有 secret 者为上限。
+- namespace 隔离已在 registry 下发、订阅、定向消息和 HTTP 代理（凭证认证时）层面强制执行，同实例上不同 namespace 互不可见，有集成测试覆盖。
+- 浏览器 Cookie Session 与 Backend enrollment→短期访问凭证的交换流程尚未实现（前者随 Phase 5、后者在 Phase 1 内后续补齐）。
 - CORS 默认 `Access-Control-Allow-Origin: *`；设置 `GATEWAY_ALLOWED_ORIGINS` 后收紧为 Origin allowlist（带 credentials）。
 - WS 认证密钥在消息体中传输（受 TLS 保护的前提下）。
 
-**尺寸与速率限制**
+### 尺寸与速率限制
 
 | 限制 | 值 | 位置 |
 | --- | --- | ---: |
@@ -88,7 +100,7 @@ docker compose up -d        # 容器部署（读取 .env）
 | 认证失败限流 | 10 次/分钟/IP | `AUTH_FAIL_LIMIT` |
 | 代理请求限流 | 200 次/分钟/IP | `PROXY_RATE_LIMIT` |
 
-**超时与周期**
+### 超时与周期
 
 | 项 | 值 |
 | --- | ---: |
@@ -99,10 +111,10 @@ docker compose up -d        # 容器部署（读取 .env）
 | Backend 租约 TTL / 检查周期 | 30 s / 5 s |
 | Registry 兜底广播周期 | 30 s |
 
-**传输语义**
+### 传输语义
 
 - 代理的二进制内容以 base64 编码经 JSON 消息传输（约 33% 膨胀）；整体响应模式会在内存中完整缓存响应体。真正的流式与二进制帧是 Protocol v4（ROADMAP Phase 2）的目标。
-- 资源快照/事件对全部订阅者广播，无定向递送（targeted `backend_server_message` 除外）。
+- 资源快照/事件默认对全部订阅者广播；消息携带 `targetPeerSessionId`（可选的加法字段）时仅递送给该订阅者，zclaudia backend 尚未采用。
 
 ## 设计决策
 

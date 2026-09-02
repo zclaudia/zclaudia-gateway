@@ -28,6 +28,8 @@ export interface PeerSession {
    * scoped to this value.
    */
   namespace: string;
+  /** Set when the peer authenticated with an issued credential (not the legacy shared secret). */
+  credentialId?: string;
   deviceId: string;
   instanceId: string;
   channel: string;
