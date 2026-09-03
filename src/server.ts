@@ -70,6 +70,11 @@ interface GatewayConfig {
   channelTicketTtlMs?: number;
   /** v4: max concurrent channels a single peer may hold open. Default 32. */
   maxChannelsPerPeer?: number;
+  /**
+   * v4: per-channel byte rate limit (bytes/second, per direction) enforced
+   * by pausing the sending socket. Unset = unlimited.
+   */
+  channelByteRateLimit?: number;
   /** Trust X-Forwarded-For header for IP extraction. Only enable behind a trusted reverse proxy. */
   trustProxy?: boolean;
   /**
@@ -153,6 +158,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
   const proxyStreamingTimeoutMs = config.proxyStreamingTimeoutMs ?? 60_000;
   const channelTicketTtlMs = config.channelTicketTtlMs ?? 30_000;
   const maxChannelsPerPeer = config.maxChannelsPerPeer ?? 32;
+  const channelByteRateLimit = config.channelByteRateLimit;
   const trustProxy = config.trustProxy ?? false;
 
   const app = express();
@@ -644,8 +650,12 @@ export function createGatewayServer(config: GatewayConfig): Server {
       }
     }
     for (const socket of [ch.clientSocket, ch.backendSocket]) {
-      if (socket && socket.readyState === WebSocket.OPEN) socket.close(1000, reason);
-      else socket?.terminate();
+      if (!socket) continue;
+      // A paused (rate-limited) socket cannot complete the close handshake;
+      // resume before closing so the peer's close frame gets processed.
+      socket.resume();
+      if (socket.readyState === WebSocket.OPEN) socket.close(1000, reason);
+      else socket.terminate();
     }
     const closedMsg = { type: 'channel_closed', channelId, reason };
     for (const sessionId of [ch.clientPeerSessionId, ch.backendPeerSessionId]) {
@@ -681,9 +691,31 @@ export function createGatewayServer(config: GatewayConfig): Server {
     ch.piped = true;
     const HIGH_WATER = 4 * 1024 * 1024;
     const relay = (from: WebSocket, to: WebSocket) => {
+      // Token bucket per direction: 1s windows, overflow pauses the sender
+      // until the window resets. Frames are never split.
+      const bucket = { used: 0, resetAt: 0 };
       from.on('message', (data: Buffer, isBinary: boolean) => {
         if (to.readyState !== WebSocket.OPEN) return;
         to.send(data, { binary: isBinary });
+        if (channelByteRateLimit) {
+          const now = Date.now();
+          if (now >= bucket.resetAt) {
+            // Carry overshoot into the new window so sustained throughput
+            // converges to the limit (each window may overshoot by at most
+            // one frame, since frames are never split).
+            bucket.used = Math.max(0, bucket.used - channelByteRateLimit) + data.length;
+            bucket.resetAt = now + 1000;
+          } else {
+            bucket.used += data.length;
+          }
+          if (bucket.used > channelByteRateLimit) {
+            from.pause();
+            // Resume unconditionally: a CLOSING socket still needs to read
+            // the peer's close frame, or it wedges until the 30s ws
+            // close timeout.
+            setTimeout(() => from.resume(), bucket.resetAt - now);
+          }
+        }
         if (to.bufferedAmount > HIGH_WATER) {
           from.pause();
           const drain = setInterval(() => {
@@ -1148,7 +1180,11 @@ export function createGatewayServer(config: GatewayConfig): Server {
 
     let backendInfo: PeerReadyMessage['backend'] | undefined;
     if (peerType === 'client+backend' && message.backend) {
-      const backendId = storage.getOrCreateBackendIdByInstance(identity.instanceId, identity.deviceId, channel, identity.name);
+      // v4: UUID keyed by (namespace, instance, environment); v3: legacy
+      // instance-keyed short IDs, unchanged for wire compatibility.
+      const backendId = peer.protocolVersion === 4
+        ? storage.getOrCreateBackendIdV4({ namespace: message.namespace, instanceId: identity.instanceId, environment: channel, name: identity.name })
+        : storage.getOrCreateBackendIdByInstance(identity.instanceId, identity.deviceId, channel, identity.name);
       const previousLease = state.leases.get(backendId);
       const epoch = storage.allocateEpoch();
       peer.backendId = backendId; peer.epoch = epoch;

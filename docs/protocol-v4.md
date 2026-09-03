@@ -22,6 +22,10 @@ Gateway 铸造的 128-bit 不可猜测 `channelId`，四元组是服务端绑定
 v4 复用 v3 的 `peer_hello`/`peer_ready`，仅 `protocolVersion: 4`。
 v4 会话额外获得 channel 控制消息；registry、订阅等 v3 消息在 v4 会话中继续可用。
 
+**Backend 身份（v4）**：唯一键为 `(tenant, namespace, instanceId, environment)`
+（tenant 预留恒为空；environment 即 `identity.channel`，默认 `prod`），backendId 为
+稳定的 128-bit UUID。v3 Backend 保持 legacy 的 instance 键与短 ID，wire 不变。
+
 ## 3. Channel 生命周期
 
 ```text
@@ -113,7 +117,9 @@ Gateway 自动改走 Channel 桥接（客户端与 v3 Backend 完全不感知）
 
 - 单 Peer 并发 channel 上限（默认 32，可配置；internal http channel 计入 Backend 侧配额）。
 - 数据帧大小上限沿用 WS maxPayload（大文件由 SDK 分帧流式发送）。
-- 后续批次：per-channel 字节速率限制。
+- per-channel 字节速率限制（`channelByteRateLimit`，字节/秒/方向，默认不限）：
+  1 秒窗口令牌桶，超发暂停发送端 socket，超发量结转下一窗口；帧不拆分，
+  单窗口最多超发一帧。
 
 ## 7. 与 v3 的关系
 

@@ -8,6 +8,8 @@ interface MemoryStorageState {
   devices: Map<string, DeviceMapping>;
   instances: Map<string, InstanceMapping>;
   credentials: Map<string, CredentialRecord>;
+  /** v4: composite identity key → backend UUID */
+  backendIdentities: Map<string, BackendIdentity>;
   maxEpoch: number;
 }
 
@@ -52,6 +54,33 @@ export interface InstanceMapping {
   name: string;
   createdAt: number;
   updatedAt: number;
+}
+
+// ============================================================================
+// v4 Backend identity (ROADMAP Phase 2)
+// ============================================================================
+
+/**
+ * v4 backends are keyed by (namespace, instanceId, environment) — with a
+ * reserved tenant slot, always '' until multi-tenancy is actually needed —
+ * and identified by a 128-bit UUID. v3 backends keep the legacy
+ * instance-keyed short IDs untouched.
+ */
+export interface BackendIdentity {
+  backendId: string;
+  tenant: string;
+  namespace: string;
+  instanceId: string;
+  environment: string;
+  name: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export function backendIdentityKey(namespace: string, instanceId: string, environment: string, tenant = ''): string {
+  // \x1f (unit separator) cannot appear in these fields via JSON string
+  // values in practice; prevents ambiguous concatenations.
+  return [tenant, namespace, instanceId, environment].join('\x1f');
 }
 
 // ============================================================================
@@ -130,6 +159,19 @@ export function initDatabase(dbPath: string = getDbPath()): Database.Database {
     INSERT OR IGNORE INTO counters (key, value) VALUES ('max_epoch', 0);
     INSERT OR IGNORE INTO counters (key, value) VALUES ('registry_revision', 0);
 
+    -- Phase 2 (v4): backend identities keyed by tenant+namespace+instance+environment
+    CREATE TABLE IF NOT EXISTS backend_identities (
+      identity_key TEXT PRIMARY KEY,
+      backend_id TEXT UNIQUE NOT NULL,
+      tenant TEXT NOT NULL DEFAULT '',
+      namespace TEXT NOT NULL,
+      instance_id TEXT NOT NULL,
+      environment TEXT NOT NULL,
+      name TEXT NOT NULL DEFAULT '',
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+
     -- Phase 1: revocable credentials (digests only, never plaintext)
     CREATE TABLE IF NOT EXISTS credentials (
       id TEXT PRIMARY KEY,
@@ -166,6 +208,7 @@ export class GatewayStorage {
           devices: new Map(),
           instances: new Map(),
           credentials: new Map(),
+          backendIdentities: new Map(),
           maxEpoch: 0,
         };
         memoryStorageStates.set(key, state);
@@ -405,6 +448,60 @@ export class GatewayStorage {
    */
   private generateBackendId(): string {
     return crypto.randomBytes(4).toString('hex');
+  }
+
+  // =========================================================================
+  // v4 Backend identity
+  // =========================================================================
+
+  /**
+   * Get or create the stable UUID for a v4 backend identity. Same
+   * (namespace, instanceId, environment) always maps to the same UUID;
+   * any component differing yields a distinct backend.
+   */
+  getOrCreateBackendIdV4(input: { namespace: string; instanceId: string; environment: string; name?: string }): string {
+    const key = backendIdentityKey(input.namespace, input.instanceId, input.environment);
+    const now = Date.now();
+
+    if (this.memoryState) {
+      const existing = this.memoryState.backendIdentities.get(key);
+      if (existing) {
+        if (input.name && input.name !== existing.name) {
+          existing.name = input.name;
+          existing.updatedAt = now;
+        }
+        return existing.backendId;
+      }
+      const identity: BackendIdentity = {
+        backendId: crypto.randomUUID(),
+        tenant: '',
+        namespace: input.namespace,
+        instanceId: input.instanceId,
+        environment: input.environment,
+        name: input.name ?? '',
+        createdAt: now,
+        updatedAt: now,
+      };
+      this.memoryState.backendIdentities.set(key, identity);
+      return identity.backendId;
+    }
+
+    const existing = this.sqlite.prepare(
+      'SELECT backend_id as backendId, name FROM backend_identities WHERE identity_key = ?',
+    ).get(key) as { backendId: string; name: string } | undefined;
+    if (existing) {
+      if (input.name && input.name !== existing.name) {
+        this.sqlite.prepare('UPDATE backend_identities SET name = ?, updated_at = ? WHERE identity_key = ?')
+          .run(input.name, now, key);
+      }
+      return existing.backendId;
+    }
+    const backendId = crypto.randomUUID();
+    this.sqlite.prepare(`
+      INSERT INTO backend_identities (identity_key, backend_id, tenant, namespace, instance_id, environment, name, created_at, updated_at)
+      VALUES (?, ?, '', ?, ?, ?, ?, ?, ?)
+    `).run(key, backendId, input.namespace, input.instanceId, input.environment, input.name ?? '', now, now);
+    return backendId;
   }
 
   // =========================================================================

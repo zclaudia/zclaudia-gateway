@@ -272,6 +272,55 @@ describeIfLoopback('Phase 2: v4 Channels', () => {
     expect(closed.reason).toBe('rejected');
   });
 
+  test('v4 backends get UUID ids keyed by namespace+instance+environment; v3 keeps short ids', async () => {
+    const { wsUrl } = await startServer();
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+    // v4: UUID, stable across reconnects
+    const b1 = await connect(wsUrl);
+    const r1 = await hello(b1, { namespace: 'app-a', peerType: 'client+backend', instanceId: 'uuid-inst' });
+    expect(r1.backend.backendId).toMatch(UUID_RE);
+    await closeWs(b1);
+    const b1again = await connect(wsUrl);
+    const r1again = await hello(b1again, { namespace: 'app-a', peerType: 'client+backend', instanceId: 'uuid-inst' });
+    expect(r1again.backend.backendId).toBe(r1.backend.backendId);
+
+    // Same instanceId in a different namespace → different backend
+    const b2 = await connect(wsUrl);
+    const r2 = await hello(b2, { namespace: 'app-b', peerType: 'client+backend', instanceId: 'uuid-inst' });
+    expect(r2.backend.backendId).toMatch(UUID_RE);
+    expect(r2.backend.backendId).not.toBe(r1.backend.backendId);
+
+    // v3 keeps the legacy 8-char hex id scheme
+    const v3 = await connect(wsUrl);
+    const r3 = await hello(v3, { namespace: 'app-a', peerType: 'client+backend', instanceId: 'legacy-inst', protocolVersion: 3 });
+    expect(r3.backend.backendId).toMatch(/^[0-9a-f]{8}$/);
+  });
+
+  test('per-channel byte rate limit throttles the relay', async () => {
+    const { wsUrl } = await startServer({ gatewaySecret: GATEWAY_SECRET, channelByteRateLimit: 64 * 1024 });
+    const { clientData, backendData } = await openChannel(wsUrl, 'app-a', 'throttle');
+
+    const frame = Buffer.alloc(64 * 1024, 7);
+    const start = Date.now();
+    const arrivals: number[] = [];
+    const done = new Promise<void>((resolve) => {
+      backendData.on('message', () => {
+        arrivals.push(Date.now() - start);
+        if (arrivals.length === 4) resolve();
+      });
+    });
+    // 4 frames, each equal to the per-second budget. The relay may overshoot
+    // by one frame per window (frames are never split), so with overshoot
+    // carryover frames 3 and 4 land in windows 2 and 3 respectively.
+    for (let i = 0; i < 4; i++) clientData.send(frame);
+    await done;
+    // Unthrottled these arrive within ~10ms; generous thresholds keep the
+    // test robust on loaded CI while still proving windowed throttling.
+    expect(arrivals[2]).toBeGreaterThanOrEqual(700);
+    expect(arrivals[3]).toBeGreaterThanOrEqual(1500);
+  }, 15000);
+
   test('channel quota per peer is enforced', async () => {
     const { wsUrl } = await startServer({ gatewaySecret: GATEWAY_SECRET, maxChannelsPerPeer: 2 });
     const backendCtl = await connect(wsUrl);
