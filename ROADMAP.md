@@ -239,6 +239,20 @@ response.end
 
 目标：把协议细节从应用代码中移出，并用现有 zclaudia 流量验证新核心。
 
+> **进度（2026-09-03）**：SDK 三包（protocol/client/backend）与契约测试已落地（ADR-0004，
+> workspace 同仓）；zclaudia server 侧迁移在 `feature/gateway-v4` 分支完成四个切片：
+> ① v4 注册（UUID backendId）+ channel 流式 HTTP 代理（`/api/proxy` 去 base64），
+> ② 快照/事件双发 `resources` Topic（快照带 retain），
+> ③ multipart 上传经 gateway 全程流式（`streamingUpload` 能力协商，desktop 已切换），
+> ④ per-client 消息 channel（kind `zclaudia`，复用虚拟客户端机制，v3 路径共存）。
+> 每个切片均有跨仓 e2e 验证。剩余：desktop/mobile 消费 Topic 与消息 channel（含
+> terminal 路由修复的消费端半边）、凭证从 legacy secret 切 `zgb_`/`zgd_`、
+> `gateway-testing` 抽包（等 Hermes/Comfy Adapter 需要时）、版本兼容矩阵与 v3 弃用条件。
+> SDK 与 zclaudia 以 `link:` 兄弟目录依赖，npm 发布待适配稳定后进行。
+> 注：zclaudia server 保留了自有传输层（握手驱动的 backoff 重置、SOCKS agent 等
+> 四处语义与 SDK 生命周期不匹配），SDK 在 zclaudia 中当前仅贡献 wire 类型；
+> 传输层是否换 SDK 留待消费端迁移完成后单独评估。
+
 可行性依据（2026-09 代码调研）：zclaudia 与 Channel 模型天然对齐——客户端全部状态已按 backendId 分键，无任何跨 backend 全局消息顺序依赖；重连语义已是"清空订阅、按 `desiredOpenBackends` 集合全量重订阅"（recoveryToken 存而未用），该集合可 1:1 映射为"应持有的 Channel 集合"；registry 消费独立于订阅，与控制面拆分吻合。同时开启的 Channel 数为"侧边栏展开 ∪ 前台"，典型 2–5 条。
 
 计划拆分：
