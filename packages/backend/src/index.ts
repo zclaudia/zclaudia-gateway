@@ -37,7 +37,13 @@ export interface GatewayBackendOptions {
   backendProtocolVersion?: number;
   socketFactory?: SocketFactory;
   heartbeatIntervalMs?: number;
+  /** Auto-reconnect with backoff after unexpected disconnects. Default true. */
+  reconnect?: boolean;
+  reconnectMinMs?: number;
+  reconnectMaxMs?: number;
 }
+
+export type GatewayBackendState = 'idle' | 'connecting' | 'connected' | 'closed';
 
 export interface ChannelOfferInfo {
   channelId: string;
@@ -73,6 +79,10 @@ export class GatewayBackend {
   private channelHandlers = new Map<string, ChannelHandler>();
   private defaultChannelHandler: ChannelHandler | null = null;
   private closed = false;
+  private state: GatewayBackendState = 'idle';
+  private reconnectAttempt = 0;
+  private stateHandlers: Array<(state: GatewayBackendState) => void> = [];
+  private messageHandlers: Array<(message: Record<string, unknown>) => void> = [];
 
   constructor(options: GatewayBackendOptions) {
     this.opts = options;
@@ -82,6 +92,33 @@ export class GatewayBackend {
 
   get id(): string { return this.backendId; }
   get currentEpoch(): number { return this.epoch; }
+  get connectionState(): GatewayBackendState { return this.state; }
+
+  onState(handler: (state: GatewayBackendState) => void): () => void {
+    this.stateHandlers.push(handler);
+    return () => { this.stateHandlers = this.stateHandlers.filter((h) => h !== handler); };
+  }
+
+  /**
+   * Raw tap on inbound control messages (v3 message flow passthrough for
+   * incremental migrations). Messages the SDK consumes internally
+   * (channel_offer) are still delivered here.
+   */
+  onMessage(handler: (message: Record<string, unknown>) => void): () => void {
+    this.messageHandlers.push(handler);
+    return () => { this.messageHandlers = this.messageHandlers.filter((h) => h !== handler); };
+  }
+
+  /** Send a raw control message (v3 message flow passthrough). */
+  send(message: Record<string, unknown>): void {
+    if (!this.socket || this.socket.readyState !== 1) throw new Error('Not connected');
+    this.socket.send(JSON.stringify(message));
+  }
+
+  private setState(state: GatewayBackendState): void {
+    this.state = state;
+    for (const handler of this.stateHandlers) handler(state);
+  }
 
   /** Register a handler for a specific channel kind (e.g. 'rpc'). */
   onChannel(kind: string, handler: ChannelHandler): void {
@@ -137,6 +174,13 @@ export class GatewayBackend {
 
   async connect(): Promise<{ backendId: string; epoch: number }> {
     this.closed = false;
+    return this.establish();
+  }
+
+  private async establish(): Promise<{ backendId: string; epoch: number }> {
+    this.setState('connecting');
+    // Re-resolve on every attempt: an exchanged access token may have
+    // expired while we were disconnected.
     const credential = await this.resolveCredential();
     const socket = this.factory(`${this.wsBase}/ws`);
     socket.binaryType = 'arraybuffer';
@@ -178,10 +222,12 @@ export class GatewayBackend {
 
     socket.addEventListener('message', (event) => {
       if (typeof event.data !== 'string') return;
-      let msg: { type?: string };
+      let msg: Record<string, unknown> & { type?: string };
       try { msg = JSON.parse(event.data); } catch { return; }
       if (msg.type === 'channel_offer') void this.handleOffer(msg as unknown as ChannelOfferMessage);
+      for (const handler of this.messageHandlers) handler(msg);
     });
+    socket.addEventListener('close', () => this.handleClose(socket));
 
     const interval = this.opts.heartbeatIntervalMs ?? 10_000;
     this.heartbeatTimer = setInterval(() => {
@@ -190,7 +236,32 @@ export class GatewayBackend {
       }
     }, interval);
 
+    this.reconnectAttempt = 0;
+    this.setState('connected');
     return { backendId: this.backendId, epoch: this.epoch };
+  }
+
+  private handleClose(socket: WebSocketLike): void {
+    if (this.socket !== socket) return; // stale socket from a previous session
+    this.socket = null;
+    if (this.heartbeatTimer) { clearInterval(this.heartbeatTimer); this.heartbeatTimer = null; }
+    if (this.closed || this.opts.reconnect === false) {
+      this.setState('closed');
+      return;
+    }
+    this.setState('connecting');
+    this.scheduleReconnect();
+  }
+
+  private scheduleReconnect(): void {
+    const minMs = this.opts.reconnectMinMs ?? 1000;
+    const maxMs = this.opts.reconnectMaxMs ?? 30_000;
+    const delay = Math.min(minMs * 2 ** this.reconnectAttempt, maxMs);
+    this.reconnectAttempt += 1;
+    setTimeout(() => {
+      if (this.closed) return;
+      this.establish().catch(() => this.scheduleReconnect());
+    }, delay);
   }
 
   /** Exchange an enrollment credential for a short-lived access token. */
@@ -232,6 +303,7 @@ export class GatewayBackend {
 
   close(): void {
     this.closed = true;
+    this.setState('closed');
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.heartbeatTimer = null;
     this.socket?.close(1000);

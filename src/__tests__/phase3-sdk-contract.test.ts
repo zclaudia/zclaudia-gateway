@@ -202,6 +202,46 @@ describeIfLoopback('Phase 3: SDK contract', () => {
     expect(await missing.text()).toBe('not found');
   });
 
+  test('backend SDK reconnects with a fresh epoch and raw messages pass through', async () => {
+    const { httpUrl } = await startServer();
+    const backend = makeBackend(httpUrl, 'brc-backend');
+    (backend as unknown as { opts: { reconnectMinMs: number } }).opts.reconnectMinMs = 100;
+    const { backendId, epoch: epoch1 } = await backend.connect();
+
+    // Raw inbound tap: registry_snapshot arrives when another backend joins
+    const tapped: string[] = [];
+    backend.onMessage((msg) => tapped.push(msg.type as string));
+    const backend2 = makeBackend(httpUrl, 'brc-other');
+    await backend2.connect();
+    await until(() => tapped.includes('registry_snapshot'));
+
+    // Raw outbound: send a topic_publish through the raw pipe, observe via SDK client
+    const client = makeClient(httpUrl, 'brc-client');
+    await client.connect();
+    const seen: unknown[] = [];
+    await client.subscribeTopic(backendId, 'raw', (payload) => seen.push(payload));
+    backend.send({ type: 'topic_publish', topic: 'raw', payload: 'via-raw-send' });
+    await until(() => seen.includes('via-raw-send'));
+
+    // Simulated network drop: backend reconnects and gets a fresh epoch
+    const states: string[] = [];
+    backend.onState((s) => states.push(s));
+    (backend as unknown as { socket: { close: (code: number) => void } }).socket.close(4000);
+    await until(() => states.includes('connected'), 10_000);
+    expect(backend.currentEpoch).toBeGreaterThan(epoch1);
+    expect(backend.id).toBe(backendId); // v4 identity is stable
+
+    // Still fully functional: channels reach it after the reconnect
+    backend.onChannel('post-rc', (channel) => {
+      channel.onMessage(() => channel.send('alive'));
+    });
+    const channel = await client.openChannel(backendId, 'post-rc');
+    const replies: unknown[] = [];
+    channel.onMessage((m) => replies.push(m.data));
+    channel.send('ping');
+    await until(() => replies.includes('alive'));
+  });
+
   test('backend SDK auto-exchanges an enrollment credential before connecting', async () => {
     const ADMIN = 'sdk-admin-token';
     const { httpUrl } = await startServer({ adminToken: ADMIN });
