@@ -974,6 +974,15 @@ export function createGatewayServer(config: GatewayConfig): Server {
 
   /** backendId → topic → subscribing peerSessionIds */
   const topicSubs = new Map<string, Map<string, Set<string>>>();
+  /**
+   * backendId → topic → last payload published with retain: true. Delivered
+   * to new subscribers on subscribe (MQTT retain semantics) so cold
+   * subscribers get the current state (e.g. a resource snapshot) without a
+   * request round-trip. Cleared with the backend's topics (disconnect /
+   * epoch change) — stale state must not outlive its epoch.
+   */
+  const retainedTopics = new Map<string, Map<string, unknown>>();
+  const MAX_RETAINED_TOPICS_PER_BACKEND = 64;
 
   function handleTopicSubscribe(peer: PeerSession, msg: { backendId: string; topic: string }): void {
     if (peer.protocolVersion !== 4) {
@@ -991,6 +1000,10 @@ export function createGatewayServer(config: GatewayConfig): Server {
     if (!subs) { subs = new Set(); topics.set(msg.topic, subs); }
     subs.add(peer.peerSessionId);
     sendToWs(peer.ws, { type: 'topic_subscribed', backendId: msg.backendId, topic: msg.topic });
+    const retained = retainedTopics.get(msg.backendId)?.get(msg.topic);
+    if (retained !== undefined) {
+      sendToWs(peer.ws, { type: 'topic_message', backendId: msg.backendId, topic: msg.topic, payload: retained });
+    }
   }
 
   function handleTopicUnsubscribe(peer: PeerSession, msg: { backendId: string; topic: string }): void {
@@ -999,8 +1012,17 @@ export function createGatewayServer(config: GatewayConfig): Server {
   }
 
   /** Backend publishes once; gateway fans out on its own (well-provisioned) side. */
-  function handleTopicPublish(peer: PeerSession, msg: { topic: string; payload?: unknown }): void {
+  function handleTopicPublish(peer: PeerSession, msg: { topic: string; payload?: unknown; retain?: boolean }): void {
     if (!isCurrentBackendOwner(peer)) return;
+    if (msg.retain === true && msg.payload !== undefined) {
+      let retained = retainedTopics.get(peer.backendId!);
+      if (!retained) { retained = new Map(); retainedTopics.set(peer.backendId!, retained); }
+      if (retained.size >= MAX_RETAINED_TOPICS_PER_BACKEND && !retained.has(msg.topic)) {
+        audit('topic.retain_cap', { backendId: peer.backendId!, topic: msg.topic });
+      } else {
+        retained.set(msg.topic, msg.payload);
+      }
+    }
     const subs = topicSubs.get(peer.backendId!)?.get(msg.topic);
     if (!subs || subs.size === 0) return;
     const outbound = { type: 'topic_message', backendId: peer.backendId, topic: msg.topic, payload: msg.payload };
@@ -1018,6 +1040,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
 
   function removeTopicsForBackend(backendId: string): void {
     topicSubs.delete(backendId);
+    retainedTopics.delete(backendId);
   }
 
   httpServer.on('connection', (socket) => {

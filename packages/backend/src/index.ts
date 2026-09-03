@@ -296,9 +296,9 @@ export class GatewayBackend {
     }
   }
 
-  publishTopic(topic: string, payload?: unknown): void {
+  publishTopic(topic: string, payload?: unknown, options?: { retain?: boolean }): void {
     if (!this.socket || this.socket.readyState !== 1) throw new Error('Not connected');
-    this.socket.send(JSON.stringify({ type: 'topic_publish', topic, payload }));
+    this.socket.send(JSON.stringify({ type: 'topic_publish', topic, payload, retain: options?.retain }));
   }
 
   close(): void {

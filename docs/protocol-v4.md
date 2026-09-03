@@ -97,6 +97,15 @@ Backend 向 Topic 发一份，Gateway 在带宽充裕侧复制给各订阅者。
 不存在的 Backend 一致）；发布仅限 Backend 当前租约持有者。Backend 下线/换代次时其
 全部 Topic 订阅被清除，订阅者从 registry 感知重建。
 
+### Retained payload（retain 语义）
+
+`topic_publish` 带 `retain: true` 时，Gateway 保存该 (Backend, Topic) 的最后一份
+retained payload，并在新订阅者 `topic_subscribed` 之后立即补发一条
+`topic_message`——冷订阅者无需请求往返即可获得当前状态（典型用途：资源快照）。
+不带 retain 的发布不覆盖 retained 状态（事件与快照可共用同一 Topic）。
+retained 状态随 Backend 下线 / epoch 换代清除（过期 epoch 的状态不得存活）；
+每 Backend 最多保留 64 个 retained Topic，超出的 retain 请求被忽略并审计。
+
 ## 7. v4 HTTP 流式映射（kind = `http`）
 
 客户端仍用普通 HTTP 访问 `/api/proxy/:backendId/*`；当目标 Backend 是 v4 会话时，

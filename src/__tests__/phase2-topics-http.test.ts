@@ -156,6 +156,66 @@ describeIfLoopback('Phase 2: Topics & HTTP streaming', () => {
       expect(received[0].topic).toBe('b');
     });
 
+    test('retained payload is delivered to late subscribers and follows retain semantics', async () => {
+      const { wsUrl } = await startServer();
+      const { backendCtl, backendId } = await setupTopic(wsUrl, 't4');
+
+      // Snapshot published with retain BEFORE anyone subscribes
+      backendCtl.send(JSON.stringify({ type: 'topic_publish', topic: 'resources', payload: { rev: 1, kind: 'snapshot' }, retain: true }));
+      // Plain event afterwards must NOT overwrite the retained state
+      backendCtl.send(JSON.stringify({ type: 'topic_publish', topic: 'resources', payload: { rev: 2, kind: 'event' } }));
+      await delay(100);
+
+      const sub = await connect(wsUrl);
+      await hello(sub, { namespace: 'app-a', peerType: 'client-only', instanceId: 't4-late' });
+      const received: any[] = [];
+      sub.on('message', (d) => { const m = JSON.parse(d.toString()); if (m.type === 'topic_message') received.push(m); });
+      sub.send(JSON.stringify({ type: 'topic_subscribe', backendId, topic: 'resources' }));
+      await waitForMessage(sub, 'topic_subscribed');
+      await delay(150);
+
+      // Cold subscriber got exactly the retained snapshot, not the event
+      expect(received).toHaveLength(1);
+      expect(received[0].payload).toEqual({ rev: 1, kind: 'snapshot' });
+
+      // A newer retained publish replaces it for the next subscriber
+      backendCtl.send(JSON.stringify({ type: 'topic_publish', topic: 'resources', payload: { rev: 3, kind: 'snapshot' }, retain: true }));
+      await delay(100);
+      const sub3 = await connect(wsUrl);
+      await hello(sub3, { namespace: 'app-a', peerType: 'client-only', instanceId: 't4-third' });
+      const received3: any[] = [];
+      sub3.on('message', (d) => { const m = JSON.parse(d.toString()); if (m.type === 'topic_message') received3.push(m); });
+      sub3.send(JSON.stringify({ type: 'topic_subscribe', backendId, topic: 'resources' }));
+      await waitForMessage(sub3, 'topic_subscribed');
+      await delay(150);
+      expect(received3).toHaveLength(1);
+      expect(received3[0].payload).toEqual({ rev: 3, kind: 'snapshot' });
+    });
+
+    test('retained state does not survive backend disconnect', async () => {
+      const { wsUrl } = await startServer();
+      const { backendCtl, backendId } = await setupTopic(wsUrl, 't5');
+      backendCtl.send(JSON.stringify({ type: 'topic_publish', topic: 'resources', payload: { rev: 9 }, retain: true }));
+      await delay(100);
+      backendCtl.close();
+      await delay(200);
+
+      // Reconnect the same backend identity (same instanceId → same backendId)
+      const backendCtl2 = await connect(wsUrl);
+      const ready2 = await hello(backendCtl2, { namespace: 'app-a', peerType: 'client+backend', instanceId: 't5-backend' });
+      expect(ready2.backend.backendId).toBe(backendId);
+
+      const sub = await connect(wsUrl);
+      await hello(sub, { namespace: 'app-a', peerType: 'client-only', instanceId: 't5-sub' });
+      const received: any[] = [];
+      sub.on('message', (d) => { const m = JSON.parse(d.toString()); if (m.type === 'topic_message') received.push(m); });
+      sub.send(JSON.stringify({ type: 'topic_subscribe', backendId, topic: 'resources' }));
+      await waitForMessage(sub, 'topic_subscribed');
+      await delay(150);
+      // Stale pre-disconnect state must not be replayed
+      expect(received).toHaveLength(0);
+    });
+
     test('cross-namespace subscribe is denied, non-owner publish is dropped', async () => {
       const { wsUrl } = await startServer();
       const { backendId } = await setupTopic(wsUrl, 't3');

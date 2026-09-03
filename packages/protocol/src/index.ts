@@ -158,6 +158,14 @@ export interface TopicPublishMessage {
   type: 'topic_publish';
   topic: string;
   payload?: unknown;
+  /**
+   * Retain the payload as the topic's current state: the gateway stores the
+   * last retained payload per (backend, topic) and delivers it to new
+   * subscribers immediately after topic_subscribed (MQTT retain semantics).
+   * Retained state is cleared when the backend disconnects or its epoch
+   * changes.
+   */
+  retain?: boolean;
 }
 
 export interface TopicMessage {
