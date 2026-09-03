@@ -773,6 +773,9 @@ export function createGatewayServer(config: GatewayConfig): Server {
     };
     relay(a, b);
     relay(b, a);
+    // Release frames buffered while waiting for the peer leg to pair.
+    a.resume();
+    b.resume();
     audit('channel.open', { channelId: ch.channelId, backendId: ch.backendId, kind: ch.kind ?? '' });
   }
 
@@ -792,6 +795,11 @@ export function createGatewayServer(config: GatewayConfig): Server {
     }
     channelWss.handleUpgrade(req, socket, head, (ws) => {
       if (!channels.has(channelId)) { ws.terminate(); return; }
+      // Hold frames until both legs are wired: the first-connected side may
+      // start sending immediately (its dial resolved), and without a pause
+      // those pre-pairing frames would have no listener and be lost.
+      // pause() keeps them in the stream buffer; wireChannel resumes.
+      ws.pause();
       if (ticket.role === 'client') ch.clientSocket = ws;
       else ch.backendSocket = ws;
       // Internal HTTP channel: the gateway itself is the client end.
@@ -799,6 +807,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
         ch.piped = true;
         clearTimeout(ch.pairingTimeout);
         ch.onBackendSocket(ch.backendSocket);
+        ch.backendSocket.resume();
         return;
       }
       if (ch.clientSocket && ch.backendSocket && !ch.piped) {

@@ -142,6 +142,42 @@ describeIfLoopback('Phase 2: v4 Channels', () => {
     return { backendCtl, clientCtl, clientData, backendData, ready, offer, backendId: backendReady.backend.backendId as string };
   }
 
+  test('frames sent before the peer leg pairs are buffered, not lost', async () => {
+    const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    const { wsUrl } = await startServer();
+    const backendCtl = await connect(wsUrl);
+    const backendReady = await hello(backendCtl, { namespace: 'app-a', peerType: 'client+backend', instanceId: 'early-backend' });
+    const clientCtl = await connect(wsUrl);
+    await hello(clientCtl, { namespace: 'app-a', peerType: 'client-only', instanceId: 'early-client' });
+
+    const offerPromise = waitForMessage(backendCtl, 'channel_offer');
+    clientCtl.send(JSON.stringify({ type: 'channel_open', target: backendReady.backend.backendId, kind: 'test' }));
+    const ready = await waitForMessage(clientCtl, 'channel_ready');
+    const offer = await offerPromise;
+
+    const base = wsUrl.replace(/\/ws$/, '');
+    // Client dials and SENDS before the backend leg exists
+    const clientData = new WebSocket(`${base}${ready.dataPath}?ticket=${ready.ticket}`);
+    sockets.push(clientData);
+    await waitForOpen(clientData);
+    clientData.send('early-frame-1');
+    clientData.send(Buffer.from([9, 8, 7]));
+    await delay(150); // frames are in flight well before pairing
+
+    const backendData = new WebSocket(`${base}${offer.dataPath}?ticket=${offer.ticket}`);
+    sockets.push(backendData);
+    const received: Array<{ data: Buffer; isBinary: boolean }> = [];
+    backendData.on('message', (data: Buffer, isBinary: boolean) => received.push({ data, isBinary }));
+    await waitForOpen(backendData);
+
+    await delay(300);
+    expect(received).toHaveLength(2);
+    expect(received[0].isBinary).toBe(false);
+    expect(received[0].data.toString()).toBe('early-frame-1');
+    expect(received[1].isBinary).toBe(true);
+    expect(Array.from(received[1].data)).toEqual([9, 8, 7]);
+  });
+
   test('text and binary frames relay transparently in both directions', async () => {
     const { wsUrl } = await startServer();
     const { clientData, backendData } = await openChannel(wsUrl);
