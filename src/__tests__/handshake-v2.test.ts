@@ -83,7 +83,7 @@ describe('Gateway handshake v2', () => {
 
     ws.send(JSON.stringify({
       type: 'peer_hello',
-      protocolVersion: 3,
+      protocolVersion: 4,
       namespace: 'zclaudia',
       clientProtocolVersion: 1,
       peerType: 'client+backend',
@@ -106,7 +106,7 @@ describe('Gateway handshake v2', () => {
 
     ws.send(JSON.stringify({
       type: 'peer_hello',
-      protocolVersion: 3,
+      protocolVersion: 4,
       namespace: 'zclaudia',
       clientProtocolVersion: 1,
       peerType: 'client+backend',

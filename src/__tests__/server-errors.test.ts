@@ -68,7 +68,7 @@ const delay = (ms: number) => new Promise(r => setTimeout(r, ms));
 async function registerBackendV2(ws: WebSocket, identity: { deviceId: string; instanceId: string; name?: string }): Promise<{ backendId: string; epoch: number }> {
   ws.send(JSON.stringify({
     type: 'peer_hello',
-    protocolVersion: 3,
+    protocolVersion: 4,
     namespace: 'zclaudia',
     clientProtocolVersion: 1,
     peerType: 'client+backend',
@@ -323,7 +323,7 @@ describeIfLoopback('Gateway Error Handling', () => {
       // Start auth but don't wait for response
       ws.send(JSON.stringify({
         type: 'peer_hello',
-        protocolVersion: 3,
+        protocolVersion: 4,
         namespace: 'zclaudia',
         clientProtocolVersion: 1,
         peerType: 'client+backend',
@@ -340,44 +340,6 @@ describeIfLoopback('Gateway Error Handling', () => {
     });
   });
 
-  describe('HTTP Error Handling', () => {
-    test('should handle large JSON body', async () => {
-      const backendWs = new WebSocket(WS_URL);
-      await waitForOpen(backendWs);
-      const { backendId } = await registerBackendV2(backendWs, { deviceId: 'large-body-device', instanceId: 'inst-large-body-device', name: 'Large Body Backend' });
-
-      // Create a large payload (but under 15MB)
-      const largeData = { data: 'x'.repeat(100000) };
-
-      backendWs.on('message', (data) => {
-        const msg = JSON.parse(data.toString());
-        if (msg.type === 'http_proxy_request') {
-          backendWs.send(JSON.stringify({
-            type: 'http_proxy_response',
-            requestId: msg.requestId,
-            statusCode: 200,
-            headers: {},
-            bodyEncoding: 'utf8',
-            body: JSON.stringify({ received: true })
-          }));
-        }
-      });
-
-      const response = await fetch(`${HTTP_URL}/api/proxy/${backendId}/large`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${GATEWAY_SECRET}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(largeData)
-      });
-
-      expect(response.status).toBe(200);
-
-      await closeWs(backendWs);
-    });
-  });
-
   describe('Edge Cases', () => {
     test('should handle message with null gateway secret', async () => {
       const ws = new WebSocket(WS_URL);
@@ -385,7 +347,7 @@ describeIfLoopback('Gateway Error Handling', () => {
 
       ws.send(JSON.stringify({
         type: 'peer_hello',
-        protocolVersion: 3,
+        protocolVersion: 4,
         namespace: 'zclaudia',
         clientProtocolVersion: 1,
         peerType: 'client+backend',
@@ -407,7 +369,7 @@ describeIfLoopback('Gateway Error Handling', () => {
 
       ws.send(JSON.stringify({
         type: 'peer_hello',
-        protocolVersion: 3,
+        protocolVersion: 4,
         namespace: 'zclaudia',
         clientProtocolVersion: 1,
         peerType: 'client+backend',
@@ -423,44 +385,5 @@ describeIfLoopback('Gateway Error Handling', () => {
       await closeWs(ws);
     });
 
-    test('should handle concurrent proxy requests', async () => {
-      // Register backend
-      const backendWs = new WebSocket(WS_URL);
-      await waitForOpen(backendWs);
-      const { backendId } = await registerBackendV2(backendWs, { deviceId: 'concurrent-device', instanceId: 'inst-concurrent-device', name: 'Concurrent Backend' });
-
-      const requests: string[] = [];
-      backendWs.on('message', (data) => {
-        const msg = JSON.parse(data.toString());
-        if (msg.type === 'http_proxy_request') {
-          requests.push(msg.requestId);
-          // Respond after small delay
-          setTimeout(() => {
-            backendWs.send(JSON.stringify({
-              type: 'http_proxy_response',
-              requestId: msg.requestId,
-              statusCode: 200,
-              headers: {},
-              bodyEncoding: 'utf8',
-              body: JSON.stringify({ id: msg.requestId })
-            }));
-          }, 10);
-        }
-      });
-
-      // Send 5 concurrent requests
-      const responses = await Promise.all([
-        fetch(`${HTTP_URL}/api/proxy/${backendId}/req1`, { headers: { 'Authorization': `Bearer ${GATEWAY_SECRET}` } }),
-        fetch(`${HTTP_URL}/api/proxy/${backendId}/req2`, { headers: { 'Authorization': `Bearer ${GATEWAY_SECRET}` } }),
-        fetch(`${HTTP_URL}/api/proxy/${backendId}/req3`, { headers: { 'Authorization': `Bearer ${GATEWAY_SECRET}` } }),
-        fetch(`${HTTP_URL}/api/proxy/${backendId}/req4`, { headers: { 'Authorization': `Bearer ${GATEWAY_SECRET}` } }),
-        fetch(`${HTTP_URL}/api/proxy/${backendId}/req5`, { headers: { 'Authorization': `Bearer ${GATEWAY_SECRET}` } }),
-      ]);
-
-      expect(requests.length).toBe(5);
-      expect(responses.every(r => r.status === 200)).toBe(true);
-
-      await closeWs(backendWs);
-    });
   });
 });

@@ -81,7 +81,7 @@ const delay = (ms: number) => new Promise(r => setTimeout(r, ms));
 async function registerBackendV2(ws: WebSocket, identity: { deviceId: string; instanceId: string; name?: string }, visible = true): Promise<{ backendId: string; epoch: number }> {
   ws.send(JSON.stringify({
     type: 'peer_hello',
-    protocolVersion: 3,
+    protocolVersion: 4,
     namespace: 'zclaudia',
     clientProtocolVersion: 1,
     peerType: 'client+backend',
@@ -97,7 +97,7 @@ async function registerBackendV2(ws: WebSocket, identity: { deviceId: string; in
 async function registerClientV2(ws: WebSocket): Promise<{ peerSessionId: string; registrySync: any }> {
   ws.send(JSON.stringify({
     type: 'peer_hello',
-    protocolVersion: 3,
+    protocolVersion: 4,
     namespace: 'zclaudia',
     clientProtocolVersion: 1,
     peerType: 'client-only',
@@ -112,7 +112,6 @@ describeIfLoopback('Gateway Client Message Handling', () => {
   let server: Server;
   let backendWs: WebSocket;
   let backendId: string;
-  let backendEpoch: number;
   let openClients: WebSocket[] = [];
 
   beforeEach(async () => {
@@ -127,7 +126,6 @@ describeIfLoopback('Gateway Client Message Handling', () => {
 
     const reg = await registerBackendV2(backendWs, { deviceId: 'test-backend-device', instanceId: 'inst-test-backend-device', name: 'Test Backend' });
     backendId = reg.backendId;
-    backendEpoch = reg.epoch;
   });
 
   afterEach(async () => {
@@ -211,88 +209,6 @@ describeIfLoopback('Gateway Client Message Handling', () => {
     });
   });
 
-  describe('Subscribe Backend', () => {
-    test('should subscribe to backend', async () => {
-      const { ws: clientWs } = await connectClient();
-
-      clientWs.send(JSON.stringify({
-        type: 'subscribe_backend',
-        backendId,
-      }));
-
-      const subscribed = await waitForMessage(clientWs, 'backend_subscribed');
-      expect(subscribed.backendId).toBe(backendId);
-      expect(subscribed.epoch).toBe(backendEpoch);
-    });
-
-    test('should return error for non-existent backend', async () => {
-      const { ws: clientWs } = await connectClient();
-
-      clientWs.send(JSON.stringify({
-        type: 'subscribe_backend',
-        backendId: 'non-existent-id',
-      }));
-
-      const error = await waitForMessage(clientWs, 'gateway_error');
-      expect(error.code).toBe('BACKEND_OFFLINE');
-    });
-
-    test('should handle duplicate subscribe gracefully', async () => {
-      const { ws: clientWs } = await connectClient();
-
-      // Subscribe first time
-      clientWs.send(JSON.stringify({
-        type: 'subscribe_backend',
-        backendId,
-      }));
-      const subscribed1 = await waitForMessage(clientWs, 'backend_subscribed');
-
-      // Subscribe again — should still succeed
-      clientWs.send(JSON.stringify({
-        type: 'subscribe_backend',
-        backendId,
-      }));
-      const subscribed2 = await waitForMessage(clientWs, 'backend_subscribed');
-      expect(subscribed2.backendId).toBe(subscribed1.backendId);
-    });
-  });
-
-  describe('Backend Messages', () => {
-    test('should reject backend_client_message when not subscribed', async () => {
-      const { ws: clientWs } = await connectClient();
-
-      clientWs.send(JSON.stringify({
-        type: 'backend_client_message',
-        backendId,
-        payload: { type: 'test' }
-      }));
-
-      const error = await waitForMessage(clientWs, 'gateway_error');
-      expect(error.code).toBe('BACKEND_NOT_SUBSCRIBED');
-    });
-  });
-
-  describe('Unsubscribe Backend', () => {
-    test('should unsubscribe and notify client', async () => {
-      const { ws: clientWs } = await connectClient();
-
-      clientWs.send(JSON.stringify({
-        type: 'subscribe_backend',
-        backendId,
-      }));
-      await waitForMessage(clientWs, 'backend_subscribed');
-
-      clientWs.send(JSON.stringify({
-        type: 'unsubscribe_backend',
-        backendId,
-      }));
-
-      const unsubscribed = await waitForMessage(clientWs, 'backend_unsubscribed');
-      expect(unsubscribed.backendId).toBe(backendId);
-      expect(unsubscribed.reason).toBe('client_unsubscribed');
-    });
-  });
-
   describe('Unknown Message Types', () => {
     test('should return error for unknown message type', async () => {
       const { ws: clientWs } = await connectClient();
@@ -307,23 +223,4 @@ describeIfLoopback('Gateway Client Message Handling', () => {
     });
   });
 
-  describe('Multiple Clients', () => {
-    test('should handle multiple clients subscribing to same backend', async () => {
-      const { ws: client1 } = await connectClient();
-      const { ws: client2 } = await connectClient();
-
-      // Both subscribe to same backend
-      client1.send(JSON.stringify({ type: 'subscribe_backend', backendId }));
-      client2.send(JSON.stringify({ type: 'subscribe_backend', backendId }));
-
-      const subscribed1 = await waitForMessage(client1, 'backend_subscribed');
-      const subscribed2 = await waitForMessage(client2, 'backend_subscribed');
-
-      // Both should get the same backendId and epoch
-      expect(subscribed1.backendId).toBe(backendId);
-      expect(subscribed2.backendId).toBe(backendId);
-      expect(subscribed1.epoch).toBe(backendEpoch);
-      expect(subscribed2.epoch).toBe(backendEpoch);
-    });
-  });
 });

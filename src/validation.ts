@@ -1,12 +1,9 @@
 /**
  * Runtime validation for inbound protocol messages and proxy header hygiene.
  *
- * Leniency rule (v3 compatibility): ONLY the fields the gateway itself reads
- * for routing are required. Everything else stays opaque — the @zclaudia/protocol
- * .d.ts shapes are aspirational and real v3 traffic diverges from them (e.g.
- * backend_resource_snapshot carries sessions/projects rather than resources,
- * some client messages use payload instead of message). Do not tighten these
- * specs beyond routing needs before Protocol v4.
+ * Leniency rule: ONLY the fields the gateway itself reads for routing are
+ * required. Application payloads stay opaque — the gateway never interprets
+ * them.
  */
 
 type FieldKind =
@@ -32,69 +29,12 @@ const MESSAGE_SPECS: Record<string, MessageSpec> = {
     epoch: { kind: 'number' },
     observedAt: { kind: 'number', optional: true },
   },
-  // Pure relays: gateway only reads the optional delivery target.
-  backend_resource_snapshot: {
-    targetPeerSessionId: { kind: 'string', optional: true },
-  },
-  backend_resource_event: {
-    targetPeerSessionId: { kind: 'string', optional: true },
-  },
-  backend_stream_event: {
-    streamId: { kind: 'non-empty-string' },
-    eventName: { kind: 'non-empty-string' },
-    seq: { kind: 'number' },
-    channel: { kind: 'string', optional: true },
-  },
   request_registry_snapshot: {},
-  request_backend_resource_snapshot: {
-    backendId: { kind: 'non-empty-string' },
-    resourceTypes: { kind: 'array', optional: true },
-    targetPeerSessionId: { kind: 'string', optional: true },
-  },
-  subscribe_backend: {
-    backendId: { kind: 'non-empty-string' },
-  },
-  unsubscribe_backend: {
-    backendId: { kind: 'non-empty-string' },
-  },
-  // Relayed whole; some traffic uses `payload` instead of `message`, so no
-  // payload-field requirement — only the routing field.
-  backend_client_message: {
-    backendId: { kind: 'non-empty-string' },
-  },
+  // Targeted fallback path from backends (clients normally receive over
+  // their message channel).
   backend_server_message: {
     backendId: { kind: 'non-empty-string' },
     targetPeerSessionId: { kind: 'string', optional: true },
-  },
-  content_patch: {
-    backendId: { kind: 'non-empty-string' },
-  },
-  content_patch_error: {
-    backendId: { kind: 'non-empty-string' },
-  },
-  catch_up_content: {
-    backendId: { kind: 'non-empty-string' },
-    contentStreamId: { kind: 'non-empty-string' },
-    afterOffset: { kind: 'number' },
-  },
-  http_proxy_response: {
-    requestId: { kind: 'non-empty-string' },
-    statusCode: { kind: 'status-code' },
-    headers: { kind: 'object', optional: true },
-    bodyEncoding: { kind: 'string', optional: true, oneOf: ['utf8', 'base64'] },
-    body: { kind: 'string', optional: true },
-  },
-  http_proxy_response_start: {
-    requestId: { kind: 'non-empty-string' },
-    statusCode: { kind: 'status-code' },
-    headers: { kind: 'object', optional: true },
-  },
-  http_proxy_response_chunk: {
-    requestId: { kind: 'non-empty-string' },
-    data: { kind: 'string' },
-  },
-  http_proxy_response_end: {
-    requestId: { kind: 'non-empty-string' },
   },
   push_notification_request: {
     event: { kind: 'present' },

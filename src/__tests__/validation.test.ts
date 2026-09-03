@@ -28,29 +28,21 @@ const describeIfLoopback = (await canBindLoopback()) ? describe : describe.skip;
 
 describe('validateGatewayMessage (unit)', () => {
   test('rejects missing routing fields', () => {
-    expect(validateGatewayMessage({ type: 'subscribe_backend' })).toContain('backendId');
-    expect(validateGatewayMessage({ type: 'backend_client_message', message: {} })).toContain('backendId');
-    expect(validateGatewayMessage({ type: 'catch_up_content', backendId: 'b', contentStreamId: 's' })).toContain('afterOffset');
-    expect(validateGatewayMessage({ type: 'http_proxy_response_chunk', requestId: 'r' })).toContain('data');
+    expect(validateGatewayMessage({ type: 'channel_open' })).toContain('target');
+    expect(validateGatewayMessage({ type: 'topic_subscribe', topic: 't' })).toContain('backendId');
+    expect(validateGatewayMessage({ type: 'backend_server_message' })).toContain('backendId');
   });
 
   test('rejects wrong field types', () => {
-    expect(validateGatewayMessage({ type: 'subscribe_backend', backendId: 42 })).toContain('non-empty string');
-    expect(validateGatewayMessage({ type: 'http_proxy_response_chunk', requestId: 'r', data: 123 })).toContain('string');
+    expect(validateGatewayMessage({ type: 'topic_subscribe', backendId: 42, topic: 't' })).toContain('non-empty string');
     expect(validateGatewayMessage({ type: 'backend_heartbeat', epoch: 'one' })).toContain('number');
-    expect(validateGatewayMessage({ type: 'http_proxy_response', requestId: 'r', statusCode: 999 })).toContain('status code');
     expect(validateGatewayMessage({ type: 'backend_server_message', backendId: 'b', targetPeerSessionId: 5 })).toContain('string');
   });
 
-  test('accepts real v3 traffic shapes (leniency contract)', () => {
-    // Snapshot with sessions/projects instead of resources
-    expect(validateGatewayMessage({ type: 'backend_resource_snapshot', sessions: [], projects: [] })).toBeNull();
-    // Event with app-specific op and item
-    expect(validateGatewayMessage({ type: 'backend_resource_event', op: 'session_upsert', item: {} })).toBeNull();
-    // Client message using payload instead of message
-    expect(validateGatewayMessage({ type: 'backend_client_message', backendId: 'b', payload: {} })).toBeNull();
-    // Unknown extra fields are always allowed
-    expect(validateGatewayMessage({ type: 'subscribe_backend', backendId: 'b', futureField: true })).toBeNull();
+  test('leniency contract: payloads stay opaque, unknown extras allowed', () => {
+    expect(validateGatewayMessage({ type: 'topic_publish', topic: 't', payload: { anything: true } })).toBeNull();
+    expect(validateGatewayMessage({ type: 'backend_server_message', backendId: 'b', payload: {} })).toBeNull();
+    expect(validateGatewayMessage({ type: 'channel_open', target: 'b', futureField: true })).toBeNull();
   });
 
   test('leaves unknown message types to the router', () => {
@@ -121,7 +113,7 @@ describeIfLoopback('Phase 1: validation & header hygiene (integration)', () => {
     });
     ws.send(JSON.stringify({
       type: 'peer_hello',
-      protocolVersion: 3,
+      protocolVersion: 4,
       namespace: 'zclaudia',
       clientProtocolVersion: 1,
       peerType: 'client+backend',
@@ -137,10 +129,10 @@ describeIfLoopback('Phase 1: validation & header hygiene (integration)', () => {
     const { wsUrl } = await startServer();
     const { ws } = await connectBackend(wsUrl, 'inst-invalid');
 
-    ws.send(JSON.stringify({ type: 'subscribe_backend' }));
+    ws.send(JSON.stringify({ type: 'channel_open' }));
     const err = await waitForMessage(ws, 'gateway_error');
     expect(err.code).toBe('INVALID_MESSAGE');
-    expect(err.message).toContain('backendId');
+    expect(err.message).toContain('target');
 
     // Connection must remain usable afterwards
     ws.send(JSON.stringify({ type: 'ping', ts: 42 }));
@@ -148,47 +140,4 @@ describeIfLoopback('Phase 1: validation & header hygiene (integration)', () => {
     expect(pong.ts).toBe(42);
   });
 
-  test('buffered proxy response headers are filtered, request headers are allowlisted', async () => {
-    const { wsUrl, httpUrl } = await startServer();
-    const { ws, backendId } = await connectBackend(wsUrl, 'inst-headers');
-
-    let seenRequestHeaders: Record<string, string> = {};
-    ws.on('message', (data) => {
-      const msg = JSON.parse(data.toString());
-      if (msg.type === 'http_proxy_request') {
-        seenRequestHeaders = msg.headers;
-        ws.send(JSON.stringify({
-          type: 'http_proxy_response', requestId: msg.requestId,
-          statusCode: 200,
-          headers: {
-            'Content-Type': 'application/json',
-            'ETag': '"v1"',
-            'Set-Cookie': 'local-session=secret',
-            'X-Powered-By': 'Express',
-          },
-          bodyEncoding: 'utf8', body: '{}',
-        }));
-      }
-    });
-
-    const response = await fetch(`${httpUrl}/api/proxy/${backendId}/data`, {
-      headers: {
-        Authorization: `Bearer ${GATEWAY_SECRET}`,
-        Range: 'bytes=0-99',
-        Cookie: 'client-cookie=value',
-        'X-Internal-Header': 'should-not-forward',
-      },
-    });
-
-    expect(response.status).toBe(200);
-    // Response side: allowlisted pass, session material and fingerprints dropped
-    expect(response.headers.get('etag')).toBe('"v1"');
-    expect(response.headers.get('set-cookie')).toBeNull();
-    expect(response.headers.get('x-powered-by')).toBeNull();
-    // Request side: allowlisted forwarded, everything else dropped
-    expect(seenRequestHeaders['range']).toBe('bytes=0-99');
-    expect(seenRequestHeaders['cookie']).toBeUndefined();
-    expect(seenRequestHeaders['authorization']).toBeUndefined();
-    expect(seenRequestHeaders['x-internal-header']).toBeUndefined();
-  });
 });

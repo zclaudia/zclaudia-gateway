@@ -72,7 +72,7 @@ function waitForMessage(ws: WebSocket, type: string, timeoutMs = 5000): Promise<
 function sendBackendHello(ws: WebSocket, secret: string | null, identity: { deviceId: string; instanceId: string; name?: string }, visible = true) {
   ws.send(JSON.stringify({
     type: 'peer_hello',
-    protocolVersion: 3,
+    protocolVersion: 4,
     namespace: 'zclaudia',
     clientProtocolVersion: 1,
     peerType: 'client+backend',
@@ -86,7 +86,7 @@ function sendBackendHello(ws: WebSocket, secret: string | null, identity: { devi
 function sendClientHello(ws: WebSocket, secret: string | null) {
   ws.send(JSON.stringify({
     type: 'peer_hello',
-    protocolVersion: 3,
+    protocolVersion: 4,
     namespace: 'zclaudia',
     clientProtocolVersion: 1,
     peerType: 'client-only',
@@ -131,7 +131,7 @@ describeIfLoopback('Gateway Authentication', () => {
 
       const result = await waitForMessage(ws, 'peer_ready');
       expect(result.backend).toBeDefined();
-      expect(result.backend.backendId).toMatch(/^[a-f0-9]{8}$/);
+      expect(result.backend.backendId).toMatch(/^[0-9a-f-]{36}$/);
 
       await closeWs(ws);
     });
@@ -233,43 +233,6 @@ describeIfLoopback('Gateway Authentication', () => {
       expect(response.status).toBe(401);
     });
 
-    test('should accept request with valid bearer token', async () => {
-      // First register a backend
-      const backendWs = new WebSocket(wsUrl);
-      await waitForOpen(backendWs);
-      sendBackendHello(backendWs, GATEWAY_SECRET, { deviceId: 'http-test-device', instanceId: 'inst-http-test-device', name: 'HTTP Test Backend' });
-      const regResult = await waitForMessage(backendWs, 'peer_ready');
-      const backendId = regResult.backend.backendId;
-
-      // Handle proxy request - respond immediately
-      backendWs.once('message', (data) => {
-        const msg = JSON.parse(data.toString());
-        if (msg.type === 'http_proxy_request') {
-          backendWs.send(JSON.stringify({
-            type: 'http_proxy_response',
-            requestId: msg.requestId,
-            statusCode: 200,
-            headers: {},
-            bodyEncoding: 'utf8',
-            body: JSON.stringify({ success: true })
-          }));
-        }
-      });
-
-      // Now try HTTP proxy
-      const response = await fetch(`${httpUrl}/api/proxy/${backendId}/test-path`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${GATEWAY_SECRET}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({ test: 'data' })
-      });
-
-      expect(response.status).toBe(200);
-
-      await closeWs(backendWs);
-    });
 
     // Token format regression tests: both HTTP auth paths must accept the same
     // formats — bare secret and legacy clientId:secret. Auth success on the proxy

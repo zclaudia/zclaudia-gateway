@@ -20,35 +20,14 @@ import type {
   RegistrySnapshotMessage,
   BackendHeartbeatMessage,
   HeartbeatAckMessage,
-  BackendResourceSnapshotMessage,
-  BackendResourceEventMessage,
-  RequestBackendResourceSnapshotMessage,
-  SubscribeBackendMessage,
-  BackendSubscribedMessage,
-  UnsubscribeBackendMessage,
-  BackendUnsubscribedMessage,
-  BackendClientMessage,
   BackendServerMessage,
-  StreamDemandMessage,
-  BackendStreamEvent,
-  GatewayStreamEvent,
-  CatchUpContentMessage,
-  ContentPatchMessage,
-  ContentPatchErrorMessage,
-  SubscriberDisconnectedMessage,
   GatewayErrorMessage,
-  GatewayHttpProxyRequest,
-  GatewayHttpProxyResponse,
-  GatewayHttpProxyResponseStart,
-  GatewayHttpProxyResponseChunk,
-  GatewayHttpProxyResponseEnd,
   PushNotificationRequestMessage,
 } from '@zclaudia/protocol/gateway';
 import type { NotificationConfig } from '@zclaudia/protocol/notifications';
 import { GatewayStorage, CREDENTIAL_TOKEN_PREFIXES, type CredentialInfo, type CredentialType } from './storage.js';
 import { validateGatewayMessage, filterProxyResponseHeaders, PROXY_REQUEST_HEADER_ALLOWLIST } from './validation.js';
 import { GatewayState, type PeerSession } from './state.js';
-import { encodeProxyRequestBody } from './proxy-body.js';
 import { GatewayPushNotificationService } from './push-notification.js';
 
 // ============================================================================
@@ -110,11 +89,6 @@ function sendToWs(ws: WebSocket, message: unknown): void {
 }
 
 /** Proxy failure carrying the HTTP status the client should receive. */
-class ProxyError extends Error {
-  constructor(readonly statusCode: number, readonly code: string, message: string) {
-    super(message);
-  }
-}
 
 function validatePeerHelloMessage(message: unknown): string | null {
   if (!message || typeof message !== 'object') return 'peer_hello must be an object';
@@ -238,22 +212,9 @@ export function createGatewayServer(config: GatewayConfig): Server {
     next();
   });
 
-  // Preserve raw bytes for proxy uploads before JSON/body-parser mutation.
-  // v4 backends are proxied via streaming channels (docs/protocol-v4.md §7):
-  // their request bodies must NOT be buffered, so the raw parser only runs
-  // for legacy v3 backends.
-  const proxyRawParser = express.raw({ type: '*/*', limit: '100mb' });
-  app.use('/api/proxy', (req: Request, res: Response, next: () => void) => {
-    const backendId = req.path.split('/')[1];
-    const lease = backendId ? state.leases.get(backendId) : undefined;
-    const backendPeer = lease ? state.peers.get(lease.peerSessionId) : undefined;
-    if (backendPeer?.protocolVersion === 4) { next(); return; }
-    proxyRawParser(req, res, next);
-  });
   // JSON parser for gateway-own endpoints. Must NOT touch /api/proxy: the
-  // v4 streaming bridge needs the raw request stream (the legacy v3 path
-  // is protected by the raw parser above, but a v4 JSON request would be
-  // consumed here and the bridge would never see body or end).
+  // streaming channel bridge needs the raw request stream — a JSON request
+  // consumed here would never reach the bridge as body frames.
   const jsonParser = express.json({ limit: '15mb' });
   app.use((req: Request, res: Response, next: (err?: unknown) => void) => {
     if (req.path.startsWith('/api/proxy/')) { next(); return; }
@@ -480,26 +441,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
     res.status(201).json({ success: true, data: { token: accessToken, expiresAt: credential.expiresAt, namespace: credential.namespace } });
   });
 
-  // --- HTTP Proxy ---
-  const pendingHttpRequests = new Map<string, {
-    resolve: (response: GatewayHttpProxyResponse | null) => void;
-    reject: (error: Error) => void;
-    timeout: NodeJS.Timeout;
-    res?: Response;
-    backendId: string;
-  }>();
-  const pendingStreamingRequests = new Map<string, {
-    res: Response; resolve: () => void; timeout: NodeJS.Timeout;
-    backendId: string;
-  }>();
-
-  function abortStreamingResponse(requestId: string, res: Response, reason: string): void {
-    pendingStreamingRequests.delete(requestId);
-    if (!res.writableEnded && !res.destroyed) {
-      res.destroy(new Error(reason));
-    }
-  }
-
+  // --- HTTP Proxy (streaming channel bridge, docs/protocol-v4.md §7) ---
   app.all('/api/proxy/:backendId/*', async (req: Request, res: Response) => {
     try {
       const { backendId } = req.params;
@@ -553,53 +495,14 @@ export function createGatewayServer(config: GatewayConfig): Server {
       const fullPath = req.params[0] || '';
       const queryString = req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : '';
       const targetPath = `/${fullPath}${queryString}`;
-      const requestId = uuidv4();
       // Path logged without query string — queries may carry sensitive values.
       audit('proxy.request', { backendId, method: req.method, path: `/${fullPath}`, ip: clientIp, auth: auth.kind === 'credential' ? auth.credential.id : 'legacy' });
-      // v4 backend: stream through an internal channel — no buffering, no base64.
-      if (backendPeer.protocolVersion === 4) {
-        proxyViaChannel(req, res, backendId, lease.epoch, backendPeer, targetPath);
-        return;
-      }
-      const contentType = req.headers['content-type'];
-      const encodedBody = ['GET', 'HEAD'].includes(req.method)
-        ? {}
-        : encodeProxyRequestBody(
-          req.body,
-          typeof contentType === 'string' ? contentType : undefined,
-        );
-      const proxyRequest: GatewayHttpProxyRequest = {
-        type: 'http_proxy_request', requestId, method: req.method,
-        path: targetPath,
-        headers: {},
-        ...encodedBody,
-      };
-      // Default-deny: only allowlisted request headers reach the backend.
-      for (const headerName of PROXY_REQUEST_HEADER_ALLOWLIST) {
-        const value = req.headers[headerName];
-        if (typeof value === 'string') proxyRequest.headers[headerName] = value;
-      }
-      const clientRequestId = req.headers['x-request-id'];
-
-      const response = await new Promise<GatewayHttpProxyResponse | null>((resolve, reject) => {
-        const timeout = setTimeout(() => { pendingHttpRequests.delete(requestId); reject(new ProxyError(504, 'GATEWAY_TIMEOUT', 'Proxy request timeout')); }, proxyRequestTimeoutMs);
-        pendingHttpRequests.set(requestId, { resolve, reject, timeout, res, backendId });
-        sendToWs(backendPeer.ws, proxyRequest);
-      });
-      if (response === null) return;
-      for (const [key, value] of Object.entries(filterProxyResponseHeaders(response.headers))) res.setHeader(key, value);
-      if (clientRequestId) res.setHeader('x-request-id', clientRequestId);
-      const responseBody = response.bodyEncoding === 'base64'
-        ? Buffer.from(response.body, 'base64')
-        : response.body;
-      res.status(response.statusCode).send(responseBody);
+      // Stream through an internal channel — no buffering, no base64.
+      proxyViaChannel(req, res, backendId, lease.epoch, backendPeer, targetPath);
     } catch (error) {
+      console.error('[Gateway] Proxy error:', error);
       if (res.headersSent) return;
-      if (error instanceof ProxyError) {
-        res.status(error.statusCode).json({ success: false, error: { code: error.code, message: error.message } });
-      } else {
-        res.status(500).json({ success: false, error: { code: 'PROXY_ERROR', message: 'Failed to proxy request' } });
-      }
+      res.status(500).json({ success: false, error: { code: 'PROXY_ERROR', message: 'Failed to proxy request' } });
     }
   });
 
@@ -1229,8 +1132,8 @@ export function createGatewayServer(config: GatewayConfig): Server {
         sendToWs(ws, { type: 'gateway_error', code: 'UNAUTHORIZED', message: 'This credential cannot register a backend' } satisfies GatewayErrorMessage); ws.close(); return null;
       }
     }
-    if (message.protocolVersion !== 3 && message.protocolVersion !== 4) {
-      sendToWs(ws, { type: 'gateway_error', code: 'PROTOCOL_VERSION_MISMATCH', message: `Expected protocol version 3 or 4, got ${message.protocolVersion}` } satisfies GatewayErrorMessage); ws.close(); return null;
+    if (message.protocolVersion !== 4) {
+      sendToWs(ws, { type: 'gateway_error', code: 'PROTOCOL_VERSION_MISMATCH', message: `Expected protocol version 4, got ${message.protocolVersion}` } satisfies GatewayErrorMessage); ws.close(); return null;
     }
     const peerSessionId = uuidv4();
     const recoveryToken = crypto.randomBytes(32).toString('hex');
@@ -1239,7 +1142,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
     const peer: PeerSession = {
       peerSessionId,
       ws,
-      protocolVersion: message.protocolVersion as 3 | 4,
+      protocolVersion: 4,
       peerType,
       namespace: message.namespace,
       credentialId: auth.kind === 'credential' ? auth.credential.id : undefined,
@@ -1249,16 +1152,12 @@ export function createGatewayServer(config: GatewayConfig): Server {
       name: identity.name || '',
       recoveryToken,
       isAlive: true,
-      subscribedBackends: new Set()
     };
 
     let backendInfo: PeerReadyMessage['backend'] | undefined;
     if (peerType === 'client+backend' && message.backend) {
-      // v4: UUID keyed by (namespace, instance, environment); v3: legacy
-      // instance-keyed short IDs, unchanged for wire compatibility.
-      const backendId = peer.protocolVersion === 4
-        ? storage.getOrCreateBackendIdV4({ namespace: message.namespace, instanceId: identity.instanceId, environment: channel, name: identity.name })
-        : storage.getOrCreateBackendIdByInstance(identity.instanceId, identity.deviceId, channel, identity.name);
+      // Stable UUID keyed by (namespace, instance, environment).
+      const backendId = storage.getOrCreateBackendIdV4({ namespace: message.namespace, instanceId: identity.instanceId, environment: channel, name: identity.name });
       const previousLease = state.leases.get(backendId);
       const epoch = storage.allocateEpoch();
       peer.backendId = backendId; peer.epoch = epoch;
@@ -1266,12 +1165,9 @@ export function createGatewayServer(config: GatewayConfig): Server {
         handleBackendOwnerReplaced(backendId, previousLease.epoch, epoch, previousLease.peerSessionId);
       }
       state.addLease({ backendId, epoch, peerSessionId, leaseTtlMs: state.config.defaultLeaseTtlMs, lastHeartbeatAt: Date.now(), leaseTimer: null });
-      // gatewayProtocolVersion is a v4 presence addition: clients use it to
-      // pick per-backend transport paths (topics/channels vs v3 messages).
-      // v3 clients tolerate the extra field (leniency contract).
+      // gatewayProtocolVersion lets clients feature-detect from presence.
       const presence: BackendPresence & { gatewayProtocolVersion: number } = { namespace: message.namespace, backendId, instanceId: identity.instanceId, deviceId: identity.deviceId, name: identity.name || '', channel, visible: message.backend.visible, capabilities: message.backend.capabilities, backendProtocolVersion: message.backend.backendProtocolVersion, minClientProtocolVersion: message.backend.minClientProtocolVersion, epoch, connectedAt: Date.now(), lastSeenAt: Date.now(), gatewayProtocolVersion: peer.protocolVersion };
       state.registryUpsert(presence);
-      state.streamDemand.set(backendId, { subscriberCount: 0, active: false });
       backendInfo = { backendId, epoch, leaseTtlMs: state.config.defaultLeaseTtlMs };
     }
 
@@ -1309,22 +1205,8 @@ export function createGatewayServer(config: GatewayConfig): Server {
     }
     switch (message.type) {
       case 'backend_heartbeat': handleBackendHeartbeat(peer, message); break;
-      case 'backend_resource_snapshot': handleBackendResourceSnapshot(peer, message); break;
-      case 'backend_resource_event': handleBackendResourceEvent(peer, message); break;
-      case 'backend_stream_event': handleBackendStreamEvent(peer, message); break;
       case 'request_registry_snapshot': handleRequestRegistrySnapshot(peer); break;
-      case 'request_backend_resource_snapshot': handleRequestBackendResourceSnapshot(peer, message); break;
-      case 'subscribe_backend': handleSubscribeBackend(peer, message); break;
-      case 'unsubscribe_backend': handleUnsubscribeBackend(peer, message); break;
-      case 'backend_client_message': handleBackendClientMessage(peer, message); break;
       case 'backend_server_message': handleBackendServerMessage(peer, message); break;
-      case 'content_patch': handleContentPatch(peer, message); break;
-      case 'content_patch_error': handleContentPatchError(peer, message); break;
-      case 'catch_up_content': handleCatchUpContent(peer, message); break;
-      case 'http_proxy_response': handleHttpProxyResponse(peer, message); break;
-      case 'http_proxy_response_start': handleHttpProxyResponseStart(peer, message); break;
-      case 'http_proxy_response_chunk': handleHttpProxyResponseChunk(peer, message); break;
-      case 'http_proxy_response_end': handleHttpProxyResponseEnd(peer, message); break;
       case 'push_notification_request': handlePushNotificationRequest(peer, message); break;
       case 'channel_open': handleChannelOpen(peer, message); break;
       case 'channel_reject': handleChannelReject(peer, message); break;
@@ -1349,51 +1231,9 @@ export function createGatewayServer(config: GatewayConfig): Server {
     lease.lastHeartbeatAt = Date.now();
     const presence = state.registry.items.get(backendId);
     if (presence) presence.lastSeenAt = Date.now();
-    sendToWs(peer.ws, { type: 'heartbeat_ack', epoch: msg.epoch, streamDemand: state.getStreamDemand(backendId) } satisfies HeartbeatAckMessage);
-  }
-
-  /**
-   * Relay a backend's resource snapshot/event to its subscribers.
-   * If the message carries targetPeerSessionId (additive, not yet in the
-   * protocol types), deliver only to that subscriber — this lets backends
-   * answer snapshot requests without broadcasting to everyone.
-   */
-  function relayToSubscribers(peer: PeerSession, msg: BackendResourceSnapshotMessage | BackendResourceEventMessage): void {
-    if (!isCurrentBackendOwner(peer)) return;
-    const backendId = peer.backendId!;
-    const subscribers = state.getSubscribers(backendId);
-    const relayMsg = { ...msg, backendId };
-    const target = (msg as { targetPeerSessionId?: string }).targetPeerSessionId;
-    if (target) {
-      if (!subscribers.has(target)) return;
-      const p = state.peers.get(target);
-      if (p) sendToWs(p.ws, relayMsg);
-      return;
-    }
-    for (const subId of subscribers) {
-      const p = state.peers.get(subId);
-      if (p) sendToWs(p.ws, relayMsg);
-    }
-  }
-
-  function handleBackendResourceSnapshot(peer: PeerSession, msg: BackendResourceSnapshotMessage): void {
-    relayToSubscribers(peer, msg);
-  }
-
-  function handleBackendResourceEvent(peer: PeerSession, msg: BackendResourceEventMessage): void {
-    relayToSubscribers(peer, msg);
-  }
-
-  function handleBackendStreamEvent(peer: PeerSession, msg: BackendStreamEvent): void {
-    if (!isCurrentBackendOwner(peer)) return;
-    const backendId = peer.backendId!;
-    const subscribers = state.getSubscribers(backendId);
-    if (subscribers.size === 0) return;
-    const clientEvent: GatewayStreamEvent = { type: 'backend_stream_event', backendId, streamId: msg.streamId, eventName: msg.eventName, seq: msg.seq, channel: msg.channel, payload: msg.payload, metadata: msg.metadata };
-    for (const subId of subscribers) {
-      const clientPeer = state.peers.get(subId);
-      if (clientPeer) sendToWs(clientPeer.ws, clientEvent);
-    }
+    // streamDemand is a v3 relic: the type still requires it, retained
+    // topics made it meaningless — always false.
+    sendToWs(peer.ws, { type: 'heartbeat_ack', epoch: msg.epoch, streamDemand: false } satisfies HeartbeatAckMessage);
   }
 
   // ========================================================================
@@ -1404,204 +1244,19 @@ export function createGatewayServer(config: GatewayConfig): Server {
     sendToWs(peer.ws, { type: 'registry_snapshot', items: state.getRegistrySnapshot(peer.namespace) } satisfies RegistrySnapshotMessage);
   }
 
-  function handleRequestBackendResourceSnapshot(peer: PeerSession, msg: RequestBackendResourceSnapshotMessage): void {
-    // Only subscribers may ask a backend for a snapshot (subscription is
-    // namespace-gated at subscribe time, so this transitively enforces
-    // namespace isolation too).
-    if (!state.getSubscribers(msg.backendId).has(peer.peerSessionId)) {
-      sendToWs(peer.ws, { type: 'gateway_error', code: 'BACKEND_NOT_SUBSCRIBED', message: 'Not subscribed to backend', recovery: 'resubscribe' } satisfies GatewayErrorMessage);
-      return;
-    }
-    const bp = findBackendPeer(msg.backendId);
-    if (!bp) {
-      sendToWs(peer.ws, { type: 'gateway_error', code: 'BACKEND_OFFLINE', message: `Backend ${msg.backendId} not found or offline`, recovery: 'reconnect' } satisfies GatewayErrorMessage);
-      return;
-    }
-    // Pin the target to the requesting peer: a client must not be able to
-    // direct another subscriber's snapshot refresh.
-    sendToWs(bp.ws, { type: 'request_backend_resource_snapshot', backendId: msg.backendId, resourceTypes: msg.resourceTypes, targetPeerSessionId: peer.peerSessionId } satisfies RequestBackendResourceSnapshotMessage);
-  }
-
-  function handleSubscribeBackend(peer: PeerSession, msg: SubscribeBackendMessage): void {
-    const presence = state.registry.items.get(msg.backendId);
-    // Cross-namespace subscription is answered exactly like a nonexistent
-    // backend so the response is not an existence oracle for other namespaces.
-    if (!presence || presence.namespace !== peer.namespace) {
-      sendToWs(peer.ws, { type: 'gateway_error', code: 'BACKEND_OFFLINE', message: `Backend ${msg.backendId} not found or offline`, recovery: 'reconnect' } satisfies GatewayErrorMessage);
-      return;
-    }
-    const lease = state.leases.get(msg.backendId);
-    if (!lease) {
-      sendToWs(peer.ws, { type: 'gateway_error', code: 'BACKEND_OFFLINE', message: `Backend ${msg.backendId} not found or offline`, recovery: 'reconnect' } satisfies GatewayErrorMessage);
-      return;
-    }
-    // Check if this peer is already subscribed before adding
-    const alreadySubscribed = peer.subscribedBackends.has(msg.backendId);
-    if (!alreadySubscribed) audit('backend.subscribed', { peerSessionId: peer.peerSessionId, backendId: msg.backendId });
-    const demandChanged = state.addSubscription(msg.backendId, peer.peerSessionId);
-    if (demandChanged) {
-      const bp = findBackendPeer(msg.backendId);
-      if (bp) sendToWs(bp.ws, { type: 'backend_stream_demand', active: true } satisfies StreamDemandMessage);
-    }
-    sendToWs(peer.ws, { type: 'backend_subscribed', backendId: msg.backendId, epoch: lease.epoch, capabilities: presence.capabilities } satisfies BackendSubscribedMessage);
-    // Request a fresh data snapshot for new subscriptions.
-    // Duplicate subscribe_backend from the same peer should not trigger
-    // redundant full snapshots that get broadcast to all existing subscribers.
-    if (!alreadySubscribed) {
-      const bp = findBackendPeer(msg.backendId);
-      if (bp) {
-        sendToWs(bp.ws, {
-          type: 'request_backend_resource_snapshot',
-          backendId: msg.backendId,
-          targetPeerSessionId: peer.peerSessionId,
-        } satisfies RequestBackendResourceSnapshotMessage);
-      }
-    }
-  }
-
-  function handleUnsubscribeBackend(peer: PeerSession, msg: UnsubscribeBackendMessage): void {
-    audit('backend.unsubscribed', { peerSessionId: peer.peerSessionId, backendId: msg.backendId });
-    const demandChanged = state.removeSubscription(msg.backendId, peer.peerSessionId);
-    sendToWs(peer.ws, { type: 'backend_unsubscribed', backendId: msg.backendId, reason: 'client_unsubscribed' } satisfies BackendUnsubscribedMessage);
-    // Notify backend to clean up this client's server-side state (virtualClient, terminal, etc.)
-    const bp = findBackendPeer(msg.backendId);
-    if (bp) {
-      sendToWs(bp.ws, { type: 'subscriber_disconnected', backendId: msg.backendId, peerSessionId: peer.peerSessionId } satisfies SubscriberDisconnectedMessage);
-    }
-    if (demandChanged && bp) {
-      sendToWs(bp.ws, { type: 'backend_stream_demand', active: false } satisfies StreamDemandMessage);
-    }
-  }
-
-  function handleBackendClientMessage(peer: PeerSession, msg: BackendClientMessage): void {
-    const subscribers = state.getSubscribers(msg.backendId);
-    if (!subscribers.has(peer.peerSessionId)) {
-      sendToWs(peer.ws, { type: 'gateway_error', code: 'BACKEND_NOT_SUBSCRIBED', message: 'Not subscribed to backend', recovery: 'resubscribe' } satisfies GatewayErrorMessage);
-      return;
-    }
-    const backendPeer = findBackendPeer(msg.backendId);
-    if (!backendPeer) {
-      sendToWs(peer.ws, { type: 'gateway_error', code: 'BACKEND_OFFLINE', message: 'Backend offline', recovery: 'reconnect' } satisfies GatewayErrorMessage);
-      return;
-    }
-    // Attach sender identity so backend can distinguish different clients
-    sendToWs(backendPeer.ws, { ...msg, sourcePeerSessionId: peer.peerSessionId });
-  }
-
   function handleBackendServerMessage(peer: PeerSession, msg: BackendServerMessage): void {
     if (!isCurrentBackendOwner(peer)) return;
     const backendId = peer.backendId!;
     if (msg.backendId !== backendId) return;
 
-    // If targetPeerSessionId is set, route to that specific client. Guard:
-    // the target must be a v3 subscriber OR a same-namespace peer (v4
-    // clients hold channels/topics instead of subscriptions). Namespace
-    // equality preserves the anti-probing property — a backend still cannot
-    // message peers of other applications by guessing session IDs.
-    if (msg.targetPeerSessionId) {
-      const targetPeer = state.peers.get(msg.targetPeerSessionId);
-      if (!targetPeer) return;
-      const isSubscriber = state.getSubscribers(backendId).has(msg.targetPeerSessionId);
-      if (!isSubscriber && targetPeer.namespace !== peer.namespace) return;
-      sendToWs(targetPeer.ws, msg);
-      return;
-    }
-
-    // Otherwise broadcast to all subscribers
-    const subscribers = state.getSubscribers(backendId);
-    for (const subId of subscribers) {
-      const clientPeer = state.peers.get(subId);
-      if (clientPeer) sendToWs(clientPeer.ws, msg);
-    }
-  }
-
-  function handleContentPatch(peer: PeerSession, msg: ContentPatchMessage): void {
-    if (!isCurrentBackendOwner(peer)) return;
-    const backendId = peer.backendId!;
-    if (msg.backendId !== backendId) return;
-    const subscribers = state.getSubscribers(backendId);
-    for (const subId of subscribers) {
-      const clientPeer = state.peers.get(subId);
-      if (clientPeer) sendToWs(clientPeer.ws, msg);
-    }
-  }
-
-  function handleContentPatchError(peer: PeerSession, msg: ContentPatchErrorMessage): void {
-    if (!isCurrentBackendOwner(peer)) return;
-    const backendId = peer.backendId!;
-    if (msg.backendId !== backendId) return;
-    const subscribers = state.getSubscribers(backendId);
-    for (const subId of subscribers) {
-      const clientPeer = state.peers.get(subId);
-      if (clientPeer) sendToWs(clientPeer.ws, msg);
-    }
-  }
-
-  function handleCatchUpContent(peer: PeerSession, msg: CatchUpContentMessage): void {
-    const subscribers = state.getSubscribers(msg.backendId);
-    if (!subscribers.has(peer.peerSessionId)) {
-      sendToWs(peer.ws, { type: 'gateway_error', code: 'BACKEND_NOT_SUBSCRIBED', message: 'Not subscribed to backend', recovery: 'resubscribe' } satisfies GatewayErrorMessage); return;
-    }
-    const bp = findBackendPeer(msg.backendId);
-    if (!bp) { sendToWs(peer.ws, { type: 'gateway_error', code: 'BACKEND_OFFLINE', message: 'Backend offline', recovery: 'reconnect' } satisfies GatewayErrorMessage); return; }
-    sendToWs(bp.ws, { type: 'catch_up_content', backendId: msg.backendId, contentStreamId: msg.contentStreamId, afterOffset: msg.afterOffset } satisfies CatchUpContentMessage);
-  }
-
-  // ========================================================================
-  // HTTP Proxy Response Handlers
-  // ========================================================================
-
-  /**
-   * A proxy response is only accepted from the current owner of the backend
-   * the request was sent to. Anything else (another peer guessing request
-   * IDs, a stale pre-epoch-change backend) is dropped.
-   */
-  function ownsProxyRequest(peer: PeerSession, backendId: string): boolean {
-    return peer.backendId === backendId && isCurrentBackendOwner(peer);
-  }
-
-  function handleHttpProxyResponse(peer: PeerSession, msg: GatewayHttpProxyResponse): void {
-    const pending = pendingHttpRequests.get(msg.requestId);
-    if (!pending || !ownsProxyRequest(peer, pending.backendId)) return;
-    clearTimeout(pending.timeout); pendingHttpRequests.delete(msg.requestId); pending.resolve(msg);
-  }
-  function handleHttpProxyResponseStart(peer: PeerSession, msg: GatewayHttpProxyResponseStart): void {
-    const pending = pendingHttpRequests.get(msg.requestId);
-    if (!pending?.res) return;
-    if (!ownsProxyRequest(peer, pending.backendId)) return;
-    clearTimeout(pending.timeout); pendingHttpRequests.delete(msg.requestId);
-    const res = pending.res;
-    for (const [key, value] of Object.entries(filterProxyResponseHeaders(msg.headers))) res.setHeader(key, value);
-    res.status(msg.statusCode);
-    const streamTimeout = setTimeout(() => { abortStreamingResponse(msg.requestId, res, 'Proxy streaming timeout'); }, proxyStreamingTimeoutMs);
-    res.once('close', () => {
-      const streaming = pendingStreamingRequests.get(msg.requestId);
-      if (!streaming) return;
-      clearTimeout(streaming.timeout);
-      pendingStreamingRequests.delete(msg.requestId);
-    });
-    pendingStreamingRequests.set(msg.requestId, { res, resolve: pending.resolve as unknown as () => void, timeout: streamTimeout, backendId: pending.backendId });
-    pending.resolve(null);
-  }
-  function handleHttpProxyResponseChunk(peer: PeerSession, msg: GatewayHttpProxyResponseChunk): void {
-    const streaming = pendingStreamingRequests.get(msg.requestId);
-    if (!streaming) return;
-    if (!ownsProxyRequest(peer, streaming.backendId)) return;
-    if (streaming.res.writableEnded || streaming.res.destroyed) {
-      pendingStreamingRequests.delete(msg.requestId);
-      clearTimeout(streaming.timeout);
-      return;
-    }
-    clearTimeout(streaming.timeout);
-    streaming.timeout = setTimeout(() => { abortStreamingResponse(msg.requestId, streaming.res, 'Proxy streaming timeout'); }, proxyStreamingTimeoutMs);
-    streaming.res.write(Buffer.from(msg.data, 'base64'));
-  }
-  function handleHttpProxyResponseEnd(peer: PeerSession, msg: GatewayHttpProxyResponseEnd): void {
-    const streaming = pendingStreamingRequests.get(msg.requestId);
-    if (!streaming) return;
-    if (!ownsProxyRequest(peer, streaming.backendId)) return;
-    clearTimeout(streaming.timeout); pendingStreamingRequests.delete(msg.requestId);
-    if (!streaming.res.writableEnded) streaming.res.end(); streaming.resolve();
+    // Targeted fallback path (v4 clients normally receive over their
+    // message channel). Namespace equality preserves the anti-probing
+    // property: a backend cannot message peers of other applications by
+    // guessing session IDs.
+    if (!msg.targetPeerSessionId) return;
+    const targetPeer = state.peers.get(msg.targetPeerSessionId);
+    if (!targetPeer || targetPeer.namespace !== peer.namespace) return;
+    sendToWs(targetPeer.ws, msg);
   }
 
   // ========================================================================
@@ -1630,40 +1285,15 @@ export function createGatewayServer(config: GatewayConfig): Server {
     const peer = state.peers.get(lease.peerSessionId);
     closeChannelsForBackend(backendId, 'backend_offline');
     removeTopicsForBackend(backendId);
-    rejectPendingProxyRequests(backendId);
-    notifySubscribersBackendGone(backendId, 'backend_offline');
     state.registryRemove(backendId);
     broadcastRegistrySnapshot();
     state.removeBackend(backendId);
     if (peer) {
       peer.backendId = undefined;
       peer.epoch = undefined;
-      // Clean up this peer's client-side subscriptions and notify backends of demand changes
-      const affectedBackends = state.removeAllSubscriptions(peer.peerSessionId);
-      for (const bid of affectedBackends) {
-        if (!state.getStreamDemand(bid)) {
-          const bp = findBackendPeer(bid);
-          if (bp) sendToWs(bp.ws, { type: 'backend_stream_demand', active: false } satisfies StreamDemandMessage);
-        }
-      }
       peer.ws.terminate();
       unregisterRecoveryToken(peer);
       state.removePeer(peer.peerSessionId);
-    }
-  }
-
-  function rejectPendingProxyRequests(backendId: string): void {
-    for (const [requestId, pending] of pendingHttpRequests) {
-      if (pending.backendId === backendId) {
-        clearTimeout(pending.timeout);
-        pendingHttpRequests.delete(requestId);
-        pending.reject(new ProxyError(502, 'BACKEND_OFFLINE', 'Backend disconnected'));
-      }
-    }
-    for (const [requestId, streaming] of pendingStreamingRequests) {
-      if (streaming.backendId === backendId) {
-        abortStreamingResponse(requestId, streaming.res, 'Backend disconnected');
-      }
     }
   }
 
@@ -1675,8 +1305,6 @@ export function createGatewayServer(config: GatewayConfig): Server {
       // Close backend-side channels first so they carry backend_offline,
       // not the generic per-peer 'closed' from the cleanup below.
       closeChannelsForBackend(peer.backendId, 'backend_offline');
-      rejectPendingProxyRequests(peer.backendId);
-      notifySubscribersBackendGone(peer.backendId, 'backend_offline');
       state.registryRemove(peer.backendId);
       broadcastRegistrySnapshot(peerSessionId);
       state.removeBackend(peer.backendId);
@@ -1685,18 +1313,6 @@ export function createGatewayServer(config: GatewayConfig): Server {
     closeChannelsForPeer(peerSessionId);
     removeTopicSubscriptionsForPeer(peerSessionId);
     if (peer.backendId) removeTopicsForBackend(peer.backendId);
-    // Clean up this peer's subscriptions: notify backends and update stream demand
-    const affectedBackends = state.removeAllSubscriptions(peerSessionId);
-    for (const backendId of affectedBackends) {
-      const bp = findBackendPeer(backendId);
-      if (bp) {
-        // Notify backend to clean up this client's server-side state
-        sendToWs(bp.ws, { type: 'subscriber_disconnected', backendId, peerSessionId } satisfies SubscriberDisconnectedMessage);
-        if (!state.getStreamDemand(backendId)) {
-          sendToWs(bp.ws, { type: 'backend_stream_demand', active: false } satisfies StreamDemandMessage);
-        }
-      }
-    }
     peer.ws.terminate();
     unregisterRecoveryToken(peer);
     state.removePeer(peerSessionId);
@@ -1720,26 +1336,6 @@ export function createGatewayServer(config: GatewayConfig): Server {
     }
   }
 
-  function notifySubscribersBackendGone(backendId: string, reason: BackendUnsubscribedMessage['reason']): void {
-    const subscribers = state.getSubscribers(backendId);
-    for (const subId of subscribers) {
-      const clientPeer = state.peers.get(subId);
-      if (clientPeer) {
-        sendToWs(clientPeer.ws, { type: 'backend_unsubscribed', backendId, reason } satisfies BackendUnsubscribedMessage);
-      }
-    }
-    // Clean up all subscriptions for this backend
-    for (const subId of [...subscribers]) {
-      state.removeSubscription(backendId, subId);
-    }
-  }
-
-  function findBackendPeer(backendId: string): PeerSession | undefined {
-    const lease = state.leases.get(backendId);
-    if (!lease) return undefined;
-    return state.peers.get(lease.peerSessionId);
-  }
-
   function isCurrentBackendOwner(peer: PeerSession, expectedEpoch?: number): boolean {
     if (!peer.backendId || peer.epoch == null) return false;
     if (expectedEpoch !== undefined && peer.epoch !== expectedEpoch) return false;
@@ -1761,7 +1357,6 @@ export function createGatewayServer(config: GatewayConfig): Server {
     // bound to the previous epoch are closed here, not inferred client-side.
     closeChannelsForBackend(backendId, 'epoch_changed');
     removeTopicsForBackend(backendId);
-    notifySubscribersBackendGone(backendId, 'epoch_changed');
     state.removeLease(backendId);
 
     const previousPeer = state.peers.get(previousPeerSessionId);

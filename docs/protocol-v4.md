@@ -132,5 +132,7 @@ Gateway 自动改走 Channel 桥接（客户端与 v3 Backend 完全不感知）
 
 ## 7. 与 v3 的关系
 
-- v3 会话完全不变，两版本客户端可同时在线。
-- v4 会话可以继续使用 v3 的订阅/快照消息（迁移期），最终由 Topic 原语替代广播语义。
+v3 已整体移除（`peer_hello.protocolVersion` 必须为 4）：订阅/快照广播由
+Topic（含 retain）取代，`http_proxy_*` 由 Channel 流式桥取代，定向消息走
+消息 Channel。唯一保留的 v3 形态消息是 `backend_server_message`（带
+`targetPeerSessionId` 的定向回退路径，同 namespace 校验）。

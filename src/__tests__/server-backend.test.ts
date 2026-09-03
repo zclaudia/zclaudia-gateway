@@ -81,7 +81,7 @@ const delay = (ms: number) => new Promise(r => setTimeout(r, ms));
 async function registerBackendV2(ws: WebSocket, identity: { deviceId: string; instanceId: string; name?: string }, visible = true): Promise<{ backendId: string; epoch: number; peerSessionId: string }> {
   ws.send(JSON.stringify({
     type: 'peer_hello',
-    protocolVersion: 3,
+    protocolVersion: 4,
     namespace: 'zclaudia',
     clientProtocolVersion: 1,
     peerType: 'client+backend',
@@ -91,21 +91,6 @@ async function registerBackendV2(ws: WebSocket, identity: { deviceId: string; in
   }));
   const ready = await waitForMessage(ws, 'peer_ready');
   return { backendId: ready.backend.backendId, epoch: ready.backend.epoch, peerSessionId: ready.peerSessionId };
-}
-
-// Helper: register a client with v2 protocol
-async function registerClientV2(ws: WebSocket): Promise<{ peerSessionId: string; registrySync: any }> {
-  ws.send(JSON.stringify({
-    type: 'peer_hello',
-    protocolVersion: 3,
-    namespace: 'zclaudia',
-    clientProtocolVersion: 1,
-    peerType: 'client-only',
-    gatewaySecret: GATEWAY_SECRET,
-    identity: { deviceId: 'client-dev', instanceId: `client-inst-${Date.now()}-${Math.random()}` }
-  }));
-  const ready = await waitForMessage(ws, 'peer_ready');
-  return { peerSessionId: ready.peerSessionId, registrySync: ready.registrySync };
 }
 
 describeIfLoopback('Gateway Backend Message Handling', () => {
@@ -152,7 +137,7 @@ describeIfLoopback('Gateway Backend Message Handling', () => {
 
       const reg2 = await registerBackendV2(backendWs2, { deviceId: 'different-device', instanceId: 'inst-different-device', name: 'Second Backend' });
       expect(reg2.backendId).not.toBe(backendId);
-      expect(reg2.backendId).toMatch(/^[a-f0-9]{8}$/);
+      expect(reg2.backendId).toMatch(/^[0-9a-f-]{36}$/);
 
       await closeWs(backendWs2);
     });
@@ -183,191 +168,6 @@ describeIfLoopback('Gateway Backend Message Handling', () => {
       expect(reg.backendId).toBeDefined();
 
       await closeWs(noNameBackendWs);
-    });
-  });
-
-  describe('Backend Subscriptions', () => {
-    test('should subscribe to backend', async () => {
-      const clientWs = new WebSocket(WS_URL);
-      await waitForOpen(clientWs);
-      openClients.push(clientWs);
-
-      await registerClientV2(clientWs);
-
-      // Subscribe to the backend
-      clientWs.send(JSON.stringify({
-        type: 'subscribe_backend',
-        backendId,
-      }));
-
-      const subscribed = await waitForMessage(clientWs, 'backend_subscribed');
-      expect(subscribed.backendId).toBe(backendId);
-      expect(subscribed.epoch).toBe(backendEpoch);
-    });
-
-    test('should return error for non-existent backend', async () => {
-      const clientWs = new WebSocket(WS_URL);
-      await waitForOpen(clientWs);
-      openClients.push(clientWs);
-
-      await registerClientV2(clientWs);
-
-      clientWs.send(JSON.stringify({
-        type: 'subscribe_backend',
-        backendId: 'nonexist1',
-      }));
-
-      const error = await waitForMessage(clientWs, 'gateway_error');
-      expect(error.code).toBe('BACKEND_OFFLINE');
-    });
-
-    test('should forward backend_client_message to backend', async () => {
-      const clientWs = new WebSocket(WS_URL);
-      await waitForOpen(clientWs);
-      openClients.push(clientWs);
-
-      await registerClientV2(clientWs);
-
-      clientWs.send(JSON.stringify({
-        type: 'subscribe_backend',
-        backendId,
-      }));
-
-      await waitForMessage(clientWs, 'backend_subscribed');
-
-      // Send a message from client to backend
-      clientWs.send(JSON.stringify({
-        type: 'backend_client_message',
-        backendId,
-        payload: { action: 'test', data: 'hello' }
-      }));
-
-      // Backend should receive it
-      const msg = await waitForMessage(backendWs, 'backend_client_message');
-      expect(msg.backendId).toBe(backendId);
-      expect(msg.payload.action).toBe('test');
-    });
-
-    test('should forward backend_server_message to subscribed clients', async () => {
-      const clientWs = new WebSocket(WS_URL);
-      await waitForOpen(clientWs);
-      openClients.push(clientWs);
-
-      await registerClientV2(clientWs);
-
-      clientWs.send(JSON.stringify({
-        type: 'subscribe_backend',
-        backendId,
-      }));
-
-      await waitForMessage(clientWs, 'backend_subscribed');
-
-      // Backend sends a backend_server_message
-      backendWs.send(JSON.stringify({
-        type: 'backend_server_message',
-        backendId,
-        payload: { action: 'response', data: 'world' }
-      }));
-
-      // Client should receive it
-      const msg = await waitForMessage(clientWs, 'backend_server_message');
-      expect(msg.backendId).toBe(backendId);
-      expect(msg.payload.action).toBe('response');
-    });
-
-    test('should ignore content_patch with mismatched backendId', async () => {
-      const clientWs = new WebSocket(WS_URL);
-      await waitForOpen(clientWs);
-      openClients.push(clientWs);
-      const clientCollector = createMessageCollector(clientWs);
-
-      await registerClientV2(clientWs);
-
-      clientWs.send(JSON.stringify({
-        type: 'subscribe_backend',
-        backendId,
-      }));
-
-      await waitForMessage(clientWs, 'backend_subscribed');
-
-      backendWs.send(JSON.stringify({
-        type: 'content_patch',
-        backendId: 'wrong-backend',
-        sessionId: 'session-1',
-        messages: [],
-        latestOffset: 0,
-      }));
-
-      await delay(50);
-      expect(clientCollector.find((message) => message.type === 'content_patch')).toBeUndefined();
-    });
-
-    test('should ignore content_patch_error with mismatched backendId', async () => {
-      const clientWs = new WebSocket(WS_URL);
-      await waitForOpen(clientWs);
-      openClients.push(clientWs);
-      const clientCollector = createMessageCollector(clientWs);
-
-      await registerClientV2(clientWs);
-
-      clientWs.send(JSON.stringify({
-        type: 'subscribe_backend',
-        backendId,
-      }));
-
-      await waitForMessage(clientWs, 'backend_subscribed');
-
-      backendWs.send(JSON.stringify({
-        type: 'content_patch_error',
-        backendId: 'wrong-backend',
-        sessionId: 'session-1',
-        afterOffset: 0,
-        message: 'boom',
-      }));
-
-      await delay(50);
-      expect(clientCollector.find((message) => message.type === 'content_patch_error')).toBeUndefined();
-    });
-  });
-
-  describe('HTTP Proxy Response', () => {
-    test('should handle http_proxy_response', async () => {
-      // Just verify it doesn't throw for non-existent request
-      backendWs.send(JSON.stringify({
-        type: 'http_proxy_response',
-        requestId: 'non-existent-request',
-        statusCode: 200,
-        headers: {},
-        bodyEncoding: 'utf8',
-        body: '{}'
-      }));
-
-      await delay(50);
-    });
-  });
-
-  describe('Backend Disconnect', () => {
-    test('should notify subscribers via backend_unsubscribed when backend disconnects', async () => {
-      const clientWs = new WebSocket(WS_URL);
-      await waitForOpen(clientWs);
-      openClients.push(clientWs);
-
-      await registerClientV2(clientWs);
-
-      // Subscribe to backend
-      clientWs.send(JSON.stringify({
-        type: 'subscribe_backend',
-        backendId,
-      }));
-
-      await waitForMessage(clientWs, 'backend_subscribed');
-
-      // Close backend connection
-      await closeWs(backendWs);
-
-      // Client should receive backend_unsubscribed
-      const unsubscribed = await waitForMessage(clientWs, 'backend_unsubscribed');
-      expect(unsubscribed.backendId).toBe(backendId);
     });
   });
 

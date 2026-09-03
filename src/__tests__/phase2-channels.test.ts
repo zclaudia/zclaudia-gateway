@@ -279,17 +279,20 @@ describeIfLoopback('Phase 2: v4 Channels', () => {
     expect(err.code).toBe('BACKEND_OFFLINE');
   });
 
-  test('v3 peers cannot open channels', async () => {
+  test('v3 hellos are rejected outright', async () => {
     const { wsUrl } = await startServer();
-    const backendCtl = await connect(wsUrl);
-    const backendReady = await hello(backendCtl, { namespace: 'app-a', peerType: 'client+backend', instanceId: 'v3-backend', protocolVersion: 3 });
-    const clientCtl = await connect(wsUrl);
-    await hello(clientCtl, { namespace: 'app-a', peerType: 'client-only', instanceId: 'v3-client', protocolVersion: 3 });
-
-    clientCtl.send(JSON.stringify({ type: 'channel_open', target: backendReady.backend.backendId }));
-    const err = await waitForMessage(clientCtl, 'gateway_error');
-    expect(err.code).toBe('INVALID_MESSAGE');
-    expect(err.message).toContain('protocol v4');
+    const ws = await connect(wsUrl);
+    ws.send(JSON.stringify({
+      type: 'peer_hello',
+      protocolVersion: 3,
+      namespace: 'app-a',
+      clientProtocolVersion: 1,
+      peerType: 'client-only',
+      gatewaySecret: GATEWAY_SECRET,
+      identity: { deviceId: 'dev-v3', instanceId: 'v3-client' },
+    }));
+    const err = await waitForMessage(ws, 'gateway_error');
+    expect(err.code).toBe('PROTOCOL_VERSION_MISMATCH');
   });
 
   test('backend can reject an offered channel', async () => {
@@ -327,17 +330,11 @@ describeIfLoopback('Phase 2: v4 Channels', () => {
     expect(r2.backend.backendId).toMatch(UUID_RE);
     expect(r2.backend.backendId).not.toBe(r1.backend.backendId);
 
-    // v3 keeps the legacy 8-char hex id scheme
-    const v3 = await connect(wsUrl);
-    const r3 = await hello(v3, { namespace: 'app-a', peerType: 'client+backend', instanceId: 'legacy-inst', protocolVersion: 3 });
-    expect(r3.backend.backendId).toMatch(/^[0-9a-f]{8}$/);
-
     // Presence advertises the gateway protocol version for path selection
     const viewer = await connect(wsUrl);
     const vready = await hello(viewer, { namespace: 'app-a', peerType: 'client-only', instanceId: 'presence-viewer' });
     const items = vready.registrySync.items as Array<{ backendId: string; gatewayProtocolVersion?: number }>;
     expect(items.find((i) => i.backendId === r1again.backend.backendId)?.gatewayProtocolVersion).toBe(4);
-    expect(items.find((i) => i.backendId === r3.backend.backendId)?.gatewayProtocolVersion).toBe(3);
   });
 
   test('per-channel byte rate limit throttles the relay', async () => {

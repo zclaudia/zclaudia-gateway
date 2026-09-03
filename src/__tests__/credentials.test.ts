@@ -95,7 +95,7 @@ describeIfLoopback('Phase 1: Credential System', () => {
   function sendHello(ws: WebSocket, secret: string, namespace: string, peerType: 'client-only' | 'client+backend', instanceId: string) {
     const hello: Record<string, unknown> = {
       type: 'peer_hello',
-      protocolVersion: 3,
+      protocolVersion: 4,
       namespace,
       clientProtocolVersion: 1,
       peerType,
@@ -331,18 +331,26 @@ describeIfLoopback('Phase 1: Credential System', () => {
   });
 
   describe('HTTP proxy with credentials', () => {
+    /** v4 backend serving http channels: every request answers 200 'ok'. */
     async function registerEchoBackend(wsUrl: string, namespace: string, instanceId: string) {
       const ws = await connect(wsUrl);
       sendHello(ws, GATEWAY_SECRET, namespace, 'client+backend', instanceId);
       const ready = await waitForMessage(ws, 'peer_ready');
+      const base = wsUrl.replace(/\/ws$/, '');
       ws.on('message', (data) => {
         const msg = JSON.parse(data.toString());
-        if (msg.type === 'http_proxy_request') {
-          ws.send(JSON.stringify({
-            type: 'http_proxy_response', requestId: msg.requestId,
-            statusCode: 200, headers: {}, bodyEncoding: 'utf8', body: 'ok',
-          }));
-        }
+        if (msg.type !== 'channel_offer' || msg.kind !== 'http') return;
+        const dataWs = new WebSocket(`${base}${msg.dataPath}?ticket=${msg.ticket}`);
+        sockets.push(dataWs);
+        dataWs.on('message', (d: Buffer, isBinary: boolean) => {
+          if (isBinary) return;
+          const frame = JSON.parse(d.toString());
+          if (frame.type === 'http_request_end') {
+            dataWs.send(JSON.stringify({ type: 'http_response', status: 200, headers: { 'content-type': 'text/plain' } }));
+            dataWs.send(Buffer.from('ok'));
+            dataWs.close(1000);
+          }
+        });
       });
       return ready.backend.backendId as string;
     }

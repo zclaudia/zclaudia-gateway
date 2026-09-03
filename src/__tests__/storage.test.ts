@@ -1,11 +1,13 @@
 /**
- * Unit tests for GatewayStorage
+ * Unit tests for GatewayStorage: v4 backend identity and epoch allocation.
  */
-import { describe, test, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, test, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { GatewayStorage } from '../storage.js';
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 describe('GatewayStorage', () => {
   let testDataDir: string;
@@ -13,142 +15,68 @@ describe('GatewayStorage', () => {
   let storage: GatewayStorage;
 
   beforeEach(() => {
-    // Create a temporary directory for test data
-    testDataDir = path.join(os.tmpdir(), `gateway-test-${Date.now()}`);
+    testDataDir = path.join(os.tmpdir(), `gateway-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
     fs.mkdirSync(testDataDir, { recursive: true });
     dbPath = path.join(testDataDir, 'test.db');
   });
 
   afterEach(() => {
-    vi.useRealTimers();
-    // Close storage and clean up
-    if (storage) {
-      storage.close();
-    }
-    // Clean up test directory
+    if (storage) storage.close();
     if (fs.existsSync(testDataDir)) {
       fs.rmSync(testDataDir, { recursive: true, force: true });
     }
   });
 
-  test('should generate 8-character hex backendId', () => {
-    storage = new GatewayStorage(dbPath);
-    const deviceId = 'test-device-1';
-    const backendId = storage.getOrCreateBackendId(deviceId);
-    
-    expect(backendId).toMatch(/^[a-f0-9]{8}$/);
+  describe('v4 backend identity', () => {
+    test('mints a UUID and keeps it stable for the same identity tuple', () => {
+      storage = new GatewayStorage(dbPath);
+      const id1 = storage.getOrCreateBackendIdV4({ namespace: 'zclaudia', instanceId: 'inst-1', environment: 'prod' });
+      expect(id1).toMatch(UUID_RE);
+      const id2 = storage.getOrCreateBackendIdV4({ namespace: 'zclaudia', instanceId: 'inst-1', environment: 'prod' });
+      expect(id2).toBe(id1);
+    });
+
+    test('any component of (namespace, instance, environment) differing yields a distinct backend', () => {
+      storage = new GatewayStorage(dbPath);
+      const base = storage.getOrCreateBackendIdV4({ namespace: 'a', instanceId: 'i', environment: 'prod' });
+      const otherNs = storage.getOrCreateBackendIdV4({ namespace: 'b', instanceId: 'i', environment: 'prod' });
+      const otherInst = storage.getOrCreateBackendIdV4({ namespace: 'a', instanceId: 'j', environment: 'prod' });
+      const otherEnv = storage.getOrCreateBackendIdV4({ namespace: 'a', instanceId: 'i', environment: 'dev' });
+      expect(new Set([base, otherNs, otherInst, otherEnv]).size).toBe(4);
+    });
+
+    test('identity survives reopening the database', () => {
+      storage = new GatewayStorage(dbPath);
+      const id1 = storage.getOrCreateBackendIdV4({ namespace: 'zclaudia', instanceId: 'persist', environment: 'prod' });
+      storage.close();
+      storage = new GatewayStorage(dbPath);
+      const id2 = storage.getOrCreateBackendIdV4({ namespace: 'zclaudia', instanceId: 'persist', environment: 'prod' });
+      expect(id2).toBe(id1);
+    });
+
+    test('name updates do not change the backendId', () => {
+      storage = new GatewayStorage(dbPath);
+      const id1 = storage.getOrCreateBackendIdV4({ namespace: 'a', instanceId: 'named', environment: 'prod', name: 'First' });
+      const id2 = storage.getOrCreateBackendIdV4({ namespace: 'a', instanceId: 'named', environment: 'prod', name: 'Renamed' });
+      expect(id2).toBe(id1);
+    });
   });
 
-  test('should return same backendId for same deviceId', () => {
-    storage = new GatewayStorage(dbPath);
-    const deviceId = 'test-device-2';
-    
-    const backendId1 = storage.getOrCreateBackendId(deviceId);
-    const backendId2 = storage.getOrCreateBackendId(deviceId);
-    
-    expect(backendId1).toBe(backendId2);
-  });
+  describe('epoch allocation', () => {
+    test('allocates monotonically increasing epochs', () => {
+      storage = new GatewayStorage(dbPath);
+      const e1 = storage.allocateEpoch();
+      const e2 = storage.allocateEpoch();
+      expect(e2).toBeGreaterThan(e1);
+      expect(storage.getMaxEpoch()).toBe(e2);
+    });
 
-  test('should generate different backendId for different deviceId', () => {
-    storage = new GatewayStorage(dbPath);
-    const deviceId1 = 'test-device-3';
-    const deviceId2 = 'test-device-4';
-    
-    const backendId1 = storage.getOrCreateBackendId(deviceId1);
-    const backendId2 = storage.getOrCreateBackendId(deviceId2);
-    
-    expect(backendId1).not.toBe(backendId2);
-  });
-
-  test('should store and retrieve device name', () => {
-    storage = new GatewayStorage(dbPath);
-    const deviceId = 'test-device-5';
-    const name = 'Test Backend Name';
-    
-    storage.getOrCreateBackendId(deviceId, name);
-    const deviceInfo = storage.getDeviceByBackendId(
-      storage.getOrCreateBackendId(deviceId)
-    );
-    
-    expect(deviceInfo).toBeDefined();
-    expect(deviceInfo?.name).toBe(name);
-    expect(deviceInfo?.deviceId).toBe(deviceId);
-  });
-
-  test('should update name if different', () => {
-    storage = new GatewayStorage(dbPath);
-    const deviceId = 'test-device-6';
-    const initialName = 'Initial Name';
-    const updatedName = 'Updated Name';
-    
-    const backendId = storage.getOrCreateBackendId(deviceId, initialName);
-    
-    // Update with new name
-    storage.getOrCreateBackendId(deviceId, updatedName);
-    
-    const deviceInfo = storage.getDeviceByBackendId(backendId);
-    expect(deviceInfo?.name).toBe(updatedName);
-  });
-
-  test('should keep existing name if name not provided', () => {
-    storage = new GatewayStorage(dbPath);
-    const deviceId = 'test-device-7';
-    const initialName = 'Initial Name';
-    
-    const backendId = storage.getOrCreateBackendId(deviceId, initialName);
-    
-    // Call without name
-    storage.getOrCreateBackendId(deviceId);
-    
-    const deviceInfo = storage.getDeviceByBackendId(backendId);
-    expect(deviceInfo?.name).toBe(initialName);
-  });
-
-  test('should return undefined for unknown backendId', () => {
-    storage = new GatewayStorage(dbPath);
-    
-    const deviceInfo = storage.getDeviceByBackendId('unknown-id');
-    
-    expect(deviceInfo).toBeUndefined();
-  });
-
-  test('should have timestamps', () => {
-    storage = new GatewayStorage(dbPath);
-    const deviceId = 'test-device-8';
-    
-    const backendId = storage.getOrCreateBackendId(deviceId, 'Test');
-    const deviceInfo = storage.getDeviceByBackendId(backendId);
-    
-    expect(deviceInfo?.createdAt).toBeDefined();
-    expect(deviceInfo?.updatedAt).toBeDefined();
-    expect(typeof deviceInfo?.createdAt).toBe('number');
-    expect(typeof deviceInfo?.updatedAt).toBe('number');
-    expect(deviceInfo!.createdAt).toBeGreaterThan(0);
-    expect(deviceInfo!.updatedAt).toBeGreaterThan(0);
-  });
-
-  test('should update updatedAt when name changes', () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date('2024-01-01T00:00:00.000Z'));
-    storage = new GatewayStorage(dbPath);
-    const deviceId = 'test-device-9';
-    
-    storage.getOrCreateBackendId(deviceId, 'Initial');
-    const backendId = storage.getOrCreateBackendId(deviceId);
-    const initialInfo = storage.getDeviceByBackendId(backendId);
-    const initialUpdatedAt = initialInfo!.updatedAt;
-    const initialCreatedAt = initialInfo!.createdAt;
-    
-    vi.setSystemTime(new Date('2024-01-01T00:00:01.000Z'));
-    
-    storage.getOrCreateBackendId(deviceId, 'Updated');
-    const updatedInfo = storage.getDeviceByBackendId(backendId);
-    
-    expect(updatedInfo!.updatedAt).toBeGreaterThan(initialUpdatedAt);
-    expect(updatedInfo!.createdAt).toBe(initialCreatedAt);
+    test('epochs survive reopening the database', () => {
+      storage = new GatewayStorage(dbPath);
+      const e1 = storage.allocateEpoch();
+      storage.close();
+      storage = new GatewayStorage(dbPath);
+      expect(storage.allocateEpoch()).toBeGreaterThan(e1);
+    });
   });
 });
-
-// NOTE: no test suite for initDatabase's default DATA_DIR (~/.zclaudia/gateway):
-// the constant is evaluated at import time and cannot be mocked without
-// refactoring storage.ts to accept an injectable path.

@@ -18,16 +18,16 @@ mobile ── HTTP /api/proxy ┘      │
 
 - **Peer**：一条已认证的 WS 连接，`client-only` 或 `client+backend`。后者同时注册为 Backend，获得租约（lease）和单调递增的 **epoch**（区分同一 Backend 的不同代次，旧代次连接会被替换下线）。
 - **Registry**：在线 Backend 的目录，连接时随 `peer_ready` 下发，变更时广播，另每 30 秒兜底推送。
-- **订阅**：客户端 `subscribe_backend` 后才能与该 Backend 互发消息；Backend 的资源快照/事件会转发给全部订阅者。
-- **HTTP 代理**：`/api/proxy/:backendId/*` 将 HTTP 请求经 WS 转发给 Backend，支持整体响应和 start/chunk/end 流式响应两种模式。
+- **Channel**：客户端向 Backend 协商专属数据连接（`channel_open` → ticket 拨号），业务消息、终端流量逐帧双向流动；HTTP 代理内部也走 Channel。
+- **Topic**：Backend 发布一份（快照带 retain），Gateway 在自己一侧向订阅者扇出；冷订阅者订阅即得 retained 状态。
+- **HTTP 代理**：`/api/proxy/:backendId/*` 经内部 Channel 流式桥接到 Backend——无 base64、双向背压、端到端取消。
 
 ## 协议兼容矩阵
 
 | Gateway 版本 | 协议版本（`peer_hello.protocolVersion`） | 协议包 | 说明 |
 | --- | --- | --- | --- |
-| 0.1.x（当前） | **3** | `@zclaudia/protocol` ^0.2.0 | 完整支持，行为不变 |
-| 0.1.x（当前） | **4** | 规范见 [docs/protocol-v4.md](docs/protocol-v4.md)；首个生产消费者为 zclaudia server（`feature/gateway-v4` 分支） | v3 全部消息 + Channel（控制面协商 + 每 Channel 一条独立 WS 数据连接，[ADR-0003](docs/adr/0003-channel-transport.md)）+ Topic（含 retain）+ 流式 HTTP 代理；与 v3 同实例共存 |
-| — | 1 / 2 | — | 已废弃，无兼容层 |
+| 0.2.x（当前） | **4**（唯一支持版本） | [`@zclaudia/gateway-protocol`](packages/protocol)；规范见 [docs/protocol-v4.md](docs/protocol-v4.md) | Channel（控制面协商 + 每 Channel 一条独立 WS 数据连接，[ADR-0003](docs/adr/0003-channel-transport.md)）+ Topic（含 retain）+ 流式 HTTP 代理 + 定向 `backend_server_message` 回退路径 |
+| — | 1 / 2 / 3 | — | 已移除，无兼容层（v3 于 zclaudia 全量迁移 v4 后拆除——新项目、无遗留对端） |
 
 `clientProtocolVersion` / `backendProtocolVersion` 是应用层版本号，Gateway 只透传不解释。
 
