@@ -47,8 +47,8 @@ describeIfLoopback('Phase 3: SDK contract', () => {
     servers.length = 0;
   });
 
-  async function startServer() {
-    const server = createGatewayServer({ gatewaySecret: GATEWAY_SECRET });
+  async function startServer(overrides: Partial<Parameters<typeof createGatewayServer>[0]> = {}) {
+    const server = createGatewayServer({ gatewaySecret: GATEWAY_SECRET, ...overrides });
     servers.push(server);
     const { httpUrl } = await listenTestServer(server);
     return { httpUrl };
@@ -200,6 +200,34 @@ describeIfLoopback('Phase 3: SDK contract', () => {
     });
     expect(missing.status).toBe(404);
     expect(await missing.text()).toBe('not found');
+  });
+
+  test('backend SDK auto-exchanges an enrollment credential before connecting', async () => {
+    const ADMIN = 'sdk-admin-token';
+    const { httpUrl } = await startServer({ adminToken: ADMIN });
+    const issued = await fetch(`${httpUrl}/api/admin/credentials`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${ADMIN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'backend', namespace: 'sdk-test', name: 'sdk-enrollment' }),
+    }).then((r) => r.json());
+
+    const backend = new GatewayBackend({
+      url: httpUrl,
+      credential: issued.data.token,
+      namespace: 'sdk-test',
+      identity: { deviceId: 'dev-exch', instanceId: 'sdk-exch-backend' },
+    });
+    cleanups.push(() => backend.close());
+    const { backendId } = await backend.connect();
+    expect(backendId).toBeDefined();
+
+    // The SDK exchanged the enrollment for a backend-access credential
+    const list = await fetch(`${httpUrl}/api/admin/credentials`, {
+      headers: { Authorization: `Bearer ${ADMIN}` },
+    }).then((r) => r.json());
+    const accessCred = list.data.find((c: any) => c.type === 'backend-access' && c.parentId === issued.data.id);
+    expect(accessCred).toBeDefined();
+    expect(accessCred.lastUsedAt).not.toBeNull();
   });
 
   test('client auto-reconnects after a dropped connection and topics resubscribe', async () => {

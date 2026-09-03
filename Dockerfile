@@ -5,8 +5,13 @@ RUN npm install -g pnpm@9.15.0
 
 WORKDIR /app/zclaudia
 
-# Copy package metadata first for better layer caching
-COPY package.json pnpm-lock.yaml ./
+# Copy workspace metadata first for better layer caching. The lockfile
+# includes the packages/* importers, so their manifests must be present
+# for a frozen install even though the server doesn't depend on them.
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY packages/protocol/package.json packages/protocol/
+COPY packages/client/package.json packages/client/
+COPY packages/backend/package.json packages/backend/
 
 RUN pnpm install --frozen-lockfile
 
@@ -14,7 +19,8 @@ RUN pnpm install --frozen-lockfile
 COPY src src
 COPY tsconfig.json ./
 
-RUN pnpm run build
+# Server only — SDK packages are not part of the runtime image
+RUN pnpm exec tsc
 
 # Stage 2: Production
 FROM node:22.14.0-slim AS runtime
@@ -23,7 +29,10 @@ RUN npm install -g pnpm@9.15.0
 
 WORKDIR /app/zclaudia
 
-COPY package.json pnpm-lock.yaml ./
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY packages/protocol/package.json packages/protocol/
+COPY packages/client/package.json packages/client/
+COPY packages/backend/package.json packages/backend/
 
 # Install production dependencies only
 RUN pnpm install --frozen-lockfile --prod

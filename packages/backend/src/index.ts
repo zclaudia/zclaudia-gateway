@@ -24,6 +24,12 @@ export interface GatewayBackendOptions {
   url: string;
   /** Credential token (zgb_*) or the legacy shared secret. */
   credential: string;
+  /**
+   * When the credential is an enrollment token (zgb_*), exchange it for a
+   * short-lived access token before connecting so the long-lived secret
+   * never travels on the control connection. Default true.
+   */
+  exchangeEnrollment?: boolean;
   namespace: string;
   identity: { deviceId: string; instanceId: string; name?: string; channel?: string };
   visible?: boolean;
@@ -131,6 +137,7 @@ export class GatewayBackend {
 
   async connect(): Promise<{ backendId: string; epoch: number }> {
     this.closed = false;
+    const credential = await this.resolveCredential();
     const socket = this.factory(`${this.wsBase}/ws`);
     socket.binaryType = 'arraybuffer';
     this.socket = socket;
@@ -155,7 +162,7 @@ export class GatewayBackend {
       namespace: this.opts.namespace,
       clientProtocolVersion: this.opts.backendProtocolVersion ?? 1,
       peerType: 'client+backend',
-      gatewaySecret: this.opts.credential,
+      gatewaySecret: credential,
       identity: this.opts.identity,
       backend: {
         visible: this.opts.visible ?? true,
@@ -186,7 +193,25 @@ export class GatewayBackend {
     return { backendId: this.backendId, epoch: this.epoch };
   }
 
+  /** Exchange an enrollment credential for a short-lived access token. */
+  private async resolveCredential(): Promise<string> {
+    if (this.opts.exchangeEnrollment === false || !this.opts.credential.startsWith('zgb_')) {
+      return this.opts.credential;
+    }
+    const httpBase = this.wsBase.replace(/^ws/, 'http');
+    const response = await fetch(`${httpBase}/api/backend/token`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${this.opts.credential}` },
+    });
+    if (!response.ok) {
+      throw new Error(`Enrollment exchange failed: HTTP ${response.status}`);
+    }
+    const body = await response.json() as { data: { token: string } };
+    return body.data.token;
+  }
+
   private async handleOffer(offer: ChannelOfferMessage): Promise<void> {
+    if (this.closed) return;
     const handler = (offer.kind && this.channelHandlers.get(offer.kind)) ?? this.defaultChannelHandler;
     if (!handler) {
       this.socket?.send(JSON.stringify({ type: 'channel_reject', channelId: offer.channelId, reason: 'no_handler' }));

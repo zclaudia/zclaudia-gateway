@@ -62,6 +62,8 @@ interface GatewayConfig {
    * When unset, the admin API is disabled. Must differ from gatewaySecret.
    */
   adminToken?: string;
+  /** TTL for exchanged backend access credentials. Default 24h. */
+  backendAccessTokenTtlMs?: number;
   notificationConfig?: Partial<NotificationConfig>;
   authTimeoutMs?: number;
   proxyRequestTimeoutMs?: number;
@@ -430,20 +432,52 @@ export function createGatewayServer(config: GatewayConfig): Server {
   });
 
   app.delete('/api/admin/credentials/:id', requireAdmin, (req: Request, res: Response) => {
-    const revoked = storage.revokeCredential(req.params.id);
-    if (!revoked) {
+    const revokedIds = storage.revokeCredential(req.params.id);
+    if (revokedIds.length === 0) {
       res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Credential not found or already revoked' } });
       return;
     }
-    audit('credential.revoked', { id: req.params.id });
-    // Disconnect any live peers authenticated with this credential
+    audit('credential.revoked', { ids: revokedIds.join(',') });
+    // Disconnect live peers on the credential or anything exchanged from it
+    const revokedSet = new Set(revokedIds);
     for (const peer of state.peers.values()) {
-      if (peer.credentialId === req.params.id) {
-        audit('credential.peer_disconnected', { id: req.params.id, peerSessionId: peer.peerSessionId });
+      if (peer.credentialId && revokedSet.has(peer.credentialId)) {
+        audit('credential.peer_disconnected', { id: peer.credentialId, peerSessionId: peer.peerSessionId });
         peer.ws.close(1008, 'Credential revoked');
       }
     }
-    res.json({ success: true, data: { id: req.params.id } });
+    res.json({ success: true, data: { revoked: revokedIds } });
+  });
+
+  // --- Backend enrollment -> short-lived access credential (ADR-0002) ---
+  app.post('/api/backend/token', (req: Request, res: Response) => {
+    const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
+    const authHeader = req.headers.authorization;
+    const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : '';
+    const auth = token ? resolveToken(token) : null;
+    if (!auth) {
+      if (!checkAuthFailLimit(clientIp)) {
+        res.status(429).json({ success: false, error: { code: 'RATE_LIMITED', message: 'Too many requests' } });
+        return;
+      }
+      res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Invalid credentials' } });
+      return;
+    }
+    // Only enrollment credentials may be exchanged — not device tokens, not
+    // already-exchanged access tokens, not the legacy shared secret.
+    if (auth.kind !== 'credential' || auth.credential.type !== 'backend') {
+      res.status(403).json({ success: false, error: { code: 'FORBIDDEN', message: 'Only backend enrollment credentials can be exchanged' } });
+      return;
+    }
+    const { credential, token: accessToken } = storage.createCredential({
+      type: 'backend-access',
+      namespace: auth.credential.namespace,
+      name: `access:${auth.credential.name || auth.credential.id}`,
+      parentId: auth.credential.id,
+      ttlMs: config.backendAccessTokenTtlMs,
+    });
+    audit('credential.exchanged', { parent: auth.credential.id, id: credential.id });
+    res.status(201).json({ success: true, data: { token: accessToken, expiresAt: credential.expiresAt, namespace: credential.namespace } });
   });
 
   // --- HTTP Proxy ---
@@ -1158,7 +1192,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
         sendToWs(ws, { type: 'gateway_error', code: 'UNAUTHORIZED', message: 'Namespace not permitted by credential' } satisfies GatewayErrorMessage); ws.close(); return null;
       }
       // A device credential must never be able to register (or impersonate) a backend.
-      if (message.peerType === 'client+backend' && auth.credential.type !== 'backend') {
+      if (message.peerType === 'client+backend' && auth.credential.type !== 'backend' && auth.credential.type !== 'backend-access') {
         audit('peer.backend_registration_denied', { credentialId: auth.credential.id });
         sendToWs(ws, { type: 'gateway_error', code: 'UNAUTHORIZED', message: 'This credential cannot register a backend' } satisfies GatewayErrorMessage); ws.close(); return null;
       }

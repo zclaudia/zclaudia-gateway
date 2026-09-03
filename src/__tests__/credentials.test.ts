@@ -252,6 +252,84 @@ describeIfLoopback('Phase 1: Credential System', () => {
     });
   });
 
+  describe('Enrollment exchange (backend-access tokens)', () => {
+    async function exchange(httpUrl: string, token: string) {
+      const res = await fetch(`${httpUrl}/api/backend/token`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      return { status: res.status, body: await res.json() };
+    }
+
+    test('enrollment credential exchanges for a working short-lived token', async () => {
+      const { wsUrl, httpUrl } = await startServer();
+      const enrollment = await issueCredential(httpUrl, { type: 'backend', namespace: 'hermes', name: 'host-1' });
+
+      const exchanged = await exchange(httpUrl, enrollment.body.data.token);
+      expect(exchanged.status).toBe(201);
+      expect(exchanged.body.data.token).toMatch(/^zga_/);
+      expect(exchanged.body.data.namespace).toBe('hermes');
+      expect(exchanged.body.data.expiresAt).toBeGreaterThan(Date.now());
+
+      // The access token can register a backend in its namespace
+      const ws = await connect(wsUrl);
+      sendHello(ws, exchanged.body.data.token, 'hermes', 'client+backend', 'exch-backend');
+      const ready = await waitForMessage(ws, 'peer_ready');
+      expect(ready.backend.backendId).toBeDefined();
+    });
+
+    test('device tokens, access tokens, and the legacy secret cannot exchange', async () => {
+      const { httpUrl } = await startServer();
+      const device = await issueCredential(httpUrl, { type: 'device', namespace: 'hermes' });
+      expect((await exchange(httpUrl, device.body.data.token)).status).toBe(403);
+
+      const enrollment = await issueCredential(httpUrl, { type: 'backend', namespace: 'hermes' });
+      const access = await exchange(httpUrl, enrollment.body.data.token);
+      expect((await exchange(httpUrl, access.body.data.token)).status).toBe(403);
+
+      expect((await exchange(httpUrl, GATEWAY_SECRET)).status).toBe(403);
+      expect((await exchange(httpUrl, 'zgb_bogus')).status).toBe(401);
+    });
+
+    test('revoking the enrollment cascades: access tokens die and peers disconnect', async () => {
+      const { wsUrl, httpUrl } = await startServer();
+      const enrollment = await issueCredential(httpUrl, { type: 'backend', namespace: 'hermes', name: 'host-2' });
+      const access = await exchange(httpUrl, enrollment.body.data.token);
+
+      const ws = await connect(wsUrl);
+      sendHello(ws, access.body.data.token, 'hermes', 'client+backend', 'cascade-backend');
+      await waitForMessage(ws, 'peer_ready');
+
+      const closed = new Promise<number>((resolve) => ws.on('close', (code) => resolve(code)));
+      const revoke = await fetch(`${httpUrl}/api/admin/credentials/${enrollment.body.data.id}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${ADMIN_TOKEN}` },
+      });
+      const revokeBody = await revoke.json();
+      // Both the enrollment and its access token are reported revoked
+      expect(revokeBody.data.revoked).toHaveLength(2);
+      expect(await closed).toBe(1008);
+
+      // The access token is dead for reconnects too
+      const ws2 = await connect(wsUrl);
+      sendHello(ws2, access.body.data.token, 'hermes', 'client+backend', 'cascade-backend');
+      const err = await waitForMessage(ws2, 'gateway_error');
+      expect(err.code).toBe('UNAUTHORIZED');
+    });
+
+    test('expired access tokens are rejected', async () => {
+      const { wsUrl, httpUrl } = await startServer({ backendAccessTokenTtlMs: 50 });
+      const enrollment = await issueCredential(httpUrl, { type: 'backend', namespace: 'hermes' });
+      const access = await exchange(httpUrl, enrollment.body.data.token);
+
+      await new Promise((r) => setTimeout(r, 120));
+      const ws = await connect(wsUrl);
+      sendHello(ws, access.body.data.token, 'hermes', 'client+backend', 'expired-backend');
+      const err = await waitForMessage(ws, 'gateway_error');
+      expect(err.code).toBe('UNAUTHORIZED');
+    });
+  });
+
   describe('HTTP proxy with credentials', () => {
     async function registerEchoBackend(wsUrl: string, namespace: string, instanceId: string) {
       const ws = await connect(wsUrl);

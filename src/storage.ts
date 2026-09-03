@@ -90,16 +90,22 @@ export function backendIdentityKey(namespace: string, instanceId: string, enviro
 /**
  * 'device' — client-only credential for user devices; cannot register a backend.
  * 'backend' — enrollment credential for a machine running an application backend.
+ * 'backend-access' — short-lived credential exchanged from an enrollment
+ *   credential (POST /api/backend/token); dies with its parent.
  */
-export type CredentialType = 'device' | 'backend';
+export type CredentialType = 'device' | 'backend' | 'backend-access';
 
 export const CREDENTIAL_TOKEN_PREFIXES: Record<CredentialType, string> = {
   device: 'zgd_',
   backend: 'zgb_',
+  'backend-access': 'zga_',
 };
 
 /** Default TTL for device credentials (matches comfy gateway precedent). */
 export const DEFAULT_DEVICE_TTL_MS = 180 * 24 * 60 * 60 * 1000;
+
+/** Default TTL for exchanged backend access credentials. */
+export const DEFAULT_BACKEND_ACCESS_TTL_MS = 24 * 60 * 60 * 1000;
 
 export interface CredentialRecord {
   id: string;
@@ -108,6 +114,8 @@ export interface CredentialRecord {
   tokenHash: string;
   namespace: string;
   name: string;
+  /** Issuing credential id for exchanged tokens (backend-access). */
+  parentId: string | null;
   createdAt: number;
   expiresAt: number | null;
   revokedAt: number | null;
@@ -188,6 +196,13 @@ export function initDatabase(dbPath: string = getDbPath()): Database.Database {
     CREATE INDEX IF NOT EXISTS idx_credentials_token_hash ON credentials(token_hash);
 
   `);
+
+  // Additive migration for pre-existing databases.
+  try {
+    db.exec('ALTER TABLE credentials ADD COLUMN parent_id TEXT');
+  } catch {
+    // Column already exists.
+  }
 
   return db;
 }
@@ -516,13 +531,16 @@ export class GatewayStorage {
     type: CredentialType;
     namespace: string;
     name?: string;
-    /** null = never expires. Undefined = type default (device 180d, backend none). */
+    /** null = never expires. Undefined = type default (device 180d, backend-access 24h, backend none). */
     ttlMs?: number | null;
+    /** Issuing credential id (backend-access only). */
+    parentId?: string;
   }): { credential: CredentialInfo; token: string } {
     const token = CREDENTIAL_TOKEN_PREFIXES[input.type] + crypto.randomBytes(32).toString('base64url');
     const now = Date.now();
     const ttlMs = input.ttlMs === undefined
-      ? (input.type === 'device' ? DEFAULT_DEVICE_TTL_MS : null)
+      ? (input.type === 'device' ? DEFAULT_DEVICE_TTL_MS
+        : input.type === 'backend-access' ? DEFAULT_BACKEND_ACCESS_TTL_MS : null)
       : input.ttlMs;
     const record: CredentialRecord = {
       id: crypto.randomUUID(),
@@ -530,6 +548,7 @@ export class GatewayStorage {
       tokenHash: hashCredentialToken(token),
       namespace: input.namespace,
       name: input.name ?? '',
+      parentId: input.parentId ?? null,
       createdAt: now,
       expiresAt: ttlMs === null ? null : now + ttlMs,
       revokedAt: null,
@@ -540,10 +559,10 @@ export class GatewayStorage {
       this.memoryState.credentials.set(record.id, record);
     } else {
       this.sqlite.prepare(`
-        INSERT INTO credentials (id, type, token_hash, namespace, name, created_at, expires_at, revoked_at, last_used_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO credentials (id, type, token_hash, namespace, name, parent_id, created_at, expires_at, revoked_at, last_used_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(record.id, record.type, record.tokenHash, record.namespace, record.name,
-        record.createdAt, record.expiresAt, record.revokedAt, record.lastUsedAt);
+        record.parentId, record.createdAt, record.expiresAt, record.revokedAt, record.lastUsedAt);
     }
     const { tokenHash: _tokenHash, ...credential } = record;
     return { credential, token };
@@ -557,22 +576,17 @@ export class GatewayStorage {
     const hash = hashCredentialToken(token);
     const now = Date.now();
 
-    let record: CredentialRecord | undefined;
-    if (this.memoryState) {
-      record = Array.from(this.memoryState.credentials.values()).find((c) => c.tokenHash === hash);
-    } else {
-      const row = this.sqlite.prepare(`
-        SELECT id, type, token_hash as tokenHash, namespace, name,
-               created_at as createdAt, expires_at as expiresAt,
-               revoked_at as revokedAt, last_used_at as lastUsedAt
-        FROM credentials WHERE token_hash = ?
-      `).get(hash) as CredentialRecord | undefined;
-      record = row;
-    }
-
+    const record = this.getCredentialByHash(hash);
     if (!record) return null;
     if (record.revokedAt !== null) return null;
     if (record.expiresAt !== null && now > record.expiresAt) return null;
+    // Exchanged tokens die with their issuing credential.
+    if (record.parentId !== null) {
+      const parent = this.getCredentialById(record.parentId);
+      if (!parent || parent.revokedAt !== null || (parent.expiresAt !== null && now > parent.expiresAt)) {
+        return null;
+      }
+    }
 
     if (this.memoryState) {
       record.lastUsedAt = now;
@@ -581,6 +595,30 @@ export class GatewayStorage {
     }
     const { tokenHash: _tokenHash, ...info } = record;
     return info;
+  }
+
+  private getCredentialByHash(hash: string): CredentialRecord | undefined {
+    if (this.memoryState) {
+      return Array.from(this.memoryState.credentials.values()).find((c) => c.tokenHash === hash);
+    }
+    return this.sqlite.prepare(`
+      SELECT id, type, token_hash as tokenHash, namespace, name, parent_id as parentId,
+             created_at as createdAt, expires_at as expiresAt,
+             revoked_at as revokedAt, last_used_at as lastUsedAt
+      FROM credentials WHERE token_hash = ?
+    `).get(hash) as CredentialRecord | undefined;
+  }
+
+  private getCredentialById(id: string): CredentialRecord | undefined {
+    if (this.memoryState) {
+      return this.memoryState.credentials.get(id);
+    }
+    return this.sqlite.prepare(`
+      SELECT id, type, token_hash as tokenHash, namespace, name, parent_id as parentId,
+             created_at as createdAt, expires_at as expiresAt,
+             revoked_at as revokedAt, last_used_at as lastUsedAt
+      FROM credentials WHERE id = ?
+    `).get(id) as CredentialRecord | undefined;
   }
 
   /** List all credentials (revoked and expired included), newest first. */
@@ -594,26 +632,43 @@ export class GatewayStorage {
         });
     }
     return this.sqlite.prepare(`
-      SELECT id, type, namespace, name,
+      SELECT id, type, namespace, name, parent_id as parentId,
              created_at as createdAt, expires_at as expiresAt,
              revoked_at as revokedAt, last_used_at as lastUsedAt
       FROM credentials ORDER BY created_at DESC
     `).all() as CredentialInfo[];
   }
 
-  /** Revoke a credential by id. Returns false if unknown or already revoked. */
-  revokeCredential(id: string): boolean {
+  /**
+   * Revoke a credential by id, cascading to credentials exchanged from it.
+   * Returns the ids actually revoked (empty = unknown or already revoked).
+   */
+  revokeCredential(id: string): string[] {
     const now = Date.now();
     if (this.memoryState) {
       const record = this.memoryState.credentials.get(id);
-      if (!record || record.revokedAt !== null) return false;
+      if (!record || record.revokedAt !== null) return [];
       record.revokedAt = now;
-      return true;
+      const revoked = [id];
+      for (const child of this.memoryState.credentials.values()) {
+        if (child.parentId === id && child.revokedAt === null) {
+          child.revokedAt = now;
+          revoked.push(child.id);
+        }
+      }
+      return revoked;
     }
-    const result = this.sqlite.prepare(
+    const self = this.sqlite.prepare(
       'UPDATE credentials SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL',
     ).run(now, id);
-    return result.changes > 0;
+    if (self.changes === 0) return [];
+    const children = this.sqlite.prepare(
+      'SELECT id FROM credentials WHERE parent_id = ? AND revoked_at IS NULL',
+    ).all(id) as Array<{ id: string }>;
+    this.sqlite.prepare(
+      'UPDATE credentials SET revoked_at = ? WHERE parent_id = ? AND revoked_at IS NULL',
+    ).run(now, id);
+    return [id, ...children.map((c) => c.id)];
   }
 
   close(): void {
