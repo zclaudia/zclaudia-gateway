@@ -1493,14 +1493,17 @@ export function createGatewayServer(config: GatewayConfig): Server {
     const backendId = peer.backendId!;
     if (msg.backendId !== backendId) return;
 
-    // If targetPeerSessionId is set, route to that specific client — but only
-    // if the target is actually subscribed to this backend. Without this
-    // check a backend could message arbitrary peers (including peers in
-    // other namespaces) by guessing session IDs.
+    // If targetPeerSessionId is set, route to that specific client. Guard:
+    // the target must be a v3 subscriber OR a same-namespace peer (v4
+    // clients hold channels/topics instead of subscriptions). Namespace
+    // equality preserves the anti-probing property — a backend still cannot
+    // message peers of other applications by guessing session IDs.
     if (msg.targetPeerSessionId) {
-      if (!state.getSubscribers(backendId).has(msg.targetPeerSessionId)) return;
       const targetPeer = state.peers.get(msg.targetPeerSessionId);
-      if (targetPeer) sendToWs(targetPeer.ws, msg);
+      if (!targetPeer) return;
+      const isSubscriber = state.getSubscribers(backendId).has(msg.targetPeerSessionId);
+      if (!isSubscriber && targetPeer.namespace !== peer.namespace) return;
+      sendToWs(targetPeer.ws, msg);
       return;
     }
 

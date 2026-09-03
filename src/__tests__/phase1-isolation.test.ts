@@ -212,33 +212,34 @@ describeIfLoopback('Phase 1: Security & Isolation', () => {
   });
 
   describe('Targeted message subscription checks', () => {
-    test('targeted backend_server_message is only delivered to subscribed peers', async () => {
+    test('targeted backend_server_message reaches same-namespace peers, never other namespaces', async () => {
       const { wsUrl } = await startServer();
       const wsBackend = await connect(wsUrl);
       const b = await registerBackend(wsBackend, 'app-a', 'inst-target');
       const wsClient = await connect(wsUrl);
       const client = await registerClient(wsClient, 'app-a', 'client-target');
+      const wsOther = await connect(wsUrl);
+      const other = await registerClient(wsOther, 'app-b', 'client-other-ns');
 
-      const received: any[] = [];
-      wsClient.on('message', (data) => received.push(JSON.parse(data.toString())));
+      const receivedOther: any[] = [];
+      wsOther.on('message', (data) => receivedOther.push(JSON.parse(data.toString())));
 
-      // Not subscribed yet: targeted message must be dropped
+      // Same namespace, not v3-subscribed (v4 clients hold channels/topics
+      // instead): targeted message is delivered
       wsBackend.send(JSON.stringify({
         type: 'backend_server_message', backendId: b.backendId,
         targetPeerSessionId: client.peerSessionId, message: { seq: 1 },
       }));
-      await delay(150);
-      expect(received.filter((m) => m.type === 'backend_server_message')).toEqual([]);
+      const delivered = await waitForMessage(wsClient, 'backend_server_message');
+      expect(delivered.message.seq).toBe(1);
 
-      // After subscribing, the same message goes through
-      wsClient.send(JSON.stringify({ type: 'subscribe_backend', backendId: b.backendId }));
-      await waitForMessage(wsClient, 'backend_subscribed');
+      // Cross-namespace: dropped even with a guessed session id
       wsBackend.send(JSON.stringify({
         type: 'backend_server_message', backendId: b.backendId,
-        targetPeerSessionId: client.peerSessionId, message: { seq: 2 },
+        targetPeerSessionId: other.peerSessionId, message: { seq: 2 },
       }));
-      const delivered = await waitForMessage(wsClient, 'backend_server_message');
-      expect(delivered.message.seq).toBe(2);
+      await delay(150);
+      expect(receivedOther.filter((m) => m.type === 'backend_server_message')).toEqual([]);
     });
 
     test('request_backend_resource_snapshot requires subscription', async () => {
