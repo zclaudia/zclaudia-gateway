@@ -27,6 +27,14 @@ export default defineConfig(async () => {
   }
 
   return {
+    resolve: {
+      // Contract tests consume SDK sources directly — no build ordering.
+      alias: {
+        '@zclaudia/gateway-protocol': new URL('./packages/protocol/src/index.ts', import.meta.url).pathname,
+        '@zclaudia/gateway-client': new URL('./packages/client/src/index.ts', import.meta.url).pathname,
+        '@zclaudia/gateway-backend': new URL('./packages/backend/src/index.ts', import.meta.url).pathname,
+      },
+    },
     test: {
       globals: true,
       environment: 'node',

@@ -1,0 +1,230 @@
+/**
+ * Phase 3: SDK contract tests — @zclaudia/gateway-client and
+ * @zclaudia/gateway-backend talking to each other through a real gateway
+ * instance. Uses Node's native WHATWG WebSocket, i.e. the same API surface
+ * a WebView client has (no custom headers).
+ */
+import { describe, test, expect, afterEach } from 'vitest';
+import type { Server } from 'http';
+import net from 'node:net';
+import { createGatewayServer } from '../server.js';
+import { listenTestServer, closeTestServer } from './test-server.js';
+import { GatewayClient } from '@zclaudia/gateway-client';
+import { GatewayBackend } from '@zclaudia/gateway-backend';
+
+const GATEWAY_SECRET = 'test-secret-sdk';
+
+async function canBindLoopback(): Promise<boolean> {
+  return await new Promise((resolve) => {
+    const probe = net.createServer();
+    probe.once('error', () => resolve(false));
+    probe.listen(0, '127.0.0.1', () => {
+      probe.close(() => resolve(true));
+    });
+  });
+}
+
+const describeIfLoopback = (await canBindLoopback()) ? describe : describe.skip;
+
+const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+async function until(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
+  const start = Date.now();
+  while (!predicate()) {
+    if (Date.now() - start > timeoutMs) throw new Error('Condition not met in time');
+    await delay(25);
+  }
+}
+
+describeIfLoopback('Phase 3: SDK contract', () => {
+  const servers: Server[] = [];
+  const cleanups: Array<() => void> = [];
+
+  afterEach(async () => {
+    for (const cleanup of cleanups) cleanup();
+    cleanups.length = 0;
+    await Promise.all(servers.map((s) => closeTestServer(s)));
+    servers.length = 0;
+  });
+
+  async function startServer() {
+    const server = createGatewayServer({ gatewaySecret: GATEWAY_SECRET });
+    servers.push(server);
+    const { httpUrl } = await listenTestServer(server);
+    return { httpUrl };
+  }
+
+  function makeBackend(url: string, instanceId: string) {
+    const backend = new GatewayBackend({
+      url,
+      credential: GATEWAY_SECRET,
+      namespace: 'sdk-test',
+      identity: { deviceId: `dev-${instanceId}`, instanceId, name: instanceId },
+      heartbeatIntervalMs: 2000,
+    });
+    cleanups.push(() => backend.close());
+    return backend;
+  }
+
+  function makeClient(url: string, instanceId: string, reconnect = true) {
+    const client = new GatewayClient({
+      url,
+      credential: GATEWAY_SECRET,
+      namespace: 'sdk-test',
+      identity: { deviceId: `dev-${instanceId}`, instanceId },
+      reconnect,
+      reconnectMinMs: 100,
+    });
+    cleanups.push(() => client.close());
+    return client;
+  }
+
+  test('registry is visible through the client SDK', async () => {
+    const { httpUrl } = await startServer();
+    const backend = makeBackend(httpUrl, 'reg-backend');
+    const { backendId } = await backend.connect();
+
+    const client = makeClient(httpUrl, 'reg-client');
+    await client.connect();
+    expect(client.registry.map((b) => b.backendId)).toContain(backendId);
+    expect(client.registry.find((b) => b.backendId === backendId)?.name).toBe('reg-backend');
+  });
+
+  test('channel: SDK client to SDK backend, echo both text and binary', async () => {
+    const { httpUrl } = await startServer();
+    const backend = makeBackend(httpUrl, 'ch-backend');
+    const { backendId } = await backend.connect();
+
+    backend.onChannel('echo', (channel) => {
+      channel.onMessage((message) => {
+        if (message.binary) channel.send(message.data as Uint8Array);
+        else channel.send(`echo:${message.data}`);
+      });
+    });
+
+    const client = makeClient(httpUrl, 'ch-client');
+    await client.connect();
+    const channel = await client.openChannel(backendId, 'echo');
+
+    const received: Array<{ data: string | Uint8Array; binary: boolean }> = [];
+    channel.onMessage((m) => received.push(m));
+
+    channel.send('hello');
+    await until(() => received.length >= 1);
+    expect(received[0].binary).toBe(false);
+    expect(received[0].data).toBe('echo:hello');
+
+    const bytes = new Uint8Array([0, 1, 254, 255, 128]);
+    channel.send(bytes);
+    await until(() => received.length >= 2);
+    expect(received[1].binary).toBe(true);
+    expect(Array.from(received[1].data as Uint8Array)).toEqual(Array.from(bytes));
+
+    // Close from the client side; both wrappers observe the close
+    let backendSawClose = false;
+    // (Re-open a channel to observe backend-side close cleanly)
+    const channel2 = await client.openChannel(backendId, 'echo');
+    backend.onChannel('echo', (ch) => ch.onClose(() => { backendSawClose = true; }));
+    const channel3 = await client.openChannel(backendId, 'echo');
+    channel3.close();
+    await until(() => backendSawClose);
+    channel.close();
+    channel2.close();
+  });
+
+  test('unhandled channel kinds are rejected by the backend SDK', async () => {
+    const { httpUrl } = await startServer();
+    const backend = makeBackend(httpUrl, 'rej-backend');
+    const { backendId } = await backend.connect();
+    // No handler registered at all
+
+    const client = makeClient(httpUrl, 'rej-client');
+    await client.connect();
+    // channel_ready arrives before the backend rejects, so the open may
+    // succeed and then close immediately — accept either outcome.
+    try {
+      const channel = await client.openChannel(backendId, 'unknown-kind');
+      await until(() => !channel.isOpen);
+    } catch {
+      // rejected before ready — also fine
+    }
+  });
+
+  test('topics: backend publishes once, subscribers receive; unsubscribe works', async () => {
+    const { httpUrl } = await startServer();
+    const backend = makeBackend(httpUrl, 'topic-backend');
+    const { backendId } = await backend.connect();
+
+    const client = makeClient(httpUrl, 'topic-client');
+    await client.connect();
+
+    const seen: unknown[] = [];
+    const unsubscribe = await client.subscribeTopic(backendId, 'resources', (payload) => seen.push(payload));
+    backend.publishTopic('resources', { rev: 1 });
+    await until(() => seen.length === 1);
+    expect(seen[0]).toEqual({ rev: 1 });
+
+    await unsubscribe();
+    backend.publishTopic('resources', { rev: 2 });
+    await delay(200);
+    expect(seen).toHaveLength(1);
+  });
+
+  test('serveHttp: fetch through the gateway reaches the backend SDK handler', async () => {
+    const { httpUrl } = await startServer();
+    const backend = makeBackend(httpUrl, 'http-backend');
+    const { backendId } = await backend.connect();
+
+    backend.serveHttp((request) => {
+      if (request.method === 'POST' && request.path === '/sum') {
+        const numbers = JSON.parse(new TextDecoder().decode(request.body)) as number[];
+        return {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sum: numbers.reduce((a, b) => a + b, 0) }),
+        };
+      }
+      return { status: 404, body: 'not found' };
+    });
+
+    const ok = await fetch(`${httpUrl}/api/proxy/${backendId}/sum`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${GATEWAY_SECRET}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify([1, 2, 3, 4]),
+    });
+    expect(ok.status).toBe(200);
+    expect(await ok.json()).toEqual({ sum: 10 });
+
+    const missing = await fetch(`${httpUrl}/api/proxy/${backendId}/nope`, {
+      headers: { Authorization: `Bearer ${GATEWAY_SECRET}` },
+    });
+    expect(missing.status).toBe(404);
+    expect(await missing.text()).toBe('not found');
+  });
+
+  test('client auto-reconnects after a dropped connection and topics resubscribe', async () => {
+    const { httpUrl } = await startServer();
+    const backend = makeBackend(httpUrl, 'rc-backend');
+    const { backendId } = await backend.connect();
+
+    const client = makeClient(httpUrl, 'rc-client');
+    await client.connect();
+
+    const seen: unknown[] = [];
+    await client.subscribeTopic(backendId, 'beat', (payload) => seen.push(payload));
+
+    const states: string[] = [];
+    client.onState((s) => states.push(s));
+
+    // Simulate a network drop by terminating the client's own socket.
+    const raw = (client as unknown as { socket: { close: (code?: number) => void } }).socket;
+    raw.close(4000);
+
+    await until(() => states.includes('connected'), 10_000);
+    // Topic subscription must survive the reconnect
+    await until(() => {
+      backend.publishTopic('beat', 'after-reconnect');
+      return seen.includes('after-reconnect');
+    }, 10_000);
+  });
+});

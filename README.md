@@ -120,6 +120,18 @@ docker compose up -d        # 容器部署（读取 .env）
 - 认证、连接、订阅、代理与凭证生命周期输出结构化 `[audit]` 日志行。
 - 资源快照/事件默认对全部订阅者广播；消息携带 `targetPeerSessionId`（可选的加法字段）时仅递送给该订阅者，zclaudia backend 尚未采用。
 
+## SDK（Protocol v4）
+
+本仓库为 pnpm workspace（[ADR-0004](docs/adr/0004-sdk-packaging.md)），`packages/` 下为 v4 SDK：
+
+| 包 | 内容 |
+| --- | --- |
+| `@zclaudia/gateway-protocol` | v4 wire 类型与常量，零依赖 |
+| `@zclaudia/gateway-client` | 控制连接、Channel、Topic、指数退避重连（快速重开模型）；面向 WHATWG WebSocket，可注入 socketFactory |
+| `@zclaudia/gateway-backend` | Backend 注册与心跳、channel offer 处理（拨号即接受）、Topic 发布、`serveHttp` HTTP channel 服务 |
+
+契约测试位于 [src/__tests__/phase3-sdk-contract.test.ts](src/__tests__/phase3-sdk-contract.test.ts)：两个 SDK 经真实 Gateway 实例互通（channel 双向收发、Topic、HTTP、断线重连恢复订阅），使用 Node 原生 WHATWG WebSocket——与 WebView 客户端相同的 API 面。
+
 ## 设计决策
 
 重要决策以 ADR 记录于 [docs/adr/](docs/adr/)。ROADMAP 第 8 节列出了实施前待定的决策清单。

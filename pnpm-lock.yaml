@@ -67,6 +67,23 @@ importers:
         specifier: ^4.0.18
         version: 4.1.7(@types/node@20.19.41)(@vitest/coverage-v8@4.1.7)(vite@8.0.14(@types/node@20.19.41)(esbuild@0.28.0)(tsx@4.22.3))
 
+  packages/backend:
+    dependencies:
+      '@zclaudia/gateway-client':
+        specifier: workspace:*
+        version: link:../client
+      '@zclaudia/gateway-protocol':
+        specifier: workspace:*
+        version: link:../protocol
+
+  packages/client:
+    dependencies:
+      '@zclaudia/gateway-protocol':
+        specifier: workspace:*
+        version: link:../protocol
+
+  packages/protocol: {}
+
 packages:
 
   '@babel/helper-string-parser@7.29.7':

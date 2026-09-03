@@ -248,7 +248,15 @@ export function createGatewayServer(config: GatewayConfig): Server {
     if (backendPeer?.protocolVersion === 4) { next(); return; }
     proxyRawParser(req, res, next);
   });
-  app.use(express.json({ limit: '15mb' }));
+  // JSON parser for gateway-own endpoints. Must NOT touch /api/proxy: the
+  // v4 streaming bridge needs the raw request stream (the legacy v3 path
+  // is protected by the raw parser above, but a v4 JSON request would be
+  // consumed here and the bridge would never see body or end).
+  const jsonParser = express.json({ limit: '15mb' });
+  app.use((req: Request, res: Response, next: (err?: unknown) => void) => {
+    if (req.path.startsWith('/api/proxy/')) { next(); return; }
+    jsonParser(req, res, next);
+  });
 
   // ========================================================================
   // HTTP Endpoints
