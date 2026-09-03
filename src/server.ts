@@ -1266,7 +1266,10 @@ export function createGatewayServer(config: GatewayConfig): Server {
         handleBackendOwnerReplaced(backendId, previousLease.epoch, epoch, previousLease.peerSessionId);
       }
       state.addLease({ backendId, epoch, peerSessionId, leaseTtlMs: state.config.defaultLeaseTtlMs, lastHeartbeatAt: Date.now(), leaseTimer: null });
-      const presence: BackendPresence = { namespace: message.namespace, backendId, instanceId: identity.instanceId, deviceId: identity.deviceId, name: identity.name || '', channel, visible: message.backend.visible, capabilities: message.backend.capabilities, backendProtocolVersion: message.backend.backendProtocolVersion, minClientProtocolVersion: message.backend.minClientProtocolVersion, epoch, connectedAt: Date.now(), lastSeenAt: Date.now() };
+      // gatewayProtocolVersion is a v4 presence addition: clients use it to
+      // pick per-backend transport paths (topics/channels vs v3 messages).
+      // v3 clients tolerate the extra field (leniency contract).
+      const presence: BackendPresence & { gatewayProtocolVersion: number } = { namespace: message.namespace, backendId, instanceId: identity.instanceId, deviceId: identity.deviceId, name: identity.name || '', channel, visible: message.backend.visible, capabilities: message.backend.capabilities, backendProtocolVersion: message.backend.backendProtocolVersion, minClientProtocolVersion: message.backend.minClientProtocolVersion, epoch, connectedAt: Date.now(), lastSeenAt: Date.now(), gatewayProtocolVersion: peer.protocolVersion };
       state.registryUpsert(presence);
       state.streamDemand.set(backendId, { subscriberCount: 0, active: false });
       backendInfo = { backendId, epoch, leaseTtlMs: state.config.defaultLeaseTtlMs };

@@ -331,6 +331,13 @@ describeIfLoopback('Phase 2: v4 Channels', () => {
     const v3 = await connect(wsUrl);
     const r3 = await hello(v3, { namespace: 'app-a', peerType: 'client+backend', instanceId: 'legacy-inst', protocolVersion: 3 });
     expect(r3.backend.backendId).toMatch(/^[0-9a-f]{8}$/);
+
+    // Presence advertises the gateway protocol version for path selection
+    const viewer = await connect(wsUrl);
+    const vready = await hello(viewer, { namespace: 'app-a', peerType: 'client-only', instanceId: 'presence-viewer' });
+    const items = vready.registrySync.items as Array<{ backendId: string; gatewayProtocolVersion?: number }>;
+    expect(items.find((i) => i.backendId === r1again.backend.backendId)?.gatewayProtocolVersion).toBe(4);
+    expect(items.find((i) => i.backendId === r3.backend.backendId)?.gatewayProtocolVersion).toBe(3);
   });
 
   test('per-channel byte rate limit throttles the relay', async () => {

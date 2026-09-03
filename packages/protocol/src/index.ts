@@ -51,6 +51,8 @@ export interface BackendPresenceV4 {
   epoch: number;
   connectedAt: number;
   lastSeenAt: number;
+  /** Gateway sync protocol version the backend registered with (3 or 4). */
+  gatewayProtocolVersion?: number;
 }
 
 export interface PeerReadyV4 {
