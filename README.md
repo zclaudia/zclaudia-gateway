@@ -26,7 +26,7 @@ mobile ── HTTP /api/proxy ┘      │
 | Gateway 版本 | 协议版本（`peer_hello.protocolVersion`） | 协议包 | 说明 |
 | --- | --- | --- | --- |
 | 0.1.x（当前） | **3** | `@zclaudia/protocol` ^0.2.0 | 完整支持，行为不变 |
-| 0.1.x（当前） | **4**（Draft） | 规范见 [docs/protocol-v4.md](docs/protocol-v4.md) | v3 全部消息 + Channel（控制面协商 + 每 Channel 一条独立 WS 数据连接，[ADR-0003](docs/adr/0003-channel-transport.md)）；与 v3 同实例共存 |
+| 0.1.x（当前） | **4** | 规范见 [docs/protocol-v4.md](docs/protocol-v4.md)；首个生产消费者为 zclaudia server（`feature/gateway-v4` 分支） | v3 全部消息 + Channel（控制面协商 + 每 Channel 一条独立 WS 数据连接，[ADR-0003](docs/adr/0003-channel-transport.md)）+ Topic（含 retain）+ 流式 HTTP 代理；与 v3 同实例共存 |
 | — | 1 / 2 | — | 已废弃，无兼容层 |
 
 `clientProtocolVersion` / `backendProtocolVersion` 是应用层版本号，Gateway 只透传不解释。
@@ -114,7 +114,7 @@ docker compose up -d        # 容器部署（读取 .env）
 
 ### 传输语义
 
-- 代理的二进制内容以 base64 编码经 JSON 消息传输（约 33% 膨胀）；整体响应模式会在内存中完整缓存响应体。真正的流式与二进制帧是 Protocol v4（ROADMAP Phase 2）的目标。
+- **仅限 v3 Backend**：代理的二进制内容以 base64 编码经 JSON 消息传输（约 33% 膨胀）、整体响应模式在内存中完整缓存响应体。v4 Backend 的 `/api/proxy` 自动改走 Channel 流式桥接（无 base64、双向背压、端到端取消），客户端零改动。
 - 代理 Header 为默认拒绝的 allowlist（见 [src/validation.ts](src/validation.ts)）：请求侧仅转发 content-type/accept/range/条件请求头等；响应侧仅转发内容类头（`Set-Cookie` 与服务器指纹头永不透传）。
 - 所有入站协议消息经 runtime 校验，只校验 Gateway 路由所需字段——协议 .d.ts 与真实 v3 流量存在偏差（如快照实际携带 `sessions`/`projects`），完整 schema 收紧推迟到 v4。
 - 认证、连接、订阅、代理与凭证生命周期输出结构化 `[audit]` 日志行。
@@ -130,7 +130,7 @@ docker compose up -d        # 容器部署（读取 .env）
 | `@zclaudia/gateway-client` | 控制连接、Channel、Topic、指数退避重连（快速重开模型）；面向 WHATWG WebSocket，可注入 socketFactory |
 | `@zclaudia/gateway-backend` | Backend 注册与心跳、channel offer 处理（拨号即接受）、Topic 发布、`serveHttp` HTTP channel 服务 |
 
-契约测试位于 [src/__tests__/phase3-sdk-contract.test.ts](src/__tests__/phase3-sdk-contract.test.ts)：两个 SDK 经真实 Gateway 实例互通（channel 双向收发、Topic、HTTP、断线重连恢复订阅），使用 Node 原生 WHATWG WebSocket——与 WebView 客户端相同的 API 面。
+契约测试位于 [`src/__tests__/phase3-sdk-contract.test.ts`](src/__tests__/phase3-sdk-contract.test.ts)：两个 SDK 经真实 Gateway 实例互通（channel 双向收发、Topic、HTTP、断线重连恢复订阅），使用 Node 原生 WHATWG WebSocket——与 WebView 客户端相同的 API 面。
 
 ## 设计决策
 
