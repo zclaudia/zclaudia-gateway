@@ -42,7 +42,7 @@ mobile ── HTTP /api/proxy ┘      │
 - `zgd_*` 设备凭证：仅可作为 client-only 连接与访问本 namespace 的 HTTP 代理；默认 180 天过期。
 - `zgb_*` Backend 凭证：可注册 Backend；默认不过期。
 - 撤销立即生效：在线连接被断开（close 1008），后续认证被拒。
-- 管理端点（需 `GATEWAY_ADMIN_TOKEN`）：`POST/GET /api/admin/credentials`、`DELETE /api/admin/credentials/:id`。
+- 管理端点（需 `GATEWAY_ADMIN_TOKEN`）：`POST/GET /api/admin/credentials`、`DELETE /api/admin/credentials/:id`；命令行封装见 [scripts/gateway-admin.sh](scripts/gateway-admin.sh)（`issue-backend` / `issue-device` / `list` / `revoke`，读 `GATEWAY_URL` + `GATEWAY_ADMIN_TOKEN` 环境变量）。
 
 ### 共享 secret（legacy 兼容）
 
