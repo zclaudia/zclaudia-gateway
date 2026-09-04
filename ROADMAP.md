@@ -248,7 +248,7 @@ response.end
 > 每个切片均有跨仓 e2e 验证。剩余：desktop/mobile 消费 Topic 与消息 channel（含
 > terminal 路由修复的消费端半边）、凭证从 legacy secret 切 `zgb_`/`zgd_`、
 > `gateway-testing` 抽包（等 Hermes/Comfy Adapter 需要时）、版本兼容矩阵与 v3 弃用条件。
-> SDK 与 zclaudia 以 `link:` 兄弟目录依赖，npm 发布待适配稳定后进行。
+> SDK 已发布至 npm（`@zclaudia/gateway-protocol` / `-client` / `-backend` 0.1.0，2026-09-04）；zclaudia 已从 `link:` 切换到正式版本。
 > 注：zclaudia server 保留了自有传输层（握手驱动的 backoff 重置、SOCKS agent 等
 > 四处语义与 SDK 生命周期不匹配），SDK 在 zclaudia 中当前仅贡献 wire 类型；
 > 传输层是否换 SDK 留待消费端迁移完成后单独评估。
