@@ -1,14 +1,43 @@
 {
   "name": "@zclaudia/gateway-client",
   "version": "0.1.0",
-  "private": true,
+  "description": "Client SDK for the zclaudia gateway: control connection, channels, topics with retained payloads, reconnect. WHATWG WebSocket, injectable socket factory.",
+  "keywords": [
+    "gateway",
+    "websocket",
+    "reverse-tunnel",
+    "client",
+    "zclaudia"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zclaudia/zclaudia-gateway.git",
+    "directory": "packages/client"
+  },
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "!dist/**/*.map"
+  ],
+  "sideEffects": false,
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
-    "build": "tsc"
+    "build": "tsc",
+    "prepublishOnly": "pnpm build"
   },
   "dependencies": {
-    "@zclaudia/gateway-protocol": "workspace:*"
+    "@zclaudia/gateway-protocol": "workspace:^"
   }
 }

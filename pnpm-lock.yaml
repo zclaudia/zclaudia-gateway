@@ -70,16 +70,16 @@ importers:
   packages/backend:
     dependencies:
       '@zclaudia/gateway-client':
-        specifier: workspace:*
+        specifier: workspace:^
         version: link:../client
       '@zclaudia/gateway-protocol':
-        specifier: workspace:*
+        specifier: workspace:^
         version: link:../protocol
 
   packages/client:
     dependencies:
       '@zclaudia/gateway-protocol':
-        specifier: workspace:*
+        specifier: workspace:^
         version: link:../protocol
 
   packages/protocol: {}

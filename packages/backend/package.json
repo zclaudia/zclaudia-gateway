@@ -1,15 +1,44 @@
 {
   "name": "@zclaudia/gateway-backend",
   "version": "0.1.0",
-  "private": true,
+  "description": "Backend SDK for the zclaudia gateway: registration, heartbeats, channel serving (dial-is-accept), topic publishing, HTTP-over-channel.",
+  "keywords": [
+    "gateway",
+    "websocket",
+    "reverse-tunnel",
+    "backend",
+    "zclaudia"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zclaudia/zclaudia-gateway.git",
+    "directory": "packages/backend"
+  },
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "!dist/**/*.map"
+  ],
+  "sideEffects": false,
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
-    "build": "tsc"
+    "build": "tsc",
+    "prepublishOnly": "pnpm build"
   },
   "dependencies": {
-    "@zclaudia/gateway-protocol": "workspace:*",
-    "@zclaudia/gateway-client": "workspace:*"
+    "@zclaudia/gateway-protocol": "workspace:^",
+    "@zclaudia/gateway-client": "workspace:^"
   }
 }
