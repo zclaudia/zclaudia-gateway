@@ -1,10 +1,12 @@
 # zclaudia-gateway 通用化 Roadmap
 
-> 状态：Draft（2026-09-01 修订一：wire 格式变更集中到 v4、Tenant 机制降级为字段预留、新增 Channel 传输承载 ADR、Go SDK 推迟、时间估算标注为乐观值。修订二：基于 zclaudia 与 comfy-mobile-ui 代码调研补充 Channel 身份四元组、三载体拨号认证（ticket 为客户端主路径）、Topic 升级为一等原语、epoch 失效语义、Comfy 设备凭证 origin 迁移与保活要求。2026-09-02 修订三：Phase 3 后检查点、namespace 共存测试、基于 hermes-client-mobile 调研重写 Phase 4——Hermes 本体为 Python、现有 Go proxy 242 行可移植、per-client 身份为核心增量、媒体签名 URL 为硬需求、事件缺 session_id 需 Hermes 侧协议配合）
+> 状态：**Phase 0–3 已完成**（含生产部署；详见各阶段进度注）。2026-09-04 修订四：v3 协议与共享 secret 认证跳过兼容期整体删除（单操作者、零遗留对端）；SDK 三包发布 npm；生产部署实况记入 ADR-0001 备注；下一步为 Phase 3 后检查点裁决（见第 6 节）。
 >
-> 更新日期：2026-09-01
+> 历史：Draft（2026-09-01 修订一：wire 格式变更集中到 v4、Tenant 机制降级为字段预留、新增 Channel 传输承载 ADR、Go SDK 推迟、时间估算标注为乐观值。修订二：基于 zclaudia 与 comfy-mobile-ui 代码调研补充 Channel 身份四元组、三载体拨号认证（ticket 为客户端主路径）、Topic 升级为一等原语、epoch 失效语义、Comfy 设备凭证 origin 迁移与保活要求。2026-09-02 修订三：Phase 3 后检查点、namespace 共存测试、基于 hermes-client-mobile 调研重写 Phase 4——Hermes 本体为 Python、现有 Go proxy 242 行可移植、per-client 身份为核心增量、媒体签名 URL 为硬需求、事件缺 session_id 需 Hermes 侧协议配合）
 >
-> 适用范围：`zclaudia-gateway`、`zclaudia-protocol`，以及 zclaudia、Hermes、ComfyUI 的 Gateway 接入层
+> 更新日期：2026-09-04
+>
+> 适用范围：`zclaudia-gateway`（含 `@zclaudia/gateway-protocol`/`-client`/`-backend` SDK），以及 zclaudia、Hermes、ComfyUI 的 Gateway 接入层
 
 ## 1. 背景
 
@@ -14,7 +16,7 @@
 
 - Hermes 主要使用 JSON-RPC WebSocket 和 `/api/*` HTTP API，需要 Gateway 在本地安全地注入私有 Session Token，并为不同远程客户端隔离本地会话。
 - ComfyUI 需要大文件流式上传和下载、二进制 WebSocket、浏览器 Session、可撤销的原生设备凭证、路由白名单和危险操作控制。
-- zclaudia 已经使用 Gateway Protocol v3，需要在通用化过程中保持兼容并渐进迁移。
+- zclaudia 最初使用 Gateway Protocol v3（已完成 v4 全量迁移，v3 于 2026-09 整体移除）。
 
 因此，通用化的目标不是继续向中心服务添加应用条件分支，而是把 Gateway 建设成一套与业务 payload 无关的安全反向隧道平台。
 
@@ -92,7 +94,7 @@ Application Adapter 运行在业务服务旁边，通常作为进程内模块或
 
 | Adapter | 推荐部署形态 | 主要职责 |
 | --- | --- | --- |
-| `gateway-adapter-zclaudia` | zclaudia server 进程内模块 | resource snapshot/event、现有 HTTP proxy 和 v3 兼容 |
+| `gateway-adapter-zclaudia` | zclaudia server 进程内模块（已落地） | resource snapshot/event（Topic）、消息 channel、流式 HTTP |
 | `gateway-adapter-hermes` | Hermes 主机上的 Node Sidecar（Go SDK 推迟，见 Phase 4） | JSON-RPC、本地 WS 会话隔离、Session Token 注入、`/api/*` 转发 |
 | `gateway-adapter-comfy` | ComfyUI 主机上的 Node Sidecar | 大文件流、二进制 WS、路由白名单、危险操作策略、Header 清洗 |
 
@@ -116,13 +118,13 @@ Adapter 使用统一 Backend SDK 连接中心 Gateway。本地服务的私有 To
 4. **端到端流式传输**：文件不能整体缓存在 Express、WebSocket 消息或 Adapter 内存中。
 5. **二进制不经过 Base64**：控制帧使用 JSON，字节流使用二进制帧。
 6. **核心与业务解耦**：应用协议、私有认证和危险操作策略属于 Adapter。
-7. **兼容迁移**：Protocol v3 与 v4 在迁移期共存，避免一次性升级所有 zclaudia 客户端。
+7. ~~**兼容迁移**~~（已完成使命：迁移期 v3/v4 曾共存；zclaudia 全量切 v4 后 v3 整体删除，新对端从 v4 起步）。
 8. **先可观测再扩容**：先获得真实连接、流量、延迟和内存指标，再确定多实例方案。
 9. **优先复用传输层能力**：能由独立 TCP/WS 连接天然提供的背压、隔离和取消，不在应用层重新实现多路复用（见 Phase 2 的 ADR）。
 
 ## 5. 分阶段计划
 
-### Phase 0：建立基线
+### Phase 0：建立基线 ✅（2026-09-02 完成）
 
 目标：让后续重构拥有稳定、可验证的工程基线。
 
@@ -143,7 +145,7 @@ Adapter 使用统一 Backend SDK 连接中心 Gateway。本地服务的私有 To
 - 测试不依赖一秒级脆弱超时；
 - 当前 v3 行为和已知限制有文档及回归测试覆盖。
 
-### Phase 1：安全与隔离基础
+### Phase 1：安全与隔离基础 ✅（2026-09-03 完成）
 
 目标：在接入第二个业务之前，建立可用于多应用和多用户的安全边界。
 
@@ -174,7 +176,7 @@ Adapter 使用统一 Backend SDK 连接中心 Gateway。本地服务的私有 To
 - 现有 v3 客户端无需修改即可通过本阶段的全部变更；
 - 关键越权场景具有自动化负向测试。
 
-### Phase 2：Protocol v4 与通用数据面
+### Phase 2：Protocol v4 与通用数据面 ✅（2026-09-03 完成；Hermes 原型项顺延至 Phase 4，见下）
 
 目标：提供 Hermes 和 ComfyUI 都能使用的通用传输能力。
 
@@ -223,8 +225,8 @@ response.end
 - 实现基于一次性 ticket / header / Cookie 三种载体的 Channel 拨号认证；
 - 实现 epoch 换代时 Gateway 主动关闭旧 Channel（`epoch_changed`）；
 - 评估 WebSocket、HTTP/2 和 QUIC 作为长期 Backend Tunnel 的取舍，并记录 ADR；
-- 保持 v3 endpoint，增加 v3 到 v4 的兼容层；
-- 用一个最小 Hermes JSON-RPC Channel 原型验证协议设计（协议在只有 zclaudia 一个消费者时定稿，接入第二个应用大概率返工）。
+- ~~保持 v3 endpoint，增加 v3 到 v4 的兼容层~~（曾实现共存；zclaudia 全量迁移后 v3 整体删除）；
+- 用一个最小 Hermes JSON-RPC Channel 原型验证协议设计——**顺延至 Phase 4**（hermes-agent 仓库当时不可用，用户决定先忽略 Hermes；协议返工风险由此后移，Phase 4 开工时优先验证）。
 
 验收标准：
 
@@ -235,7 +237,7 @@ response.end
 - 最小 Hermes JSON-RPC 原型可以通过 v4 Channel 端到端工作；
 - v3 zclaudia 客户端在兼容期内无需同步升级即可继续工作。
 
-### Phase 3：公共 SDK 与 zclaudia 迁移
+### Phase 3：公共 SDK 与 zclaudia 迁移 ✅（2026-09-04 完成并生产部署）
 
 目标：把协议细节从应用代码中移出，并用现有 zclaudia 流量验证新核心。
 
@@ -415,22 +417,24 @@ Phase 4 Hermes   Phase 5 ComfyUI
 | Phase 5：ComfyUI 迁移 | 约 2–4 周 |
 | Phase 6：生产化与多实例 | 约 2–4 周 |
 
+> **实际复盘（2026-09-04）**：Phase 0–3 实际历时约 4 天（AI 辅助开发，含生产部署与两次超范围的终局拆除），远低于乐观估算——「协议类工作超期 1.5–2 倍」的历史规律在本项目未成立。Phase 4–6 估算仍保留原值作参考，实际排期以检查点裁决为准。
+
 单节点、可信用户范围的 MVP 预计约 6–10 周；三个项目可使用的生产级版本乐观估算约 13–22 周，规划时应按此区间的偏高端预留。两到三名工程师并行时，安全/协议、SDK/Adapter、测试/运维可以拆分推进。
 
 ## 8. 必须先确认的技术决策
 
 实施前应通过 ADR 明确以下事项：
 
-1. Channel 的传输承载：每 Channel 一条独立 WebSocket 连接（倾向），还是单连接自研多路复用（见 Phase 2）；
-2. v4 Backend Tunnel 继续基于 WebSocket，还是采用 HTTP/2/QUIC；
-3. TLS/WSS 终止方案：Gateway 自行终止还是假设前置反向代理；这决定 `trustProxy`、Cookie `Secure` 属性和设备凭证的安全前提；
-4. 用户身份接入现有 IdP，还是由 Gateway 提供最小认证服务；
-5. 浏览器 Session、原生 Device Credential 和 Backend Credential 的签发与撤销模型；
-6. Namespace、Backend 和 Environment 的标识及唯一性规则（含 Tenant 字段的预留方式）；
-7. 最大 chunk 大小和重放规则（二进制 framing 与 flow-control window 仅在选择多路复用方案时需要）；
-8. v3 compatibility layer 位于 Gateway 内还是独立兼容服务；
-9. SDK 的仓库、包名、版本发布策略；Go/多语言 SDK 的启动条件；
-10. 单节点状态何时迁移到 PostgreSQL/Redis，以及多实例连接路由方式。
+1. ✅ Channel 传输承载：每 Channel 一条独立 WebSocket 连接（[ADR-0003](docs/adr/0003-channel-transport.md)）；
+2. ✅ v4 Backend Tunnel 基于 WebSocket（QUIC/HTTP3 列为 ADR-0001 的重评估触发条件）；
+3. ✅ 前置反向代理终止 TLS（[ADR-0001](docs/adr/0001-deployment-and-tls-termination.md)；实际部署备注：origin 带端口、Caddy 容器化）；
+4. ✅ Gateway 提供最小认证服务，不接 IdP（[ADR-0002](docs/adr/0002-identity-issuance.md)）；
+5. ✅ Device/Backend/Backend-access 凭证签发与级联撤销已实现（ADR-0002）；浏览器 Session 留待 Phase 5；
+6. ✅ Backend 唯一键 =（tenant 预留, namespace, instanceId, environment），UUID 标识（docs/protocol-v4.md §2）；
+7. ✅ 不需要：选择了每 Channel 一连接，无自研 framing/flow-control window；
+8. ✅ 已作废：v3 兼容层曾内置于 Gateway，随 v3 删除一并移除；
+9. ✅ 同仓 pnpm workspace、`@zclaudia/gateway-*` 已发 npm（[ADR-0004](docs/adr/0004-sdk-packaging.md)）；Go SDK 推迟；
+10. ⏳ 未决（Phase 6）：PostgreSQL/Redis 与多实例路由，待真实指标驱动。
 
 ## 9. 风险与控制措施
 
@@ -442,9 +446,11 @@ Phase 4 Hermes   Phase 5 ComfyUI
 | Adapter 与中心职责重新耦合 | 公共 SDK 只暴露通用 Channel/HTTP API，业务 policy 保留在 Adapter |
 | 多应用/多用户越权 | 服务端派生身份、默认拒绝、负向测试和审计 |
 | 多语言 SDK 行为不一致 | 推迟 Go SDK，先只维护 TS 实现和语言无关协议规范；未来扩展时使用共享 schema、golden fixtures 和跨语言 contract suite |
-| 迁移期维护成本增加 | 明确 v3 弃用条件，限制双栈期间新增 v3 功能 |
+| ~~迁移期维护成本增加~~ | 已消解：双栈期结束后 v3 整体删除，无长期兼容负担 |
 
 ## 10. 完成定义
+
+> 现状（2026-09-04）：平台侧条件（业务无关核心、安全边界、流式数据面、SDK）已满足且经 zclaudia 生产验证；"三个应用接入"目前为 1/3——按第 6 节检查点，Hermes/Comfy 是否接入为独立裁决项，通用化的完成定义在其裁决后重估。
 
 当满足以下条件时，可以认为 `zclaudia-gateway` 已完成通用化：
 
