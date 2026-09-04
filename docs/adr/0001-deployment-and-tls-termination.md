@@ -26,3 +26,13 @@ Gateway 的存在意义是暴露在公网上为 NAT 后的 Backend 提供接入�
 - 正面：证书零维护；Gateway 保持纯 HTTP 简单性；同机可并存其他服务。
 - 负面/需要承担的：反代是新的单点，其超时/缓冲配置必须适配 WS 长连接与流式响应（禁用代理缓冲、拉长空闲超时）；`trustProxy` 开启后必须保证 Gateway 端口不直接暴露公网（防火墙仅放行 80/443）。
 - 触发重新评估的条件：需要 QUIC/HTTP3 隧道（反代支持不足时）；或部署形态变更（失去公网服务器）。
+
+## 实际部署备注（2026-09-04）
+
+实际部署与决策有两处偏差，Phase 5 做 origin 绑定（浏览器 Session、设备凭证
+origin 重绑定）时必须以实际值为准：
+
+- **canonical origin 是 `https://gateway.zhvala.space:28443`（带端口后缀）**，
+  非标准 443——公网入口经路由器端口映射（28443 → Caddy 内部 https 8443）。
+- Caddy 以 Docker 容器运行（iStoreOS），非宿主进程；gateway 上游经容器网络
+  互通，宿主 loopback 绑定对 bridge 网络内的 Caddy 不可达（曾致 503，已修复）。
