@@ -8,9 +8,16 @@ import WebSocket from 'ws';
 import type { Server } from 'http';
 import net from 'node:net';
 import { createGatewayServer } from '../server.js';
-import { closeTestServer, listenTestServer } from './test-server.js';
+import { closeTestServer, listenTestServer, issueToken, TEST_ADMIN_TOKEN } from './test-server.js';
 
-const GATEWAY_SECRET = 'test-secret-channels';
+// Per-server issued zgb_ tokens, cached per namespace.
+let CURRENT_HTTP_URL = '';
+const tokenCache = new Map<string, Promise<string>>();
+function tokenFor(namespace: string): Promise<string> {
+  let tok = tokenCache.get(namespace);
+  if (!tok) { tok = issueToken(CURRENT_HTTP_URL, 'backend', namespace); tokenCache.set(namespace, tok); }
+  return tok;
+}
 
 async function canBindLoopback(): Promise<boolean> {
   return await new Promise((resolve) => {
@@ -89,9 +96,12 @@ describeIfLoopback('Phase 2: v4 Channels', () => {
   });
 
   async function startServer(overrides: Partial<Parameters<typeof createGatewayServer>[0]> = {}) {
-    const server = createGatewayServer({ gatewaySecret: GATEWAY_SECRET, ...overrides });
+    const server = createGatewayServer({ adminToken: TEST_ADMIN_TOKEN, ...overrides });
     servers.push(server);
-    return await listenTestServer(server);
+    const urls = await listenTestServer(server);
+    CURRENT_HTTP_URL = urls.httpUrl;
+    tokenCache.clear();
+    return urls;
   }
 
   async function connect(wsUrl: string): Promise<WebSocket> {
@@ -108,7 +118,7 @@ describeIfLoopback('Phase 2: v4 Channels', () => {
       namespace: opts.namespace,
       clientProtocolVersion: 1,
       peerType: opts.peerType,
-      gatewaySecret: GATEWAY_SECRET,
+      gatewaySecret: await tokenFor(opts.namespace),
       identity: { deviceId: `dev-${opts.instanceId}`, instanceId: opts.instanceId },
     };
     if (opts.peerType === 'client+backend') {
@@ -288,7 +298,7 @@ describeIfLoopback('Phase 2: v4 Channels', () => {
       namespace: 'app-a',
       clientProtocolVersion: 1,
       peerType: 'client-only',
-      gatewaySecret: GATEWAY_SECRET,
+      gatewaySecret: await tokenFor('app-a'),
       identity: { deviceId: 'dev-v3', instanceId: 'v3-client' },
     }));
     const err = await waitForMessage(ws, 'gateway_error');
@@ -338,7 +348,7 @@ describeIfLoopback('Phase 2: v4 Channels', () => {
   });
 
   test('per-channel byte rate limit throttles the relay', async () => {
-    const { wsUrl } = await startServer({ gatewaySecret: GATEWAY_SECRET, channelByteRateLimit: 64 * 1024 });
+    const { wsUrl } = await startServer({ channelByteRateLimit: 64 * 1024 });
     const { clientData, backendData } = await openChannel(wsUrl, 'app-a', 'throttle');
 
     const frame = Buffer.alloc(64 * 1024, 7);
@@ -362,7 +372,7 @@ describeIfLoopback('Phase 2: v4 Channels', () => {
   }, 15000);
 
   test('channel quota per peer is enforced', async () => {
-    const { wsUrl } = await startServer({ gatewaySecret: GATEWAY_SECRET, maxChannelsPerPeer: 2 });
+    const { wsUrl } = await startServer({ maxChannelsPerPeer: 2 });
     const backendCtl = await connect(wsUrl);
     const backendReady = await hello(backendCtl, { namespace: 'app-a', peerType: 'client+backend', instanceId: 'quota-backend' });
     const clientCtl = await connect(wsUrl);

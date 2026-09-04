@@ -6,9 +6,10 @@ import WebSocket from 'ws';
 import type { Server } from 'http';
 import net from 'node:net';
 import { createGatewayServer } from '../server.js';
-import { closeTestServer, listenTestServer } from './test-server.js';
+import { closeTestServer, listenTestServer, issueToken, TEST_ADMIN_TOKEN } from './test-server.js';
 
-const GATEWAY_SECRET = 'test-secret-client';
+// Issued zgb_ token, refreshed for every test server instance.
+let GATEWAY_SECRET = '';
 let WS_URL = '';
 
 async function canBindLoopback(): Promise<boolean> {
@@ -115,8 +116,9 @@ describeIfLoopback('Gateway Client Message Handling', () => {
   let openClients: WebSocket[] = [];
 
   beforeEach(async () => {
-    server = createGatewayServer({ gatewaySecret: GATEWAY_SECRET });
+    server = createGatewayServer({ adminToken: TEST_ADMIN_TOKEN });
     ({ wsUrl: WS_URL } = await listenTestServer(server));
+    GATEWAY_SECRET = await issueToken(WS_URL, 'backend', 'zclaudia');
 
     // Register a backend
     backendWs = new WebSocket(WS_URL);

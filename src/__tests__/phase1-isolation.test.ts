@@ -8,9 +8,16 @@ import WebSocket from 'ws';
 import type { Server } from 'http';
 import net from 'node:net';
 import { createGatewayServer } from '../server.js';
-import { closeTestServer, listenTestServer } from './test-server.js';
+import { closeTestServer, listenTestServer, issueToken, TEST_ADMIN_TOKEN } from './test-server.js';
 
-const GATEWAY_SECRET = 'test-secret-phase1';
+// Per-server issued zgb_ tokens, cached per namespace.
+let CURRENT_HTTP_URL = '';
+const tokenCache = new Map<string, Promise<string>>();
+function tokenFor(namespace: string): Promise<string> {
+  let tok = tokenCache.get(namespace);
+  if (!tok) { tok = issueToken(CURRENT_HTTP_URL, 'backend', namespace); tokenCache.set(namespace, tok); }
+  return tok;
+}
 
 async function canBindLoopback(): Promise<boolean> {
   return await new Promise((resolve) => {
@@ -70,10 +77,12 @@ describeIfLoopback('Phase 1: Security & Isolation', () => {
     servers.length = 0;
   });
 
-  async function startServer(config: Parameters<typeof createGatewayServer>[0] = { gatewaySecret: GATEWAY_SECRET }) {
-    const server = createGatewayServer(config);
+  async function startServer(config: Partial<Parameters<typeof createGatewayServer>[0]> = {}) {
+    const server = createGatewayServer({ adminToken: TEST_ADMIN_TOKEN, ...config });
     servers.push(server);
     const { wsUrl, httpUrl } = await listenTestServer(server);
+    CURRENT_HTTP_URL = httpUrl;
+    tokenCache.clear();
     return { server, wsUrl, httpUrl };
   }
 
@@ -91,7 +100,7 @@ describeIfLoopback('Phase 1: Security & Isolation', () => {
       namespace,
       clientProtocolVersion: 1,
       peerType: 'client+backend',
-      gatewaySecret: GATEWAY_SECRET,
+      gatewaySecret: await tokenFor(namespace),
       identity: { deviceId: `dev-${instanceId}`, instanceId, name },
       backend: { visible: true, capabilities: [], backendProtocolVersion: 1 },
     }));
@@ -106,7 +115,7 @@ describeIfLoopback('Phase 1: Security & Isolation', () => {
       namespace,
       clientProtocolVersion: 1,
       peerType: 'client-only',
-      gatewaySecret: GATEWAY_SECRET,
+      gatewaySecret: await tokenFor(namespace),
       identity: { deviceId: `dev-${instanceId}`, instanceId },
     }));
     const ready = await waitForMessage(ws, 'peer_ready');
@@ -201,7 +210,6 @@ describeIfLoopback('Phase 1: Security & Isolation', () => {
   describe('CORS allowlist', () => {
     test('allowed origin is echoed with credentials, others get no CORS header', async () => {
       const { httpUrl } = await startServer({
-        gatewaySecret: GATEWAY_SECRET,
         allowedOrigins: ['https://app.example.com'],
       });
 

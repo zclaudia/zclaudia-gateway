@@ -10,9 +10,10 @@ import type { Server } from 'http';
 import net from 'node:net';
 import { createGatewayServer } from '../server.js';
 import { validateGatewayMessage, filterProxyResponseHeaders } from '../validation.js';
-import { closeTestServer, listenTestServer } from './test-server.js';
+import { closeTestServer, listenTestServer, issueToken, TEST_ADMIN_TOKEN } from './test-server.js';
 
-const GATEWAY_SECRET = 'test-secret-validation';
+// Issued zgb_ token, refreshed for every test server instance.
+let GATEWAY_SECRET = '';
 
 async function canBindLoopback(): Promise<boolean> {
   return await new Promise((resolve) => {
@@ -99,9 +100,11 @@ describeIfLoopback('Phase 1: validation & header hygiene (integration)', () => {
   }
 
   async function startServer() {
-    const server = createGatewayServer({ gatewaySecret: GATEWAY_SECRET });
+    const server = createGatewayServer({ adminToken: TEST_ADMIN_TOKEN });
     servers.push(server);
-    return await listenTestServer(server);
+    const urls = await listenTestServer(server);
+    GATEWAY_SECRET = await issueToken(urls.httpUrl, 'backend', 'zclaudia');
+    return urls;
   }
 
   async function connectBackend(wsUrl: string, instanceId: string) {

@@ -3,9 +3,10 @@ import type { Server } from 'http';
 import net from 'node:net';
 import WebSocket from 'ws';
 import { createGatewayServer } from '../server.js';
-import { closeTestServer, listenTestServer } from './test-server.js';
+import { closeTestServer, listenTestServer, issueToken, TEST_ADMIN_TOKEN } from './test-server.js';
 
-const GATEWAY_SECRET = 'test-secret-handshake-v2';
+// Issued zgb_ token, refreshed for every test server instance.
+let GATEWAY_SECRET = '';
 
 async function canBindLoopback(): Promise<boolean> {
   return await new Promise((resolve) => {
@@ -62,8 +63,9 @@ describe('Gateway handshake v2', () => {
   const sockets = new Set<WebSocket>();
 
   beforeEach(async () => {
-    server = createGatewayServer({ gatewaySecret: GATEWAY_SECRET, authTimeoutMs: 500 });
+    server = createGatewayServer({ adminToken: TEST_ADMIN_TOKEN, authTimeoutMs: 500 });
     ({ wsUrl } = await listenTestServer(server));
+    GATEWAY_SECRET = await issueToken(wsUrl, 'backend', 'zclaudia');
   });
 
   afterEach(async () => {

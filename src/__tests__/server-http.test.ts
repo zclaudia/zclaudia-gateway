@@ -6,9 +6,10 @@ import WebSocket from 'ws';
 import type { Server } from 'http';
 import net from 'node:net';
 import { createGatewayServer } from '../server.js';
-import { closeTestServer, listenTestServer } from './test-server.js';
+import { closeTestServer, listenTestServer, issueToken, TEST_ADMIN_TOKEN } from './test-server.js';
 
-const GATEWAY_SECRET = 'test-secret-http';
+// Issued zgb_ token, refreshed for every test server instance.
+let GATEWAY_SECRET = '';
 let WS_URL = '';
 let HTTP_URL = '';
 
@@ -81,8 +82,9 @@ describeIfLoopback('Gateway HTTP Endpoints', () => {
   let server: Server;
 
   beforeEach(async () => {
-    server = createGatewayServer({ gatewaySecret: GATEWAY_SECRET });
+    server = createGatewayServer({ adminToken: TEST_ADMIN_TOKEN });
     ({ wsUrl: WS_URL, httpUrl: HTTP_URL } = await listenTestServer(server));
+    GATEWAY_SECRET = await issueToken(HTTP_URL, 'backend', 'zclaudia');
   });
 
   afterEach(async () => {

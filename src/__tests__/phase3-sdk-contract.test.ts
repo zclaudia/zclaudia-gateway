@@ -8,11 +8,12 @@ import { describe, test, expect, afterEach } from 'vitest';
 import type { Server } from 'http';
 import net from 'node:net';
 import { createGatewayServer } from '../server.js';
-import { listenTestServer, closeTestServer } from './test-server.js';
+import { listenTestServer, closeTestServer, issueToken, TEST_ADMIN_TOKEN } from './test-server.js';
 import { GatewayClient } from '@zclaudia/gateway-client';
 import { GatewayBackend } from '@zclaudia/gateway-backend';
 
-const GATEWAY_SECRET = 'test-secret-sdk';
+// Issued zgb_ token, refreshed for every test server instance.
+let GATEWAY_SECRET = '';
 
 async function canBindLoopback(): Promise<boolean> {
   return await new Promise((resolve) => {
@@ -48,9 +49,10 @@ describeIfLoopback('Phase 3: SDK contract', () => {
   });
 
   async function startServer(overrides: Partial<Parameters<typeof createGatewayServer>[0]> = {}) {
-    const server = createGatewayServer({ gatewaySecret: GATEWAY_SECRET, ...overrides });
+    const server = createGatewayServer({ adminToken: TEST_ADMIN_TOKEN, ...overrides });
     servers.push(server);
     const { httpUrl } = await listenTestServer(server);
+    GATEWAY_SECRET = await issueToken(httpUrl, 'backend', 'sdk-test');
     return { httpUrl };
   }
 
@@ -243,8 +245,8 @@ describeIfLoopback('Phase 3: SDK contract', () => {
   });
 
   test('backend SDK auto-exchanges an enrollment credential before connecting', async () => {
-    const ADMIN = 'sdk-admin-token';
-    const { httpUrl } = await startServer({ adminToken: ADMIN });
+    const ADMIN = TEST_ADMIN_TOKEN;
+    const { httpUrl } = await startServer();
     const issued = await fetch(`${httpUrl}/api/admin/credentials`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${ADMIN}`, 'Content-Type': 'application/json' },

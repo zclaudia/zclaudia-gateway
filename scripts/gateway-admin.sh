@@ -5,7 +5,7 @@
 # or GATEWAY_ENV_FILE if set):
 #   GATEWAY_URL          e.g. https://gateway.example.com (no trailing slash);
 #                        defaults to http://127.0.0.1:$GATEWAY_PORT on the host
-#   GATEWAY_ADMIN_TOKEN  admin token (never the shared GATEWAY_SECRET)
+#   GATEWAY_ADMIN_TOKEN  admin token — the root of trust for credential issuance
 #
 # Usage:
 #   gateway-admin.sh issue-backend <namespace> <name>

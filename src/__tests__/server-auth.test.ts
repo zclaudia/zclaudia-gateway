@@ -6,9 +6,10 @@ import WebSocket from 'ws';
 import type { Server } from 'http';
 import net from 'node:net';
 import { createGatewayServer } from '../server.js';
-import { closeTestServer, listenTestServer } from './test-server.js';
+import { closeTestServer, listenTestServer, issueToken, TEST_ADMIN_TOKEN } from './test-server.js';
 
-const GATEWAY_SECRET = 'test-secret-auth';
+// Issued zgb_ token, refreshed for every test server instance.
+let GATEWAY_SECRET = '';
 
 async function canBindLoopback(): Promise<boolean> {
   return await new Promise((resolve) => {
@@ -101,8 +102,9 @@ describeIfLoopback('Gateway Authentication', () => {
   let httpUrl: string;
 
   beforeEach(async () => {
-    server = createGatewayServer({ gatewaySecret: GATEWAY_SECRET });
+    server = createGatewayServer({ adminToken: TEST_ADMIN_TOKEN });
     ({ wsUrl, httpUrl } = await listenTestServer(server));
+    GATEWAY_SECRET = await issueToken(httpUrl, 'backend', 'zclaudia');
   });
 
   afterEach(async () => {
@@ -235,24 +237,14 @@ describeIfLoopback('Gateway Authentication', () => {
 
 
     // Token format regression tests: both HTTP auth paths must accept the same
-    // formats — bare secret and legacy clientId:secret. Auth success on the proxy
-    // route surfaces as 502 BACKEND_OFFLINE for an unknown backend (never 401),
-    // so no backend registration is needed.
+    // formats — only issued credential tokens are accepted; the legacy
+    // clientId:secret composite is gone with the shared secret.
     describe('Bearer token formats', () => {
-      test('proxy route accepts clientId:gatewaySecret composite token', async () => {
+      test('legacy clientId:token composite is rejected', async () => {
         const response = await fetch(`${httpUrl}/api/proxy/nonexistent-backend/some-path`, {
           headers: { 'Authorization': `Bearer client-123:${GATEWAY_SECRET}` }
         });
-        expect(response.status).toBe(502);
-        const body = await response.json();
-        expect(body.error.code).toBe('BACKEND_OFFLINE');
-      });
-
-      test('notification config route accepts clientId:gatewaySecret composite token', async () => {
-        const response = await fetch(`${httpUrl}/api/notifications/config`, {
-          headers: { 'Authorization': `Bearer client-123:${GATEWAY_SECRET}` }
-        });
-        expect(response.status).toBe(200);
+        expect(response.status).toBe(401);
       });
 
       test('proxy route rejects token where only the pre-colon prefix matches the secret', async () => {
@@ -277,8 +269,9 @@ describe('Gateway Rate Limiting', () => {
   let httpUrl: string;
 
   beforeEach(async () => {
-    server = createGatewayServer({ gatewaySecret: GATEWAY_SECRET });
+    server = createGatewayServer({ adminToken: TEST_ADMIN_TOKEN });
     ({ httpUrl } = await listenTestServer(server));
+    GATEWAY_SECRET = await issueToken(httpUrl, 'backend', 'zclaudia');
   });
 
   afterEach(async () => {
@@ -313,8 +306,9 @@ describe('Invalid First Messages', () => {
   let wsUrl: string;
 
   beforeEach(async () => {
-    server = createGatewayServer({ gatewaySecret: GATEWAY_SECRET });
+    server = createGatewayServer({ adminToken: TEST_ADMIN_TOKEN });
     ({ wsUrl } = await listenTestServer(server));
+    GATEWAY_SECRET = await issueToken(wsUrl, 'backend', 'zclaudia');
   });
 
   afterEach(async () => {
@@ -353,7 +347,7 @@ describe('Connection Timeout', () => {
   let server: Server;
 
   beforeEach(async () => {
-    server = createGatewayServer({ gatewaySecret: GATEWAY_SECRET });
+    server = createGatewayServer({ adminToken: TEST_ADMIN_TOKEN });
     await listenTestServer(server);
   });
 

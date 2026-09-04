@@ -1,7 +1,8 @@
 /**
- * Phase 1 credential system tests (ADR-0002): admin issuance/revocation,
- * WS auth with credentials (namespace derivation, backend registration
- * restriction), HTTP proxy namespace scoping, and legacy compatibility.
+ * Credential system tests (ADR-0002): admin issuance/revocation, WS auth
+ * with credentials (namespace derivation, backend registration restriction),
+ * HTTP proxy namespace scoping. Issued credentials are the only
+ * authentication — the shared-secret path no longer exists.
  */
 import { describe, test, expect, afterEach } from 'vitest';
 import WebSocket from 'ws';
@@ -10,7 +11,6 @@ import net from 'node:net';
 import { createGatewayServer } from '../server.js';
 import { closeTestServer, listenTestServer } from './test-server.js';
 
-const GATEWAY_SECRET = 'test-secret-credentials';
 const ADMIN_TOKEN = 'test-admin-token';
 
 async function canBindLoopback(): Promise<boolean> {
@@ -70,7 +70,7 @@ describeIfLoopback('Phase 1: Credential System', () => {
   });
 
   async function startServer(overrides: Partial<Parameters<typeof createGatewayServer>[0]> = {}) {
-    const server = createGatewayServer({ gatewaySecret: GATEWAY_SECRET, adminToken: ADMIN_TOKEN, ...overrides });
+    const server = createGatewayServer({ adminToken: ADMIN_TOKEN, ...overrides });
     servers.push(server);
     const { wsUrl, httpUrl } = await listenTestServer(server);
     return { server, wsUrl, httpUrl };
@@ -160,17 +160,8 @@ describeIfLoopback('Phase 1: Credential System', () => {
       });
       expect(wrong.status).toBe(401);
 
-      // Gateway secret must not work as admin token
-      const viaSecret = await fetch(`${httpUrl}/api/admin/credentials`, {
-        headers: { Authorization: `Bearer ${GATEWAY_SECRET}` },
-      });
-      expect(viaSecret.status).toBe(401);
-
-      const { httpUrl: noAdminUrl } = await startServer({ adminToken: undefined });
-      const disabled = await fetch(`${noAdminUrl}/api/admin/credentials`, {
-        headers: { Authorization: `Bearer ${ADMIN_TOKEN}` },
-      });
-      expect(disabled.status).toBe(503);
+      // A server without an admin token cannot exist: credentials would be unissuable
+      expect(() => createGatewayServer({ adminToken: '' } as never)).toThrow(/adminToken is required/);
     });
   });
 
@@ -238,17 +229,12 @@ describeIfLoopback('Phase 1: Credential System', () => {
       expect(err.code).toBe('UNAUTHORIZED');
     });
 
-    test('legacy shared secret still authenticates both peer types', async () => {
+    test('a shared-secret-style token is rejected: credentials are the only auth', async () => {
       const { wsUrl } = await startServer();
-      const wsBackend = await connect(wsUrl);
-      sendHello(wsBackend, GATEWAY_SECRET, 'zclaudia', 'client+backend', 'legacy-backend');
-      const ready = await waitForMessage(wsBackend, 'peer_ready');
-      expect(ready.backend.backendId).toBeDefined();
-
-      const wsClient = await connect(wsUrl);
-      sendHello(wsClient, GATEWAY_SECRET, 'zclaudia', 'client-only', 'legacy-client');
-      const clientReady = await waitForMessage(wsClient, 'peer_ready');
-      expect(clientReady.peerSessionId).toBeDefined();
+      const ws = await connect(wsUrl);
+      sendHello(ws, 'some-shared-secret-value', 'zclaudia', 'client+backend', 'legacy-backend');
+      const err = await waitForMessage(ws, 'gateway_error');
+      expect(err.code).toBe('UNAUTHORIZED');
     });
   });
 
@@ -287,7 +273,7 @@ describeIfLoopback('Phase 1: Credential System', () => {
       const access = await exchange(httpUrl, enrollment.body.data.token);
       expect((await exchange(httpUrl, access.body.data.token)).status).toBe(403);
 
-      expect((await exchange(httpUrl, GATEWAY_SECRET)).status).toBe(403);
+      expect((await exchange(httpUrl, 'some-shared-secret-value')).status).toBe(401);
       expect((await exchange(httpUrl, 'zgb_bogus')).status).toBe(401);
     });
 
@@ -332,9 +318,10 @@ describeIfLoopback('Phase 1: Credential System', () => {
 
   describe('HTTP proxy with credentials', () => {
     /** v4 backend serving http channels: every request answers 200 'ok'. */
-    async function registerEchoBackend(wsUrl: string, namespace: string, instanceId: string) {
+    async function registerEchoBackend(wsUrl: string, httpUrl: string, namespace: string, instanceId: string) {
+      const issued = await issueCredential(httpUrl, { type: 'backend', namespace });
       const ws = await connect(wsUrl);
-      sendHello(ws, GATEWAY_SECRET, namespace, 'client+backend', instanceId);
+      sendHello(ws, issued.body.data.token, namespace, 'client+backend', instanceId);
       const ready = await waitForMessage(ws, 'peer_ready');
       const base = wsUrl.replace(/\/ws$/, '');
       ws.on('message', (data) => {
@@ -357,8 +344,8 @@ describeIfLoopback('Phase 1: Credential System', () => {
 
     test('device credential can proxy to its own namespace only', async () => {
       const { wsUrl, httpUrl } = await startServer();
-      const zclaudiaBackend = await registerEchoBackend(wsUrl, 'zclaudia', 'proxy-z');
-      const hermesBackend = await registerEchoBackend(wsUrl, 'hermes', 'proxy-h');
+      const zclaudiaBackend = await registerEchoBackend(wsUrl, httpUrl, 'zclaudia', 'proxy-z');
+      const hermesBackend = await registerEchoBackend(wsUrl, httpUrl, 'hermes', 'proxy-h');
       const issued = await issueCredential(httpUrl, { type: 'device', namespace: 'zclaudia' });
       const token = issued.body.data.token;
 
@@ -376,13 +363,13 @@ describeIfLoopback('Phase 1: Credential System', () => {
       expect(body.error.code).toBe('BACKEND_OFFLINE');
     });
 
-    test('legacy shared secret can still proxy to any namespace', async () => {
+    test('a non-credential bearer token cannot proxy anywhere', async () => {
       const { wsUrl, httpUrl } = await startServer();
-      const hermesBackend = await registerEchoBackend(wsUrl, 'hermes', 'proxy-legacy');
+      const hermesBackend = await registerEchoBackend(wsUrl, httpUrl, 'hermes', 'proxy-legacy');
       const response = await fetch(`${httpUrl}/api/proxy/${hermesBackend}/test`, {
-        headers: { Authorization: `Bearer ${GATEWAY_SECRET}` },
+        headers: { Authorization: 'Bearer some-shared-secret-value' },
       });
-      expect(response.status).toBe(200);
+      expect(response.status).toBe(401);
     });
   });
 });

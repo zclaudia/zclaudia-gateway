@@ -5,9 +5,10 @@ import { describe, test, expect, beforeEach, afterEach } from 'vitest';
 import net from 'node:net';
 import type { Server } from 'http';
 import { createGatewayServer } from '../server.js';
-import { closeTestServer, listenTestServer } from './test-server.js';
+import { closeTestServer, listenTestServer, issueToken, TEST_ADMIN_TOKEN } from './test-server.js';
 
-const GATEWAY_SECRET = 'test-secret-notif';
+// Issued zgb_ token, refreshed for every test server instance.
+let GATEWAY_SECRET = '';
 let HTTP_URL = '';
 
 async function canBindLoopback(): Promise<boolean> {
@@ -34,7 +35,7 @@ describeIfLoopback('Notification Config', () => {
 
   beforeEach(async () => {
     server = createGatewayServer({
-      gatewaySecret: GATEWAY_SECRET,
+      adminToken: TEST_ADMIN_TOKEN,
       notificationConfig: {
         enabled: true,
         ntfyUrl: 'https://ntfy.sh',
@@ -53,6 +54,7 @@ describeIfLoopback('Notification Config', () => {
       },
     });
     const urls = await listenTestServer(server);
+    GATEWAY_SECRET = await issueToken(urls.httpUrl, 'backend', 'zclaudia');
     HTTP_URL = urls.httpUrl;
   });
 

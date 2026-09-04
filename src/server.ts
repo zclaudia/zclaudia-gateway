@@ -1,9 +1,8 @@
 /**
- * Gateway Sync Protocol v3 — Server Implementation
+ * Gateway Protocol v4 — Server Implementation
  *
- * No prose spec exists; the wire format is defined by the types in
- * @zclaudia/protocol (src/gateway.ts) and the behavior is pinned by
- * the tests in src/__tests__/. See README.md for an overview.
+ * Wire spec: docs/protocol-v4.md; behavior is pinned by the tests in
+ * src/__tests__/. See README.md for an overview.
  */
 
 import { createServer as createHttpServer, IncomingMessage, Server } from 'http';
@@ -35,12 +34,12 @@ import { GatewayPushNotificationService } from './push-notification.js';
 // ============================================================================
 
 interface GatewayConfig {
-  gatewaySecret: string;
   /**
-   * Admin token for the credential management API (/api/admin/*).
-   * When unset, the admin API is disabled. Must differ from gatewaySecret.
+   * Admin token for the credential management API (/api/admin/*). Required:
+   * issued credentials are the only authentication, so without the admin API
+   * no peer could ever connect.
    */
-  adminToken?: string;
+  adminToken: string;
   /** TTL for exchanged backend access credentials. Default 24h. */
   backendAccessTokenTtlMs?: number;
   notificationConfig?: Partial<NotificationConfig>;
@@ -95,7 +94,7 @@ function validatePeerHelloMessage(message: unknown): string | null {
   const msg = message as Record<string, unknown>;
   if (msg.type !== 'peer_hello') return 'First message must be peer_hello';
   if (typeof msg.gatewaySecret !== 'string') return 'peer_hello.gatewaySecret must be a string';
-  if (msg.protocolVersion !== 3 && msg.protocolVersion !== 4) return 'peer_hello.protocolVersion must be 3 or 4';
+  if (typeof msg.protocolVersion !== 'number') return 'peer_hello.protocolVersion must be a number';
   if (typeof msg.namespace !== 'string' || !msg.namespace) return 'peer_hello.namespace must be a non-empty string';
   if (typeof msg.clientProtocolVersion !== 'number') return 'peer_hello.clientProtocolVersion must be a number';
   if (msg.peerType !== 'client-only' && msg.peerType !== 'client+backend') {
@@ -122,8 +121,8 @@ function validatePeerHelloMessage(message: unknown): string | null {
 // ============================================================================
 
 export function createGatewayServer(config: GatewayConfig): Server {
-  if (config.adminToken !== undefined && config.adminToken === config.gatewaySecret) {
-    throw new Error('adminToken must differ from gatewaySecret');
+  if (!config.adminToken) {
+    throw new Error('adminToken is required: issued credentials are the only authentication');
   }
   const storage = new GatewayStorage();
   const pushNotificationService = new GatewayPushNotificationService(config.notificationConfig);
@@ -234,39 +233,22 @@ export function createGatewayServer(config: GatewayConfig): Server {
   });
 
   /**
-   * Accepted Bearer token formats (must be identical across all HTTP auth paths):
-   *   1. `Bearer <gatewaySecret>`          — what all current clients send
-   *   2. `Bearer <clientId>:<gatewaySecret>` — legacy composite; clientId is ignored
-   * A secret containing ':' still works via the whole-token comparison in (1).
+   * The only accepted authentication is an issued, revocable credential
+   * (zgd_/zgb_/zga_ Bearer token or peer_hello.gatewaySecret): namespace and
+   * capabilities derive from the server-side record, never the client. The
+   * shared-secret path was removed once every peer migrated (ADR-0002).
    */
-  function isValidGatewayToken(token: string): boolean {
-    if (safeCompare(token, config.gatewaySecret)) return true;
-    const colonIndex = token.indexOf(':');
-    return colonIndex !== -1 && safeCompare(token.slice(colonIndex + 1), config.gatewaySecret);
-  }
-
-  /**
-   * Resolved identity of a presented token.
-   * 'legacy' — the shared gateway secret: full access, self-declared
-   *   namespace (compatibility mode until all clients migrate).
-   * 'credential' — an issued, revocable credential: namespace and
-   *   capabilities derive from the server-side record, never the client.
-   */
-  type AuthContext =
-    | { kind: 'legacy' }
-    | { kind: 'credential'; credential: CredentialInfo };
+  type AuthContext = { kind: 'credential'; credential: CredentialInfo };
 
   function isCredentialToken(token: string): boolean {
     return Object.values(CREDENTIAL_TOKEN_PREFIXES).some((prefix) => token.startsWith(prefix));
   }
 
   function resolveToken(token: string): AuthContext | null {
-    if (isCredentialToken(token)) {
-      const credential = storage.findValidCredential(token);
-      if (!credential) return null;
-      return { kind: 'credential', credential };
-    }
-    return isValidGatewayToken(token) ? { kind: 'legacy' } : null;
+    if (!isCredentialToken(token)) return null;
+    const credential = storage.findValidCredential(token);
+    if (!credential) return null;
+    return { kind: 'credential', credential };
   }
 
   function audit(event: string, fields: Record<string, unknown>): void {
@@ -333,10 +315,6 @@ export function createGatewayServer(config: GatewayConfig): Server {
 
   // --- Admin: credential management (ADR-0002) ---
   function requireAdmin(req: Request, res: Response, next: () => void): void {
-    if (!config.adminToken) {
-      res.status(503).json({ success: false, error: { code: 'ADMIN_DISABLED', message: 'Admin API is not configured' } });
-      return;
-    }
     const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ') || !safeCompare(authHeader.slice(7), config.adminToken)) {
@@ -426,7 +404,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
     }
     // Only enrollment credentials may be exchanged — not device tokens, not
     // already-exchanged access tokens, not the legacy shared secret.
-    if (auth.kind !== 'credential' || auth.credential.type !== 'backend') {
+    if (auth.credential.type !== 'backend') {
       res.status(403).json({ success: false, error: { code: 'FORBIDDEN', message: 'Only backend enrollment credentials can be exchanged' } });
       return;
     }
@@ -477,10 +455,9 @@ export function createGatewayServer(config: GatewayConfig): Server {
         res.status(502).json({ success: false, error: { code: 'BACKEND_OFFLINE', message: 'Backend not found or offline' } });
         return;
       }
-      // Credential-based callers may only reach backends in their own
-      // namespace; answered like an offline backend to avoid an existence
-      // oracle. Legacy shared-secret callers are unrestricted (compat).
-      if (auth.kind === 'credential') {
+      // Callers may only reach backends in their credential's namespace;
+      // answered like an offline backend to avoid an existence oracle.
+      {
         const presence = state.registry.items.get(backendId);
         if (!presence || presence.namespace !== auth.credential.namespace) {
           res.status(502).json({ success: false, error: { code: 'BACKEND_OFFLINE', message: 'Backend not found or offline' } });
@@ -496,7 +473,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
       const queryString = req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : '';
       const targetPath = `/${fullPath}${queryString}`;
       // Path logged without query string — queries may carry sensitive values.
-      audit('proxy.request', { backendId, method: req.method, path: `/${fullPath}`, ip: clientIp, auth: auth.kind === 'credential' ? auth.credential.id : 'legacy' });
+      audit('proxy.request', { backendId, method: req.method, path: `/${fullPath}`, ip: clientIp, auth: auth.credential.id });
       // Stream through an internal channel — no buffering, no base64.
       proxyViaChannel(req, res, backendId, lease.epoch, backendPeer, targetPath);
     } catch (error) {
@@ -1112,25 +1089,23 @@ export function createGatewayServer(config: GatewayConfig): Server {
   // ========================================================================
 
   function handlePeerHello(ws: WebSocket, message: PeerHelloMessage): string | null {
-    // The gatewaySecret field carries either the legacy shared secret or an
-    // issued credential token (zgd_/zgb_ prefix).
+    // The gatewaySecret field carries an issued credential token
+    // (zgd_/zgb_/zga_ prefix); the field name is kept for wire stability.
     const auth = resolveToken(message.gatewaySecret);
     if (!auth) {
       audit('peer.auth_failed', { namespace: message.namespace, peerType: message.peerType });
       sendToWs(ws, { type: 'gateway_error', code: 'UNAUTHORIZED', message: 'Invalid gateway secret' } satisfies GatewayErrorMessage); ws.close(); return null;
     }
-    if (auth.kind === 'credential') {
-      // Namespace derives from the server-side credential record; a declared
-      // namespace that disagrees is an error, never a grant.
-      if (auth.credential.namespace !== message.namespace) {
-        audit('peer.namespace_mismatch', { credentialId: auth.credential.id, declared: message.namespace });
-        sendToWs(ws, { type: 'gateway_error', code: 'UNAUTHORIZED', message: 'Namespace not permitted by credential' } satisfies GatewayErrorMessage); ws.close(); return null;
-      }
-      // A device credential must never be able to register (or impersonate) a backend.
-      if (message.peerType === 'client+backend' && auth.credential.type !== 'backend' && auth.credential.type !== 'backend-access') {
-        audit('peer.backend_registration_denied', { credentialId: auth.credential.id });
-        sendToWs(ws, { type: 'gateway_error', code: 'UNAUTHORIZED', message: 'This credential cannot register a backend' } satisfies GatewayErrorMessage); ws.close(); return null;
-      }
+    // Namespace derives from the server-side credential record; a declared
+    // namespace that disagrees is an error, never a grant.
+    if (auth.credential.namespace !== message.namespace) {
+      audit('peer.namespace_mismatch', { credentialId: auth.credential.id, declared: message.namespace });
+      sendToWs(ws, { type: 'gateway_error', code: 'UNAUTHORIZED', message: 'Namespace not permitted by credential' } satisfies GatewayErrorMessage); ws.close(); return null;
+    }
+    // A device credential must never be able to register (or impersonate) a backend.
+    if (message.peerType === 'client+backend' && auth.credential.type !== 'backend' && auth.credential.type !== 'backend-access') {
+      audit('peer.backend_registration_denied', { credentialId: auth.credential.id });
+      sendToWs(ws, { type: 'gateway_error', code: 'UNAUTHORIZED', message: 'This credential cannot register a backend' } satisfies GatewayErrorMessage); ws.close(); return null;
     }
     if (message.protocolVersion !== 4) {
       sendToWs(ws, { type: 'gateway_error', code: 'PROTOCOL_VERSION_MISMATCH', message: `Expected protocol version 4, got ${message.protocolVersion}` } satisfies GatewayErrorMessage); ws.close(); return null;
@@ -1145,7 +1120,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
       protocolVersion: 4,
       peerType,
       namespace: message.namespace,
-      credentialId: auth.kind === 'credential' ? auth.credential.id : undefined,
+      credentialId: auth.credential.id,
       deviceId: identity.deviceId,
       instanceId: identity.instanceId,
       channel,
@@ -1185,7 +1160,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
       namespace: peer.namespace,
       peerType,
       backendId: peer.backendId ?? 'none',
-      credentialId: peer.credentialId ?? 'legacy',
+      credentialId: peer.credentialId,
     });
     return peerSessionId;
   }

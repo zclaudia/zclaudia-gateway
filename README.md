@@ -1,6 +1,6 @@
 # zclaudia-gateway
 
-zclaudia 的中心 Gateway：为 NAT 之后的 Backend 与远程客户端提供注册发现、消息中继和 HTTP 代理。当前实现 Gateway Sync Protocol v3，服务于 zclaudia 的资源同步与远程访问；通用化计划（多应用、Channel 模型、Protocol v4）见 [ROADMAP.md](ROADMAP.md)。
+payload 无关的安全反向隧道平台：为 NAT 之后的 Backend 与远程客户端提供注册发现、Channel 专线、Topic 广播和流式 HTTP 代理。实现 Gateway Protocol v4（[docs/protocol-v4.md](docs/protocol-v4.md)）；演进历史与后续计划见 [ROADMAP.md](ROADMAP.md)。
 
 ## 架构
 
@@ -8,8 +8,8 @@ zclaudia 的中心 Gateway：为 NAT 之后的 Backend 与远程客户端提供�
 zclaudia client ──ws /ws──┐                ┌──ws /ws── zclaudia server (client+backend)
 zclaudia client ──ws /ws──┼──► Gateway ◄───┘
 mobile ── HTTP /api/proxy ┘      │
-                                 ├─ state.ts    内存态：peers / registry / leases / subscriptions
-                                 ├─ storage.ts  SQLite：deviceId/instanceId → backendId 映射、epoch 计数
+                                 ├─ state.ts    内存态：peers / registry / leases / channels / topics
+                                 ├─ storage.ts  SQLite：backend 身份（UUID）、凭证、epoch 计数
                                  ├─ server.ts   Express + ws：协议路由、HTTP 代理、限流
                                  └─ push-notification.ts  ntfy 推送
 ```
@@ -33,26 +33,19 @@ mobile ── HTTP /api/proxy ┘      │
 
 ## 认证
 
-两套并行体系（迁移期共存，见 [ADR-0002](docs/adr/0002-identity-issuance.md)）：
-
-### 签发凭证（推荐）
-
-由 Admin API 签发的可撤销凭证，namespace 与能力从服务端记录派生，不信任客户端声明。
+**签发凭证是唯一认证方式**（[ADR-0002](docs/adr/0002-identity-issuance.md)；共享 secret 体系已于 2026-09 整体移除）。由 Admin API 签发的可撤销凭证，namespace 与能力从服务端记录派生，不信任客户端声明：
 
 - `zgd_*` 设备凭证：仅可作为 client-only 连接与访问本 namespace 的 HTTP 代理；默认 180 天过期。
-- `zgb_*` Backend 凭证：可注册 Backend；默认不过期。
-- 撤销立即生效：在线连接被断开（close 1008），后续认证被拒。
-- 管理端点（需 `GATEWAY_ADMIN_TOKEN`）：`POST/GET /api/admin/credentials`、`DELETE /api/admin/credentials/:id`；命令行封装见 [scripts/gateway-admin.sh](scripts/gateway-admin.sh)（`issue-backend` / `issue-device` / `list` / `revoke`，读 `GATEWAY_URL` + `GATEWAY_ADMIN_TOKEN` 环境变量）。
-
-### 共享 secret（legacy 兼容）
-
-`GATEWAY_SECRET` 继续在 WS（`peer_hello.gatewaySecret`）和 HTTP（`Bearer <secret>` 或 `Bearer <clientId>:<secret>`）两侧有效，不受 namespace 限制。待三个应用全部迁移到签发凭证后按 ROADMAP 弃用。
+- `zgb_*` Backend 凭证：可注册 Backend；默认不过期；可经 `/api/backend/token` 交换为短期 `zga_*` 访问凭证（Backend SDK 默认行为）。
+- 撤销立即生效：在线连接被断开（close 1008），后续认证被拒；撤销 `zgb_*` 级联撤销其交换出的 `zga_*`。
+- 凭证在 WS（`peer_hello.gatewaySecret` 字段，名称保留以稳定 wire）与 HTTP（`Bearer <token>`）两侧通用。
+- 管理端点（需 `GATEWAY_ADMIN_TOKEN`，必填——它是签发凭证的信任根）：`POST/GET /api/admin/credentials`、`DELETE /api/admin/credentials/:id`；命令行封装见 [scripts/gateway-admin.sh](scripts/gateway-admin.sh)（`issue-backend` / `issue-device` / `list` / `revoke`，自动读取 `.env`）。
 
 ## 本地开发
 
 ```bash
 pnpm install
-cp .env.example .env        # 设置 GATEWAY_SECRET
+cp .env.example .env        # 设置 GATEWAY_ADMIN_TOKEN
 pnpm dev                    # tsx watch，默认端口 3200
 pnpm build && pnpm start    # 编译运行
 pnpm test                   # vitest 全量测试
@@ -65,11 +58,10 @@ docker compose up -d        # 容器部署（读取 .env）
 
 | 变量 | 必需 | 默认 | 说明 |
 | --- | --- | --- | --- |
-| `GATEWAY_SECRET` | ✅ | — | 共享认证密钥 |
+| `GATEWAY_ADMIN_TOKEN` | ✅ | — | 凭证管理 API 的管理员 token（凭证体系的信任根） |
 | `GATEWAY_PORT` | | `3200` | 监听端口 |
 | `GATEWAY_TRUST_PROXY` | | `false` | 信任 `X-Forwarded-For`（仅置于可信反代之后时开启，见 ADR-0001） |
 | `GATEWAY_ALLOWED_ORIGINS` | | 无（通配符） | 逗号分隔的 CORS Origin allowlist，设置后仅列表内 Origin 可跨域（带 credentials） |
-| `GATEWAY_ADMIN_TOKEN` | | 无（Admin API 禁用） | 凭证管理 API 的管理员 token，必须不同于 `GATEWAY_SECRET` |
 | `ZCLAUDIA_DATA_DIR` | | `~/.zclaudia` | SQLite 数据目录（实际路径 `<dir>/gateway/gateway.db`） |
 | `NTFY_*` | | 见 [.env.example](.env.example) 与 [src/index.ts](src/index.ts) | ntfy 推送通知配置 |
 
@@ -79,14 +71,14 @@ docker compose up -d        # 容器部署（读取 .env）
 
 ### 单节点与状态易失
 
-- 仅支持单实例部署。peers、registry、租约、订阅、进行中的代理请求、recovery token 全部在内存中，**进程重启即全部丢失**，客户端需重连并重新订阅（zclaudia 客户端已按此语义实现）。
-- SQLite 仅持久化 deviceId/instanceId → backendId 的映射和 epoch 计数器，保证 Backend 重连后 ID 与代次稳定。
+- 仅支持单实例部署。peers、registry、租约、channel、topic 订阅与 retained payload、recovery token 全部在内存中，**进程重启即全部丢失**，客户端需重连并重新订阅（zclaudia 客户端已按此语义实现）。
+- SQLite 持久化 backend 身份（UUID）、签发凭证（仅摘要）和 epoch 计数器，保证 Backend 重连后 ID 与代次稳定、凭证跨重启有效。
 
 ### 安全模型（Phase 1 重构对象）
 
-- 可撤销的设备/Backend 凭证已可用（见"认证"一节），凭证认证下 namespace 从服务端记录派生；但**共享 secret 仍在兼容期内有效**且不受 namespace 限制——在三个应用迁移完成、legacy 路径关闭之前，安全边界以持有 secret 者为上限。
-- namespace 隔离已在 registry 下发、订阅、定向消息和 HTTP 代理（凭证认证时）层面强制执行，同实例上不同 namespace 互不可见，有集成测试覆盖。
-- 浏览器 Cookie Session 与 Backend enrollment→短期访问凭证的交换流程尚未实现（前者随 Phase 5、后者在 Phase 1 内后续补齐）。
+- 认证只有可撤销的设备/Backend 凭证（见"认证"一节），namespace 一律从服务端记录派生；共享 secret 路径已整体删除，不存在不受 namespace 限制的通道。
+- namespace 隔离在 registry 下发、Topic、Channel、定向消息和 HTTP 代理层面强制执行，同实例上不同 namespace 互不可见，有集成测试覆盖。
+- 浏览器 Cookie Session 尚未实现（随 Phase 5）。
 - CORS 默认 `Access-Control-Allow-Origin: *`；设置 `GATEWAY_ALLOWED_ORIGINS` 后收紧为 Origin allowlist（带 credentials）。
 - WS 认证密钥在消息体中传输（受 TLS 保护的前提下）。
 
@@ -96,7 +88,6 @@ docker compose up -d        # 容器部署（读取 .env）
 | --- | --- | ---: |
 | WS 最大消息 | 50 MB | `server.ts` maxPayload |
 | JSON 请求体 | 15 MB | `express.json` |
-| 代理上传体 | 100 MB | `/api/proxy` raw parser |
 | 每 IP WS 连接数 | 10 | `MAX_WS_CONNECTIONS_PER_IP` |
 | 认证失败限流 | 10 次/分钟/IP | `AUTH_FAIL_LIMIT` |
 | 代理请求限流 | 200 次/分钟/IP | `PROXY_RATE_LIMIT` |
@@ -114,11 +105,9 @@ docker compose up -d        # 容器部署（读取 .env）
 
 ### 传输语义
 
-- **仅限 v3 Backend**：代理的二进制内容以 base64 编码经 JSON 消息传输（约 33% 膨胀）、整体响应模式在内存中完整缓存响应体。v4 Backend 的 `/api/proxy` 自动改走 Channel 流式桥接（无 base64、双向背压、端到端取消），客户端零改动。
 - 代理 Header 为默认拒绝的 allowlist（见 [src/validation.ts](src/validation.ts)）：请求侧仅转发 content-type/accept/range/条件请求头等；响应侧仅转发内容类头（`Set-Cookie` 与服务器指纹头永不透传）。
-- 所有入站协议消息经 runtime 校验，只校验 Gateway 路由所需字段——协议 .d.ts 与真实 v3 流量存在偏差（如快照实际携带 `sessions`/`projects`），完整 schema 收紧推迟到 v4。
-- 认证、连接、订阅、代理与凭证生命周期输出结构化 `[audit]` 日志行。
-- 资源快照/事件默认对全部订阅者广播；消息携带 `targetPeerSessionId`（可选的加法字段）时仅递送给该订阅者，zclaudia backend 尚未采用。
+- 所有入站协议消息经 runtime 校验，只校验 Gateway 路由所需字段；payload（topic、channel 帧、`backend_server_message`）一律不解析。
+- 认证、连接、channel/topic、代理与凭证生命周期输出结构化 `[audit]` 日志行。
 
 ## SDK（Protocol v4）
 

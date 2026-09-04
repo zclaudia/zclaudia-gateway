@@ -7,9 +7,16 @@ import WebSocket from 'ws';
 import type { Server } from 'http';
 import net from 'node:net';
 import { createGatewayServer } from '../server.js';
-import { closeTestServer, listenTestServer } from './test-server.js';
+import { closeTestServer, listenTestServer, issueToken, TEST_ADMIN_TOKEN } from './test-server.js';
 
-const GATEWAY_SECRET = 'test-secret-p2';
+// Per-server issued zgb_ tokens, cached per namespace.
+let CURRENT_HTTP_URL = '';
+const tokenCache = new Map<string, Promise<string>>();
+function tokenFor(namespace: string): Promise<string> {
+  let tok = tokenCache.get(namespace);
+  if (!tok) { tok = issueToken(CURRENT_HTTP_URL, 'backend', namespace); tokenCache.set(namespace, tok); }
+  return tok;
+}
 
 async function canBindLoopback(): Promise<boolean> {
   return await new Promise((resolve) => {
@@ -68,9 +75,12 @@ describeIfLoopback('Phase 2: Topics & HTTP streaming', () => {
   });
 
   async function startServer(overrides: Partial<Parameters<typeof createGatewayServer>[0]> = {}) {
-    const server = createGatewayServer({ gatewaySecret: GATEWAY_SECRET, ...overrides });
+    const server = createGatewayServer({ adminToken: TEST_ADMIN_TOKEN, ...overrides });
     servers.push(server);
-    return await listenTestServer(server);
+    const urls = await listenTestServer(server);
+    CURRENT_HTTP_URL = urls.httpUrl;
+    tokenCache.clear();
+    return urls;
   }
 
   async function connect(wsUrl: string): Promise<WebSocket> {
@@ -87,7 +97,7 @@ describeIfLoopback('Phase 2: Topics & HTTP streaming', () => {
       namespace: opts.namespace,
       clientProtocolVersion: 1,
       peerType: opts.peerType,
-      gatewaySecret: GATEWAY_SECRET,
+      gatewaySecret: await tokenFor(opts.namespace),
       identity: { deviceId: `dev-${opts.instanceId}`, instanceId: opts.instanceId },
     };
     if (opts.peerType === 'client+backend') {
@@ -285,7 +295,7 @@ describeIfLoopback('Phase 2: Topics & HTTP streaming', () => {
       });
 
       const response = await fetch(`${httpUrl}/api/proxy/${backendId}/files/hello.txt`, {
-        headers: { Authorization: `Bearer ${GATEWAY_SECRET}` },
+        headers: { Authorization: `Bearer ${await tokenFor('app-a')}` },
       });
       expect(response.status).toBe(200);
       expect(response.headers.get('etag')).toBe('"v9"');
@@ -310,7 +320,7 @@ describeIfLoopback('Phase 2: Topics & HTTP streaming', () => {
 
       const response = await fetch(`${httpUrl}/api/proxy/${backendId}/upload`, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${GATEWAY_SECRET}`, 'Content-Type': 'application/octet-stream' },
+        headers: { Authorization: `Bearer ${await tokenFor('app-a')}`, 'Content-Type': 'application/octet-stream' },
         body: payload,
       });
       expect(response.status).toBe(200);
@@ -321,11 +331,11 @@ describeIfLoopback('Phase 2: Topics & HTTP streaming', () => {
     });
 
     test('backend that never responds yields 504', async () => {
-      const { wsUrl, httpUrl } = await startServer({ gatewaySecret: GATEWAY_SECRET, proxyRequestTimeoutMs: 400 });
+      const { wsUrl, httpUrl } = await startServer({ proxyRequestTimeoutMs: 400 });
       const { backendId } = await startV4HttpBackend(wsUrl, 'http-504', () => {}, { silent: true });
 
       const response = await fetch(`${httpUrl}/api/proxy/${backendId}/never`, {
-        headers: { Authorization: `Bearer ${GATEWAY_SECRET}` },
+        headers: { Authorization: `Bearer ${await tokenFor('app-a')}` },
       });
       expect(response.status).toBe(504);
       const body = await response.json();
@@ -337,7 +347,7 @@ describeIfLoopback('Phase 2: Topics & HTTP streaming', () => {
       const { backendId } = await startV4HttpBackend(wsUrl, 'http-rej', () => {}, { reject: true });
 
       const response = await fetch(`${httpUrl}/api/proxy/${backendId}/denied`, {
-        headers: { Authorization: `Bearer ${GATEWAY_SECRET}` },
+        headers: { Authorization: `Bearer ${await tokenFor('app-a')}` },
       });
       expect(response.status).toBe(502);
       const body = await response.json();
@@ -359,7 +369,7 @@ describeIfLoopback('Phase 2: Topics & HTTP streaming', () => {
       });
 
       const response = await fetch(`${httpUrl}/api/proxy/${backendId}/blob`, {
-        headers: { Authorization: `Bearer ${GATEWAY_SECRET}` },
+        headers: { Authorization: `Bearer ${await tokenFor('app-a')}` },
       });
       expect(response.status).toBe(200);
       const received = Buffer.from(await response.arrayBuffer());
