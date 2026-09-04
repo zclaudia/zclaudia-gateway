@@ -6,10 +6,16 @@ services:
       network: host
     restart: unless-stopped
     ports:
-      - "${GATEWAY_PORT:-3200}:${GATEWAY_PORT:-3200}"
+      # Loopback by default: TLS terminates at the front proxy (ADR-0001) and
+      # trustProxy must never face the open internet. Set GATEWAY_BIND=0.0.0.0
+      # only for proxy-less setups.
+      - "${GATEWAY_BIND:-127.0.0.1}:${GATEWAY_PORT:-3200}:${GATEWAY_PORT:-3200}"
     environment:
       - GATEWAY_SECRET=${GATEWAY_SECRET:?Please set GATEWAY_SECRET in .env}
       - GATEWAY_PORT=${GATEWAY_PORT:-3200}
+      - GATEWAY_ADMIN_TOKEN=${GATEWAY_ADMIN_TOKEN:-}
+      - GATEWAY_TRUST_PROXY=${GATEWAY_TRUST_PROXY:-false}
+      - GATEWAY_ALLOWED_ORIGINS=${GATEWAY_ALLOWED_ORIGINS:-}
       - NTFY_ENABLED=${NTFY_ENABLED:-false}
       - NTFY_URL=${NTFY_URL:-https://ntfy.sh}
       - NTFY_TOPIC=${NTFY_TOPIC:-}
