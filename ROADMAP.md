@@ -245,9 +245,13 @@ response.end
 > ② 快照/事件双发 `resources` Topic（快照带 retain），
 > ③ multipart 上传经 gateway 全程流式（`streamingUpload` 能力协商，desktop 已切换），
 > ④ per-client 消息 channel（kind `zclaudia`，复用虚拟客户端机制，v3 路径共存）。
-> 每个切片均有跨仓 e2e 验证。剩余：desktop/mobile 消费 Topic 与消息 channel（含
-> terminal 路由修复的消费端半边）、凭证从 legacy secret 切 `zgb_`/`zgd_`、
-> `gateway-testing` 抽包（等 Hermes/Comfy Adapter 需要时）、版本兼容矩阵与 v3 弃用条件。
+> 每个切片均有跨仓 e2e 验证。
+>
+> **收官（2026-09-04）**：desktop 消费端（Topic + 消息 channel）完成并合并回 zclaudia
+> main；生产部署上线（gateway.zhvala.space，容器化 Caddy 前置）并经真浏览器网页模式
+> e2e 验证；凭证切换完成后**跳过兼容期直接终局**——v3 协议与共享 secret 认证均整体
+> 删除（单操作者、零遗留对端，"版本兼容矩阵与 v3 弃用条件"随之作废）。
+> 剩余小项：`gateway-testing` 抽包（等 Hermes/Comfy Adapter 需要时）。
 > SDK 已发布至 npm（`@zclaudia/gateway-protocol` / `-client` / `-backend` 0.1.0，2026-09-04）；zclaudia 已从 `link:` 切换到正式版本。
 > 注：zclaudia server 保留了自有传输层（握手驱动的 backoff 重置、SOCKS agent 等
 > 四处语义与 SDK 生命周期不匹配），SDK 在 zclaudia 中当前仅贡献 wire 类型；
