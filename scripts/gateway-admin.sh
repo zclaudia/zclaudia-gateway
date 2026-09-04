@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Credential management for a running gateway (wraps /api/admin/credentials).
 #
-# Required environment:
-#   GATEWAY_URL          e.g. https://gateway.example.com (no trailing slash)
+# Configuration (environment wins; unset values fall back to the repo .env,
+# or GATEWAY_ENV_FILE if set):
+#   GATEWAY_URL          e.g. https://gateway.example.com (no trailing slash);
+#                        defaults to http://127.0.0.1:$GATEWAY_PORT on the host
 #   GATEWAY_ADMIN_TOKEN  admin token (never the shared GATEWAY_SECRET)
 #
 # Usage:
@@ -12,8 +14,21 @@
 #   gateway-admin.sh revoke <credential-id>
 set -euo pipefail
 
-: "${GATEWAY_URL:?set GATEWAY_URL, e.g. https://gateway.example.com}"
-: "${GATEWAY_ADMIN_TOKEN:?set GATEWAY_ADMIN_TOKEN}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="${GATEWAY_ENV_FILE:-$SCRIPT_DIR/../.env}"
+
+# Read one key's last assignment from the .env file, stripping quotes.
+env_lookup() {
+  [ -f "$ENV_FILE" ] || return 0
+  sed -n "s/^[[:space:]]*$1=//p" "$ENV_FILE" | tail -1 \
+    | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/"
+}
+
+: "${GATEWAY_ADMIN_TOKEN:=$(env_lookup GATEWAY_ADMIN_TOKEN)}"
+: "${GATEWAY_PORT:=$(env_lookup GATEWAY_PORT)}"
+: "${GATEWAY_URL:=$(env_lookup GATEWAY_URL)}"
+: "${GATEWAY_URL:=http://127.0.0.1:${GATEWAY_PORT:-3200}}"
+: "${GATEWAY_ADMIN_TOKEN:?set GATEWAY_ADMIN_TOKEN (env or ${ENV_FILE})}"
 
 api() {
   local method="$1" path="$2" body="${3:-}"
