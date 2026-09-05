@@ -1,5 +1,5 @@
 import net from 'node:net';
-import { defineConfig } from 'vitest/config';
+import { configDefaults, defineConfig } from 'vitest/config';
 
 async function canBindLoopback(): Promise<boolean> {
   return await new Promise((resolve) => {
@@ -41,7 +41,10 @@ export default defineConfig(async () => {
       setupFiles: ['./vitest.setup.ts'],
       testTimeout: 15000,
       hookTimeout: 15000,
-      exclude: loopbackAvailable ? [] : [
+      // Always keep configDefaults.exclude (node_modules etc.): replacing it
+      // with [] made vitest collect *.test.js shipped inside dependencies.
+      exclude: loopbackAvailable ? configDefaults.exclude : [
+        ...configDefaults.exclude,
         'src/__tests__/broadcast-subscription.test.ts',
         'src/__tests__/handshake-v2.test.ts',
         'src/__tests__/proxy-streaming-v2.test.ts',

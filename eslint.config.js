@@ -14,4 +14,10 @@ export default tseslint.config(
       'no-empty': ['error', { allowEmptyCatch: true }],
     },
   },
+  {
+    // Admin web UI: DOM/node globals come from tsc lib types; no-undef would
+    // false-positive on them (typescript-eslint guidance).
+    files: ['packages/admin-ui/**/*.{ts,tsx}'],
+    rules: { 'no-undef': 'off' },
+  },
 );

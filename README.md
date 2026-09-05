@@ -40,6 +40,7 @@ mobile ── HTTP /api/proxy ┘      │
 - 撤销立即生效：在线连接被断开（close 1008），后续认证被拒；撤销 `zgb_*` 级联撤销其交换出的 `zga_*`。
 - 凭证在 WS（`peer_hello.gatewaySecret` 字段，名称保留以稳定 wire）与 HTTP（`Bearer <token>`）两侧通用。
 - 管理端点（需 `GATEWAY_ADMIN_TOKEN`，必填——它是签发凭证的信任根）：`POST/GET /api/admin/credentials`、`DELETE /api/admin/credentials/:id`；命令行封装见 [scripts/gateway-admin.sh](scripts/gateway-admin.sh)（`issue-backend` / `issue-device` / `list` / `revoke`，自动读取 `.env`）。
+- **Web 管理控制台**（[ADR-0005](docs/adr/0005-admin-web-ui.md)）：容器镜像内置 UI，访问 `/admin`（本地 `http://localhost:3200/admin`）用管理员令牌登录，即可签发/吊销凭证、查看在线连接与凭证状态。登录用令牌换取 HttpOnly + SameSite=Strict 会话 Cookie（默认 12h，重启即登出），令牌本身不落浏览器；`/api/admin/*` 同时继续接受 Bearer 令牌，CLI 不受影响。源码在 [packages/admin-ui](packages/admin-ui)，开发用 `pnpm --filter @zclaudia/admin-ui dev`；非容器部署需设置 `GATEWAY_ADMIN_UI_DIR` 指向构建产物（`pnpm --filter @zclaudia/admin-ui build`）。
 
 ## 本地开发
 
@@ -62,6 +63,8 @@ docker compose up -d        # 容器部署（读取 .env）
 | `GATEWAY_PORT` | | `3200` | 监听端口 |
 | `GATEWAY_TRUST_PROXY` | | `false` | 信任 `X-Forwarded-For`（仅置于可信反代之后时开启，见 ADR-0001） |
 | `GATEWAY_ALLOWED_ORIGINS` | | 无（通配符） | 逗号分隔的 CORS Origin allowlist，设置后仅列表内 Origin 可跨域（带 credentials） |
+| `GATEWAY_ADMIN_UI_DIR` | | 无（容器镜像内默认 `/app/zclaudia/admin-ui`） | 管理控制台静态产物目录；未设置时网关为纯 API（见 [ADR-0005](docs/adr/0005-admin-web-ui.md)） |
+| `GATEWAY_ADMIN_SESSION_TTL_HOURS` | | `12` | 管理控制台会话时长（小时）；会话在内存中，重启即全部登出 |
 | `ZCLAUDIA_DATA_DIR` | | `~/.zclaudia` | SQLite 数据目录（实际路径 `<dir>/gateway/gateway.db`） |
 | `NTFY_*` | | 见 [.env.example](.env.example) 与 [src/index.ts](src/index.ts) | ntfy 推送通知配置 |
 

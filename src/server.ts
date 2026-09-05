@@ -10,6 +10,7 @@ import type { Socket } from 'net';
 import { WebSocketServer, WebSocket } from 'ws';
 import { v4 as uuidv4 } from 'uuid';
 import crypto from 'crypto';
+import path from 'node:path';
 import express, { Request, Response } from 'express';
 import type {
   PeerHelloMessage,
@@ -28,6 +29,7 @@ import { GatewayStorage, CREDENTIAL_TOKEN_PREFIXES, type CredentialInfo, type Cr
 import { validateGatewayMessage, filterProxyResponseHeaders, PROXY_REQUEST_HEADER_ALLOWLIST } from './validation.js';
 import { GatewayState, type PeerSession } from './state.js';
 import { GatewayPushNotificationService } from './push-notification.js';
+import { AdminSessionStore, ADMIN_SESSION_COOKIE, readSessionCookie } from './admin-session.js';
 
 // ============================================================================
 // Config & Helpers
@@ -63,6 +65,10 @@ interface GatewayConfig {
    * legacy wildcard behavior for backward compatibility.
    */
   allowedOrigins?: string[];
+  /** Serve the admin web UI static bundle from this directory at /admin. Unset = API-only (ADR-0005). */
+  adminStaticDir?: string;
+  /** Admin web UI session TTL. Default 12h. Fixed expiry, no sliding renewal. */
+  adminSessionTtlMs?: number;
 }
 
 function isVitestProcess(): boolean {
@@ -135,6 +141,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
   const maxChannelsPerPeer = config.maxChannelsPerPeer ?? 32;
   const channelByteRateLimit = config.channelByteRateLimit;
   const trustProxy = config.trustProxy ?? false;
+  const adminSessions = new AdminSessionStore(config.adminSessionTtlMs ?? 12 * 60 * 60 * 1000);
 
   const app = express();
   app.disable('x-powered-by');
@@ -313,21 +320,146 @@ export function createGatewayServer(config: GatewayConfig): Server {
     }
   });
 
-  // --- Admin: credential management (ADR-0002) ---
+  // --- Admin: credential management (ADR-0002), web UI session login (ADR-0005) ---
+
+  /**
+   * The request host, as seen through the proxy chain. Same-origin checks and
+   * cookie Secure flags both depend on it.
+   */
+  function requestIsSecure(req: Request): boolean {
+    if (trustProxy) return req.headers['x-forwarded-proto'] === 'https';
+    return req.secure;
+  }
+
+  /**
+   * Defense-in-depth against CSRF for cookie-authenticated requests.
+   * SameSite=Strict already keeps the cookie off cross-site requests; this
+   * additionally rejects cookie-authenticated mutations whose Origin (browsers
+   * always send it on POST/DELETE) does not match this deployment's origins.
+   * Non-browser clients are unaffected: they authenticate with Bearer.
+   */
+  function isTrustedOrigin(req: Request): boolean {
+    const origin = req.headers.origin;
+    if (!origin) return false;
+    if (allowedOrigins && allowedOrigins.length > 0) return allowedOrigins.includes(origin);
+    try {
+      return new URL(origin).host === req.headers.host;
+    } catch {
+      return false;
+    }
+  }
+
+  function isMutatingRequest(req: Request): boolean {
+    return req.method !== 'GET' && req.method !== 'HEAD' && req.method !== 'OPTIONS';
+  }
+
   function requireAdmin(req: Request, res: Response, next: () => void): void {
     const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
     const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ') || !safeCompare(authHeader.slice(7), config.adminToken)) {
+    const bearerOk = !!authHeader
+      && authHeader.startsWith('Bearer ')
+      && safeCompare(authHeader.slice(7), config.adminToken);
+    if (bearerOk) {
+      next();
+      return;
+    }
+    // Web UI path: a valid admin session cookie also grants admin access.
+    const sessionId = readSessionCookie(req, ADMIN_SESSION_COOKIE);
+    if (sessionId && adminSessions.validate(sessionId)) {
+      if (isMutatingRequest(req) && !isTrustedOrigin(req)) {
+        audit('admin.csrf_rejected', { ip: clientIp, method: req.method, path: req.path });
+        res.status(403).json({ success: false, error: { code: 'FORBIDDEN', message: 'Origin check failed' } });
+        return;
+      }
+      next();
+      return;
+    }
+    if (!checkAuthFailLimit(clientIp)) {
+      res.status(429).json({ success: false, error: { code: 'RATE_LIMITED', message: 'Too many requests' } });
+      return;
+    }
+    audit('admin.auth_failed', { ip: clientIp });
+    res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Invalid admin token' } });
+    return;
+  }
+
+  // Login: exchange the admin token (shown once in the form) for a session
+  // cookie, so the long-lived token never persists in the browser.
+  app.post('/api/admin/session', (req: Request, res: Response) => {
+    const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
+    const token = typeof (req.body as { token?: unknown } | undefined)?.token === 'string'
+      ? (req.body as { token: string }).token
+      : '';
+    if (!token || !safeCompare(token, config.adminToken)) {
       if (!checkAuthFailLimit(clientIp)) {
         res.status(429).json({ success: false, error: { code: 'RATE_LIMITED', message: 'Too many requests' } });
         return;
       }
-      audit('admin.auth_failed', { ip: clientIp });
+      audit('admin.session_login_failed', { ip: clientIp });
       res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Invalid admin token' } });
       return;
     }
-    next();
-  }
+    const session = adminSessions.create();
+    audit('admin.session_created', { ip: clientIp, expiresAt: session.expiresAt });
+    res.cookie(ADMIN_SESSION_COOKIE, session.id, {
+      httpOnly: true,
+      sameSite: 'strict',
+      secure: requestIsSecure(req),
+      path: '/',
+      maxAge: session.expiresAt - Date.now(),
+    });
+    res.json({ success: true, data: { expiresAt: session.expiresAt } });
+  });
+
+  // Session probe for the SPA (decide login vs. admin view on boot).
+  app.get('/api/admin/session', (req: Request, res: Response) => {
+    const sessionId = readSessionCookie(req, ADMIN_SESSION_COOKIE);
+    if (!sessionId || !adminSessions.validate(sessionId)) {
+      res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'No active session' } });
+      return;
+    }
+    res.json({ success: true, data: { expiresAt: adminSessions.expiresAt(sessionId) } });
+  });
+
+  app.delete('/api/admin/session', (req: Request, res: Response) => {
+    const sessionId = readSessionCookie(req, ADMIN_SESSION_COOKIE);
+    if (sessionId && adminSessions.validate(sessionId)) {
+      audit('admin.session_destroyed', { ip: req.ip || req.socket.remoteAddress || 'unknown' });
+      adminSessions.destroy(sessionId);
+    }
+    res.clearCookie(ADMIN_SESSION_COOKIE, { path: '/' });
+    res.json({ success: true });
+  });
+
+  // Read-only dashboard data for the admin web UI (ADR-0005).
+  app.get('/api/admin/overview', requireAdmin, (_req: Request, res: Response) => {
+    const now = Date.now();
+    const credentials = storage.listCredentials();
+    const counters = { total: credentials.length, active: 0, revoked: 0, expired: 0, byType: {} as Record<string, number> };
+    for (const credential of credentials) {
+      if (credential.revokedAt) counters.revoked++;
+      else if (credential.expiresAt !== null && credential.expiresAt <= now) counters.expired++;
+      else counters.active++;
+      counters.byType[credential.type] = (counters.byType[credential.type] ?? 0) + 1;
+    }
+    res.json({
+      success: true,
+      data: {
+        backends: state.registry.items.size,
+        peers: [...state.peers.values()].map((peer) => ({
+          peerSessionId: peer.peerSessionId,
+          namespace: peer.namespace,
+          peerType: peer.peerType,
+          name: peer.name,
+          deviceId: peer.deviceId,
+          protocolVersion: peer.protocolVersion,
+          backendId: peer.backendId ?? null,
+        })),
+        credentials: counters,
+        uptimeSec: Math.floor(process.uptime()),
+      },
+    });
+  });
 
   app.post('/api/admin/credentials', requireAdmin, (req: Request, res: Response) => {
     const { type, namespace, name, ttlDays } = (req.body ?? {}) as {
@@ -482,6 +614,23 @@ export function createGatewayServer(config: GatewayConfig): Server {
       res.status(500).json({ success: false, error: { code: 'PROXY_ERROR', message: 'Failed to proxy request' } });
     }
   });
+
+  // --- Admin web UI static hosting (ADR-0005, optional) ---
+  // Unset adminStaticDir keeps the gateway API-only: /admin falls through to
+  // the 404 handler below, exactly as before the web UI existed.
+  if (config.adminStaticDir) {
+    const adminDir = config.adminStaticDir;
+    // redirect:false keeps /admin hitting the sendFile fallback below instead
+    // of express.static's trailing-slash redirect round trip.
+    app.use('/admin', express.static(adminDir, { redirect: false }));
+    // The SPA uses hash routing, so only /admin itself needs the entry file.
+    app.get('/admin', (_req: Request, res: Response) => {
+      res.sendFile(path.resolve(adminDir, 'index.html'));
+    });
+    app.get('/', (_req: Request, res: Response) => {
+      res.redirect('/admin');
+    });
+  }
 
   app.use((_req: Request, res: Response) => { res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Not found' } }); });
   app.use((err: Error, _req: Request, res: Response, _next: () => void) => { console.error('[Gateway] Unhandled error:', err); res.status(500).json({ success: false, error: { code: 'INTERNAL_ERROR', message: 'Internal server error' } }); });
@@ -944,6 +1093,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
     clearInterval(leaseCheckInterval);
     clearInterval(registryPollInterval);
     clearInterval(rateLimitCleanup);
+    adminSessions.dispose();
     for (const ch of [...channels.values()]) teardownChannel(ch.channelId, 'closed');
     channelWss.close();
     state.destroy();

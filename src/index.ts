@@ -95,14 +95,32 @@ function parseNotificationConfigFromEnv(): Partial<NotificationConfig> {
 
 const allowedOrigins = parseListEnv(process.env.GATEWAY_ALLOWED_ORIGINS);
 
+// Admin web UI (ADR-0005): unset dir keeps the gateway API-only.
+const ADMIN_UI_DIR = process.env.GATEWAY_ADMIN_UI_DIR?.trim() || undefined;
+
+let adminSessionTtlMs: number | undefined;
+if (process.env.GATEWAY_ADMIN_SESSION_TTL_HOURS?.trim()) {
+  const hours = parseFloat(process.env.GATEWAY_ADMIN_SESSION_TTL_HOURS);
+  if (isNaN(hours) || hours <= 0) {
+    console.error(`Error: GATEWAY_ADMIN_SESSION_TTL_HOURS must be a positive number, got: ${process.env.GATEWAY_ADMIN_SESSION_TTL_HOURS}`);
+    process.exit(1);
+  }
+  adminSessionTtlMs = hours * 60 * 60 * 1000;
+}
+
 const server = createGatewayServer({
   adminToken: ADMIN_TOKEN,
   notificationConfig: parseNotificationConfigFromEnv(),
   trustProxy: process.env.GATEWAY_TRUST_PROXY === 'true',
   allowedOrigins: allowedOrigins.length > 0 ? allowedOrigins : undefined,
+  adminStaticDir: ADMIN_UI_DIR,
+  adminSessionTtlMs,
 });
 
 server.listen(PORT, () => {
   console.log(`Gateway server listening on port ${PORT}`);
   console.log(`WebSocket endpoint: ws://localhost:${PORT}/ws`);
+  if (ADMIN_UI_DIR) {
+    console.log(`Admin web UI: http://localhost:${PORT}/admin (static dir: ${ADMIN_UI_DIR})`);
+  }
 });

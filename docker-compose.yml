@@ -15,6 +15,10 @@ services:
       - GATEWAY_PORT=${GATEWAY_PORT:-3200}
       - GATEWAY_TRUST_PROXY=${GATEWAY_TRUST_PROXY:-false}
       - GATEWAY_ALLOWED_ORIGINS=${GATEWAY_ALLOWED_ORIGINS:-}
+      # Admin web UI (ADR-0005): the image ships the bundle and defaults
+      # GATEWAY_ADMIN_UI_DIR=/app/zclaudia/admin-ui. For an API-only gateway,
+      # override it here with an empty value.
+      - GATEWAY_ADMIN_SESSION_TTL_HOURS=${GATEWAY_ADMIN_SESSION_TTL_HOURS:-}
       - NTFY_ENABLED=${NTFY_ENABLED:-false}
       - NTFY_URL=${NTFY_URL:-https://ntfy.sh}
       - NTFY_TOPIC=${NTFY_TOPIC:-}

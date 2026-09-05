@@ -42,7 +42,7 @@
 - 保存或向远程客户端暴露本地服务的私有 Token；
 - 在核心路由中维护 `if app === ...` 形式的应用分支；
 - 成为允许访问任意地址和端口的开放代理；
-- 在第一阶段同时承担应用 UI 静态资源托管；
+- 承担**应用** UI 静态资源托管（例外：网关自身的管理控制台静态产物由网关托管，见 [ADR-0005](docs/adr/0005-admin-web-ui.md)——它是运维面，不是业务应用）；
 - 为追求多实例而提前引入尚未验证必要性的分布式组件；
 - 在出现第二个真实租户之前实现 Workspace/Tenant 管理和 ACL 机制（协议层只预留字段）。
 
@@ -429,7 +429,7 @@ Phase 4 Hermes   Phase 5 ComfyUI
 2. ✅ v4 Backend Tunnel 基于 WebSocket（QUIC/HTTP3 列为 ADR-0001 的重评估触发条件）；
 3. ✅ 前置反向代理终止 TLS（[ADR-0001](docs/adr/0001-deployment-and-tls-termination.md)；实际部署备注：origin 带端口、Caddy 容器化）；
 4. ✅ Gateway 提供最小认证服务，不接 IdP（[ADR-0002](docs/adr/0002-identity-issuance.md)）；
-5. ✅ Device/Backend/Backend-access 凭证签发与级联撤销已实现（ADR-0002）；浏览器 Session 留待 Phase 5；
+5. ✅ Device/Backend/Backend-access 凭证签发与级联撤销已实现（ADR-0002）；管理面 Cookie 会话已随 Web 管理控制台落地（[ADR-0005](docs/adr/0005-admin-web-ui.md)）；peer 隧道浏览器 Session 仍留待 Phase 5；
 6. ✅ Backend 唯一键 =（tenant 预留, namespace, instanceId, environment），UUID 标识（docs/protocol-v4.md §2）；
 7. ✅ 不需要：选择了每 Channel 一连接，无自研 framing/flow-control window；
 8. ✅ 已作废：v3 兼容层曾内置于 Gateway，随 v3 删除一并移除；
