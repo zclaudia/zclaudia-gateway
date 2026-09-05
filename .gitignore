@@ -9,3 +9,4 @@ coverage/
 *.db-journal
 .deploy-version*
 .DS_Store
+.zcode/
