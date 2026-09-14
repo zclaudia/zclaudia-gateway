@@ -7,7 +7,7 @@
   "packageManager": "pnpm@9.15.0",
   "scripts": {
     "dev": "tsx watch --env-file=.env src/index.ts",
-    "build": "tsc && pnpm -r build",
+    "build": "pnpm -r build && tsc",
     "start": "node dist/index.js",
     "clean": "rm -rf dist",
     "lint": "eslint src packages",
