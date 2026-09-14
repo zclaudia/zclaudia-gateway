@@ -1,7 +1,7 @@
 {
   "name": "@zclaudia/gateway-protocol",
-  "version": "0.1.0",
-  "description": "Wire types and constants for Gateway Protocol v4 (channels, topics, streaming HTTP). Zero dependencies.",
+  "version": "0.2.0",
+  "description": "Canonical wire types and constants for Gateway Protocol v4: handshake, registry, heartbeat, control plane, channels, topics, streaming HTTP, plus auth/admin/notification service DTOs. Zero dependencies.",
   "keywords": [
     "gateway",
     "websocket",
@@ -22,6 +22,21 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
+    },
+    "./auth": {
+      "types": "./dist/auth.d.ts",
+      "import": "./dist/auth.js",
+      "default": "./dist/auth.js"
+    },
+    "./admin": {
+      "types": "./dist/admin.d.ts",
+      "import": "./dist/admin.js",
+      "default": "./dist/admin.js"
+    },
+    "./notifications": {
+      "types": "./dist/notifications.d.ts",
+      "import": "./dist/notifications.js",
+      "default": "./dist/notifications.js"
     }
   },
   "files": [
