@@ -1,6 +1,9 @@
 import { createGatewayServer } from './server.js';
-import { DEFAULT_NOTIFICATION_CONFIG } from '@zclaudia/protocol/notifications';
-import type { NotificationAuthMode, NotificationConfig } from '@zclaudia/protocol/notifications';
+import { DEFAULT_NOTIFICATION_CONFIG } from './push-notification.js';
+import type {
+  GatewayNotificationAuthMode,
+  GatewayNotificationConfig,
+} from '@zclaudia/gateway-protocol/notifications';
 
 const PORT = parseInt(process.env.GATEWAY_PORT || '3200', 10);
 if (isNaN(PORT) || PORT < 1 || PORT > 65535) {
@@ -23,7 +26,7 @@ function parseBooleanEnv(value: string | undefined, fallback: boolean): boolean 
   return fallback;
 }
 
-function parseAuthModeEnv(value: string | undefined): NotificationAuthMode {
+function parseAuthModeEnv(value: string | undefined): GatewayNotificationAuthMode {
   const normalized = value?.trim().toLowerCase();
   if (!normalized || normalized === 'none') return 'none';
   if (normalized === 'bearer' || normalized === 'basic') return normalized;
@@ -39,7 +42,7 @@ function parseListEnv(value: string | undefined): string[] {
     .filter((entry) => entry !== '');
 }
 
-function parseSeverityEnv(value: string | undefined): NotificationConfig['minSeverity'] {
+function parseSeverityEnv(value: string | undefined): GatewayNotificationConfig['minSeverity'] {
   const normalized = value?.trim().toLowerCase();
   if (!normalized) return undefined;
   if (normalized === 'info' || normalized === 'success' || normalized === 'warning' || normalized === 'error') {
@@ -49,7 +52,7 @@ function parseSeverityEnv(value: string | undefined): NotificationConfig['minSev
   process.exit(1);
 }
 
-function parseNotificationConfigFromEnv(): Partial<NotificationConfig> {
+function parseNotificationConfigFromEnv(): Partial<GatewayNotificationConfig> {
   const ntfyUrl = process.env.NTFY_URL?.trim();
   if (ntfyUrl) {
     try {

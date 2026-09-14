@@ -22,7 +22,10 @@ import {
 
 export interface GatewayBackendOptions {
   url: string;
-  /** Credential token (zgb_*) or the legacy shared secret. */
+  /**
+   * Backend credential: an enrollment token (zgb_) or a backend-access
+   * token (zga_). Shared secrets and the admin token are not accepted.
+   */
   credential: string;
   /**
    * When the credential is an enrollment token (zgb_*), exchange it for a
@@ -100,16 +103,16 @@ export class GatewayBackend {
   }
 
   /**
-   * Raw tap on inbound control messages (v3 message flow passthrough for
-   * incremental migrations). Messages the SDK consumes internally
-   * (channel_offer) are still delivered here.
+   * Raw tap on inbound control messages (e.g. the directed
+   * `backend_server_message` fallback for incremental migrations). Messages
+   * the SDK consumes internally (channel_offer) are still delivered here.
    */
   onMessage(handler: (message: Record<string, unknown>) => void): () => void {
     this.messageHandlers.push(handler);
     return () => { this.messageHandlers = this.messageHandlers.filter((h) => h !== handler); };
   }
 
-  /** Send a raw control message (v3 message flow passthrough). */
+  /** Send a raw control message (e.g. the directed fallback path). */
   send(message: Record<string, unknown>): void {
     if (!this.socket || this.socket.readyState !== 1) throw new Error('Not connected');
     this.socket.send(JSON.stringify(message));

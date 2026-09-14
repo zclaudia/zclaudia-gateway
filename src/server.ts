@@ -13,18 +13,19 @@ import crypto from 'crypto';
 import path from 'node:path';
 import express, { Request, Response } from 'express';
 import type {
-  PeerHelloMessage,
-  PeerReadyMessage,
-  RegistrySyncPayload,
-  BackendPresence,
-  RegistrySnapshotMessage,
   BackendHeartbeatMessage,
-  HeartbeatAckMessage,
+  BackendPresenceV4,
   BackendServerMessage,
-  GatewayErrorMessage,
+  GatewayErrorV4,
+  HeartbeatAckMessage,
+  PeerHelloV4,
+  PeerReadyV4,
+  RegistrySnapshotV4,
+} from '@zclaudia/gateway-protocol';
+import type {
+  GatewayNotificationConfig as NotificationConfig,
   PushNotificationRequestMessage,
-} from '@zclaudia/protocol/gateway';
-import type { NotificationConfig } from '@zclaudia/protocol/notifications';
+} from '@zclaudia/gateway-protocol/notifications';
 import { GatewayStorage, CREDENTIAL_TOKEN_PREFIXES, type CredentialInfo, type CredentialType } from './storage.js';
 import { validateGatewayMessage, filterProxyResponseHeaders, PROXY_REQUEST_HEADER_ALLOWLIST } from './validation.js';
 import { GatewayState, type PeerSession } from './state.js';
@@ -95,7 +96,7 @@ function sendToWs(ws: WebSocket, message: unknown): void {
 
 /** Proxy failure carrying the HTTP status the client should receive. */
 
-function validatePeerHelloMessage(message: unknown): string | null {
+function validatePeerHelloV4(message: unknown): string | null {
   if (!message || typeof message !== 'object') return 'peer_hello must be an object';
   const msg = message as Record<string, unknown>;
   if (msg.type !== 'peer_hello') return 'First message must be peer_hello';
@@ -848,7 +849,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
 
   function handleChannelOpen(peer: PeerSession, msg: { target: string; kind?: string }): void {
     if (peer.protocolVersion !== 4) {
-      sendToWs(peer.ws, { type: 'gateway_error', code: 'INVALID_MESSAGE', message: 'channel_open requires protocol v4' } satisfies GatewayErrorMessage);
+      sendToWs(peer.ws, { type: 'gateway_error', code: 'INVALID_MESSAGE', message: 'channel_open requires protocol v4' } satisfies GatewayErrorV4);
       return;
     }
     const presence = state.registry.items.get(msg.target);
@@ -856,11 +857,11 @@ export function createGatewayServer(config: GatewayConfig): Server {
     const backendPeer = lease ? state.peers.get(lease.peerSessionId) : undefined;
     // Same non-oracle answer for nonexistent, offline, and cross-namespace.
     if (!presence || !lease || !backendPeer || presence.namespace !== peer.namespace) {
-      sendToWs(peer.ws, { type: 'gateway_error', code: 'BACKEND_OFFLINE', message: `Backend ${msg.target} not found or offline` } satisfies GatewayErrorMessage);
+      sendToWs(peer.ws, { type: 'gateway_error', code: 'BACKEND_OFFLINE', message: `Backend ${msg.target} not found or offline` } satisfies GatewayErrorV4);
       return;
     }
     if (countChannelsForPeer(peer.peerSessionId) >= maxChannelsPerPeer) {
-      sendToWs(peer.ws, { type: 'gateway_error', code: 'RATE_LIMITED', message: 'Too many open channels' } satisfies GatewayErrorMessage);
+      sendToWs(peer.ws, { type: 'gateway_error', code: 'RATE_LIMITED', message: 'Too many open channels' } satisfies GatewayErrorV4);
       return;
     }
     const channelId = crypto.randomBytes(16).toString('hex');
@@ -1024,12 +1025,12 @@ export function createGatewayServer(config: GatewayConfig): Server {
 
   function handleTopicSubscribe(peer: PeerSession, msg: { backendId: string; topic: string }): void {
     if (peer.protocolVersion !== 4) {
-      sendToWs(peer.ws, { type: 'gateway_error', code: 'INVALID_MESSAGE', message: 'topic_subscribe requires protocol v4' } satisfies GatewayErrorMessage);
+      sendToWs(peer.ws, { type: 'gateway_error', code: 'INVALID_MESSAGE', message: 'topic_subscribe requires protocol v4' } satisfies GatewayErrorV4);
       return;
     }
     const presence = state.registry.items.get(msg.backendId);
     if (!presence || presence.namespace !== peer.namespace) {
-      sendToWs(peer.ws, { type: 'gateway_error', code: 'BACKEND_OFFLINE', message: `Backend ${msg.backendId} not found or offline` } satisfies GatewayErrorMessage);
+      sendToWs(peer.ws, { type: 'gateway_error', code: 'BACKEND_OFFLINE', message: `Backend ${msg.backendId} not found or offline` } satisfies GatewayErrorV4);
       return;
     }
     let topics = topicSubs.get(msg.backendId);
@@ -1142,20 +1143,20 @@ export function createGatewayServer(config: GatewayConfig): Server {
       try {
         const message = JSON.parse(data.toString());
         if (!peerSessionId) {
-          const validationError = validatePeerHelloMessage(message);
+          const validationError = validatePeerHelloV4(message);
           if (validationError) {
-            sendToWs(ws, { type: 'gateway_error', code: 'INVALID_MESSAGE', message: validationError } satisfies GatewayErrorMessage);
+            sendToWs(ws, { type: 'gateway_error', code: 'INVALID_MESSAGE', message: validationError } satisfies GatewayErrorV4);
             ws.close(1008, 'Invalid peer_hello');
             return;
           }
           clearTimeout(authTimeout);
-          peerSessionId = handlePeerHello(ws, message as PeerHelloMessage);
+          peerSessionId = handlePeerHello(ws, message as PeerHelloV4);
           return;
         }
         handlePeerMessage(peerSessionId, message);
       } catch (error) {
         console.error('[Gateway] Message parse error:', error);
-        sendToWs(ws, { type: 'gateway_error', code: 'INVALID_MESSAGE', message: 'Invalid message format' } satisfies GatewayErrorMessage);
+        sendToWs(ws, { type: 'gateway_error', code: 'INVALID_MESSAGE', message: 'Invalid message format' } satisfies GatewayErrorV4);
         if (!peerSessionId) {
           ws.close(1008, 'Invalid message format');
         }
@@ -1238,27 +1239,27 @@ export function createGatewayServer(config: GatewayConfig): Server {
   // Peer Hello
   // ========================================================================
 
-  function handlePeerHello(ws: WebSocket, message: PeerHelloMessage): string | null {
+  function handlePeerHello(ws: WebSocket, message: PeerHelloV4): string | null {
     // The gatewaySecret field carries an issued credential token
     // (zgd_/zgb_/zga_ prefix); the field name is kept for wire stability.
     const auth = resolveToken(message.gatewaySecret);
     if (!auth) {
       audit('peer.auth_failed', { namespace: message.namespace, peerType: message.peerType });
-      sendToWs(ws, { type: 'gateway_error', code: 'UNAUTHORIZED', message: 'Invalid gateway secret' } satisfies GatewayErrorMessage); ws.close(); return null;
+      sendToWs(ws, { type: 'gateway_error', code: 'UNAUTHORIZED', message: 'Invalid gateway secret' } satisfies GatewayErrorV4); ws.close(); return null;
     }
     // Namespace derives from the server-side credential record; a declared
     // namespace that disagrees is an error, never a grant.
     if (auth.credential.namespace !== message.namespace) {
       audit('peer.namespace_mismatch', { credentialId: auth.credential.id, declared: message.namespace });
-      sendToWs(ws, { type: 'gateway_error', code: 'UNAUTHORIZED', message: 'Namespace not permitted by credential' } satisfies GatewayErrorMessage); ws.close(); return null;
+      sendToWs(ws, { type: 'gateway_error', code: 'UNAUTHORIZED', message: 'Namespace not permitted by credential' } satisfies GatewayErrorV4); ws.close(); return null;
     }
     // A device credential must never be able to register (or impersonate) a backend.
     if (message.peerType === 'client+backend' && auth.credential.type !== 'backend' && auth.credential.type !== 'backend-access') {
       audit('peer.backend_registration_denied', { credentialId: auth.credential.id });
-      sendToWs(ws, { type: 'gateway_error', code: 'UNAUTHORIZED', message: 'This credential cannot register a backend' } satisfies GatewayErrorMessage); ws.close(); return null;
+      sendToWs(ws, { type: 'gateway_error', code: 'UNAUTHORIZED', message: 'This credential cannot register a backend' } satisfies GatewayErrorV4); ws.close(); return null;
     }
     if (message.protocolVersion !== 4) {
-      sendToWs(ws, { type: 'gateway_error', code: 'PROTOCOL_VERSION_MISMATCH', message: `Expected protocol version 4, got ${message.protocolVersion}` } satisfies GatewayErrorMessage); ws.close(); return null;
+      sendToWs(ws, { type: 'gateway_error', code: 'PROTOCOL_VERSION_MISMATCH', message: `Expected protocol version 4, got ${message.protocolVersion}` } satisfies GatewayErrorV4); ws.close(); return null;
     }
     const peerSessionId = uuidv4();
     const recoveryToken = crypto.randomBytes(32).toString('hex');
@@ -1279,7 +1280,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
       isAlive: true,
     };
 
-    let backendInfo: PeerReadyMessage['backend'] | undefined;
+    let backendInfo: PeerReadyV4['backend'] | undefined;
     if (peerType === 'client+backend' && message.backend) {
       // Stable UUID keyed by (namespace, instance, environment).
       const backendId = storage.getOrCreateBackendIdV4({ namespace: message.namespace, instanceId: identity.instanceId, environment: channel, name: identity.name });
@@ -1291,15 +1292,15 @@ export function createGatewayServer(config: GatewayConfig): Server {
       }
       state.addLease({ backendId, epoch, peerSessionId, leaseTtlMs: state.config.defaultLeaseTtlMs, lastHeartbeatAt: Date.now(), leaseTimer: null });
       // gatewayProtocolVersion lets clients feature-detect from presence.
-      const presence: BackendPresence & { gatewayProtocolVersion: number } = { namespace: message.namespace, backendId, instanceId: identity.instanceId, deviceId: identity.deviceId, name: identity.name || '', channel, visible: message.backend.visible, capabilities: message.backend.capabilities, backendProtocolVersion: message.backend.backendProtocolVersion, minClientProtocolVersion: message.backend.minClientProtocolVersion, epoch, connectedAt: Date.now(), lastSeenAt: Date.now(), gatewayProtocolVersion: peer.protocolVersion };
+      const presence: BackendPresenceV4 = { namespace: message.namespace, backendId, instanceId: identity.instanceId, deviceId: identity.deviceId, name: identity.name || '', channel, visible: message.backend.visible, capabilities: message.backend.capabilities, backendProtocolVersion: message.backend.backendProtocolVersion, minClientProtocolVersion: message.backend.minClientProtocolVersion, epoch, connectedAt: Date.now(), lastSeenAt: Date.now(), gatewayProtocolVersion: peer.protocolVersion };
       state.registryUpsert(presence);
       backendInfo = { backendId, epoch, leaseTtlMs: state.config.defaultLeaseTtlMs };
     }
 
     state.addPeer(peer);
     recoveryTokens.set(recoveryToken, peerSessionId);
-    const registrySync: RegistrySyncPayload = { items: state.getRegistrySnapshot(peer.namespace) };
-    const ready: PeerReadyMessage = { type: 'peer_ready', protocolVersion: peer.protocolVersion, peerSessionId, recoveryToken, backend: backendInfo, registrySync };
+    const registrySync: PeerReadyV4["registrySync"] = { items: state.getRegistrySnapshot(peer.namespace) };
+    const ready: PeerReadyV4 = { type: 'peer_ready', protocolVersion: peer.protocolVersion, peerSessionId, recoveryToken, backend: backendInfo, registrySync };
     sendToWs(ws, ready);
 
     if (peer.backendId) {
@@ -1325,7 +1326,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
     const validationError = validateGatewayMessage(message);
     if (validationError) {
       audit('message.invalid', { peerSessionId, type: message?.type, error: validationError });
-      sendToWs(peer.ws, { type: 'gateway_error', code: 'INVALID_MESSAGE', message: validationError } satisfies GatewayErrorMessage);
+      sendToWs(peer.ws, { type: 'gateway_error', code: 'INVALID_MESSAGE', message: validationError } satisfies GatewayErrorV4);
       return;
     }
     switch (message.type) {
@@ -1340,7 +1341,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
       case 'topic_unsubscribe': handleTopicUnsubscribe(peer, message); break;
       case 'topic_publish': handleTopicPublish(peer, message); break;
       case 'ping': sendToWs(peer.ws, { type: 'pong', ts: message.ts }); break;
-      default: sendToWs(peer.ws, { type: 'gateway_error', code: 'INVALID_MESSAGE', message: `Unknown message type: ${message.type}` } satisfies GatewayErrorMessage);
+      default: sendToWs(peer.ws, { type: 'gateway_error', code: 'INVALID_MESSAGE', message: `Unknown message type: ${message.type}` } satisfies GatewayErrorV4);
     }
   }
 
@@ -1366,7 +1367,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
   // ========================================================================
 
   function handleRequestRegistrySnapshot(peer: PeerSession): void {
-    sendToWs(peer.ws, { type: 'registry_snapshot', items: state.getRegistrySnapshot(peer.namespace) } satisfies RegistrySnapshotMessage);
+    sendToWs(peer.ws, { type: 'registry_snapshot', items: state.getRegistrySnapshot(peer.namespace) } satisfies RegistrySnapshotV4);
   }
 
   function handleBackendServerMessage(peer: PeerSession, msg: BackendServerMessage): void {
@@ -1394,7 +1395,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
         type: 'gateway_error',
         code: 'INVALID_MESSAGE',
         message: 'push_notification_request is only allowed from backends',
-      } satisfies GatewayErrorMessage);
+      } satisfies GatewayErrorV4);
       return;
     }
     void pushNotificationService.notify(msg.event);
@@ -1449,7 +1450,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
 
   function broadcastRegistrySnapshot(excludePeerSessionId?: string): void {
     // Each peer only ever sees its own namespace's slice of the registry.
-    const perNamespace = new Map<string, RegistrySnapshotMessage>();
+    const perNamespace = new Map<string, RegistrySnapshotV4>();
     for (const peer of state.peers.values()) {
       if (peer.peerSessionId === excludePeerSessionId) continue;
       let msg = perNamespace.get(peer.namespace);

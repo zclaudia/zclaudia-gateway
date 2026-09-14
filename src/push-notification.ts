@@ -1,8 +1,25 @@
-import type { PushNotificationRequestMessage } from '@zclaudia/protocol/gateway';
-import { DEFAULT_NOTIFICATION_CONFIG } from '@zclaudia/protocol/notifications';
-import type { NotificationAuthMode, NotificationConfig, NotificationSeverity } from '@zclaudia/protocol/notifications';
+import type { PushNotificationRequestMessage } from '@zclaudia/gateway-protocol/notifications';
+import type {
+  GatewayNotificationAuthMode as NotificationAuthMode,
+  GatewayNotificationConfig as NotificationConfig,
+  GatewayNotificationSeverity as NotificationSeverity,
+} from '@zclaudia/gateway-protocol/notifications';
 
 type NotifyEvent = PushNotificationRequestMessage['event'];
+
+/** Defaults for the gateway notification service (gateway-internal). */
+export const DEFAULT_NOTIFICATION_CONFIG: NotificationConfig = {
+  enabled: false,
+  ntfyUrl: 'https://ntfy.sh',
+  ntfyTopic: '',
+  ntfyAuthMode: 'none',
+  ntfyPublishToken: '',
+  ntfySubscribeToken: '',
+  ntfyUsername: '',
+  ntfyPassword: '',
+  eventAllowlist: [],
+  eventDenylist: [],
+};
 
 const SEVERITY_ORDER: Record<NotificationSeverity, number> = {
   info: 0,

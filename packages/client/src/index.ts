@@ -30,7 +30,7 @@ export type { SocketFactory, WebSocketLike } from './socket.js';
 export interface GatewayClientOptions {
   /** Gateway base URL (http(s):// or ws(s)://). */
   url: string;
-  /** Credential token (zgd_*) or the legacy shared secret. */
+  /** Issued credential token (zgd_ device credential or an exchanged zga_ access token). Shared secrets and the admin token are not accepted. */
   credential: string;
   namespace: string;
   identity: { deviceId: string; instanceId: string; name?: string };

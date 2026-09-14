@@ -1,23 +1,25 @@
-/** Mirrors CredentialRecord from gateway src/storage.ts (type is not published). */
-export type CredentialType = 'device' | 'backend' | 'backend-access';
+/**
+ * UI-side aliases of the canonical admin/auth DTOs from
+ * @zclaudia/gateway-protocol, plus presentation-only helpers. The wire
+ * shapes are owned by the protocol package; this file keeps only what is
+ * specific to rendering the admin SPA.
+ */
 
-export const CREDENTIAL_TOKEN_PREFIXES: Record<CredentialType, string> = {
-  device: 'zgd_',
-  backend: 'zgb_',
-  'backend-access': 'zga_',
-};
-
-export interface CredentialRecord {
-  id: string;
-  type: CredentialType;
-  namespace: string;
-  name: string;
-  parentId: string | null;
-  createdAt: number;
-  expiresAt: number | null;
-  revokedAt: number | null;
-  lastUsedAt: number | null;
-}
+export type {
+  AdminCredentialCounters,
+  AdminOverview,
+  AdminOverviewPeer,
+  AdminSessionInfo,
+  IssueCredentialRequest,
+  IssuedGatewayCredential as IssuedCredential,
+} from '@zclaudia/gateway-protocol/admin';
+export type { AdminOverview as Overview } from '@zclaudia/gateway-protocol/admin';
+export type {
+  GatewayCredentialInfo as CredentialRecord,
+  GatewayCredentialType as CredentialType,
+} from '@zclaudia/gateway-protocol/auth';
+export { GATEWAY_CREDENTIAL_TOKEN_PREFIXES as CREDENTIAL_TOKEN_PREFIXES } from '@zclaudia/gateway-protocol/auth';
+import type { GatewayCredentialInfo as CredentialRecord } from '@zclaudia/gateway-protocol/auth';
 
 export type CredentialStatus = 'active' | 'revoked' | 'expired';
 
@@ -25,39 +27,4 @@ export function credentialStatus(c: CredentialRecord, now: number = Date.now()):
   if (c.revokedAt !== null) return 'revoked';
   if (c.expiresAt !== null && c.expiresAt <= now) return 'expired';
   return 'active';
-}
-
-export interface IssueCredentialRequest {
-  type: 'device' | 'backend';
-  namespace: string;
-  name?: string;
-  ttlDays?: number | null;
-}
-
-export interface IssuedCredential extends CredentialRecord {
-  /** Plaintext token — returned exactly once at issuance, never again. */
-  token: string;
-}
-
-export interface OverviewPeer {
-  peerSessionId: string;
-  namespace: string;
-  peerType: 'client-only' | 'client+backend';
-  name: string;
-  deviceId: string;
-  protocolVersion: number;
-  backendId: string | null;
-}
-
-export interface Overview {
-  backends: number;
-  peers: OverviewPeer[];
-  credentials: {
-    total: number;
-    active: number;
-    revoked: number;
-    expired: number;
-    byType: Record<string, number>;
-  };
-  uptimeSec: number;
 }

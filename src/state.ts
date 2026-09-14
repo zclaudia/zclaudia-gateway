@@ -6,11 +6,11 @@
  */
 
 import type {
-  BackendPresence,
+  BackendPresenceV4 as BackendPresence,
   BackendId,
   Epoch,
   PeerSessionId,
-} from '@zclaudia/protocol/gateway';
+} from '@zclaudia/gateway-protocol';
 import type { WebSocket } from 'ws';
 
 // ============================================================================
@@ -20,17 +20,16 @@ import type { WebSocket } from 'ws';
 export interface PeerSession {
   peerSessionId: PeerSessionId;
   ws: WebSocket;
-  /** Negotiated protocol version for this session (v3 and v4 coexist). */
-  protocolVersion: 3 | 4;
+  /** Negotiated protocol version for this session. v4 only: the handshake rejects everything else. */
+  protocolVersion: 4;
   peerType: 'client-only' | 'client+backend';
   /**
-   * Isolation domain. Currently taken from peer_hello (self-declared);
-   * will be derived from server-side credentials once the Phase 1
-   * credential split lands. All registry/subscription visibility is
-   * scoped to this value.
+   * Isolation domain, taken from the server-side credential record at the
+   * handshake (a declared namespace that disagrees is rejected). All
+   * registry/subscription visibility is scoped to this value.
    */
   namespace: string;
-  /** Set when the peer authenticated with an issued credential (not the legacy shared secret). */
+  /** Id of the issued credential this peer authenticated with. */
   credentialId?: string;
   deviceId: string;
   instanceId: string;
@@ -69,12 +68,7 @@ export interface BackendLease {
 }
 
 // ============================================================================
-// Stream Demand State (per-backend)
-// ============================================================================
-
-
-// ============================================================================
-// Gateway V2 State Manager
+// Gateway State Manager
 // ============================================================================
 
 export interface GatewayStateConfig {

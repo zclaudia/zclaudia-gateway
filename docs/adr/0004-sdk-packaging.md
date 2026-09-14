@@ -22,7 +22,7 @@ Phase 3 拆分公共 SDK（ROADMAP：`gateway-protocol` / `gateway-client` / `ga
 - `@zclaudia/gateway-backend` — Backend 注册、心跳、channel offer 处理、Topic 发布、HTTP channel 服务；依赖 gateway-client 复用连接核心；
 - `gateway-testing` 暂不单列，契约测试先以根仓库测试套件形式存在，抽包时机等到 Hermes/Comfy Adapter 需要复用测试夹具。
 
-版本策略：迁移期全部 0.x，与 Gateway minor 版本对齐（lockstep）；先不发布 npm（workspace 内消费 + git 依赖），首个外部消费者（zclaudia 迁移分支）稳定后再发布。协议稳定、多语言 SDK 启动时重新评估拆仓。
+版本策略：迁移期全部 0.x，SDK 与 Gateway wire 版本对齐（lockstep）。2026-09-04 起已发布 npm（gateway-protocol / gateway-client / gateway-backend 0.1.0），消费者显式升级；本决策的"先不发布 npm"部分已被超越，同仓交付保持不变。协议稳定、多语言 SDK 启动时重新评估拆仓。
 
 ## 后果
 

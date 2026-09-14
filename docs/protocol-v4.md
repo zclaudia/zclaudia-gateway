@@ -1,7 +1,9 @@
 # Gateway Protocol v4 — Channels（草案）
 
 > 状态：Draft（随实现演进）。承载决策见 [ADR-0003](adr/0003-channel-transport.md)。
-> v4 与 v3 在同一 Gateway 实例上共存：`peer_hello.protocolVersion` 决定会话协议版本，v3 行为完全不变。
+> v4 是唯一协议版本：`peer_hello.protocolVersion` 必须为 4，非 v4 握手被拒绝并返回
+> `PROTOCOL_VERSION_MISMATCH`。唯一保留的 v3 形态消息是 `backend_server_message`
+> 定向回退（见文末）。
 
 ## 1. 概念
 
@@ -19,12 +21,13 @@ Gateway 铸造的 128-bit 不可猜测 `channelId`，四元组是服务端绑定
 
 ## 2. 握手
 
-v4 复用 v3 的 `peer_hello`/`peer_ready`，仅 `protocolVersion: 4`。
-v4 会话额外获得 channel 控制消息；registry、订阅等 v3 消息在 v4 会话中继续可用。
+v4 沿用 `peer_hello`/`peer_ready` 消息形态，`protocolVersion` 必须为 4。
+`gatewaySecret` 字段承载 Gateway 签发的凭证（zgd_/zgb_/zga_；字段名为 wire
+兼容保留，共享密钥已移除）。namespace 与注册权限由服务端凭证记录决定。
 
 **Backend 身份（v4）**：唯一键为 `(tenant, namespace, instanceId, environment)`
 （tenant 预留恒为空；environment 即 `identity.channel`，默认 `prod`），backendId 为
-稳定的 128-bit UUID。v3 Backend 保持 legacy 的 instance 键与短 ID，wire 不变。
+稳定的 128-bit UUID。
 
 ## 3. Channel 生命周期
 
@@ -54,8 +57,8 @@ client                     Gateway                      backend
 - **关闭**：任一端关闭数据连接即关闭整个 channel（另一端连接同步关闭）；
   Gateway 在两端控制连接上发 `channel_closed {channelId, reason}`。
 - **epoch 失效**：Backend 租约换代次或下线时，Gateway 主动关闭其全部 channel，
-  reason 为 `epoch_changed` / `backend_offline`（v3 的"客户端从 registry diff
-  推断失效"不再适用于 channel）。
+  reason 为 `epoch_changed` / `backend_offline`（失效由 Gateway 铸造并下发，
+  客户端无需从 registry diff 推断）。
 
 ## 4. 控制面消息（v4 新增）
 
@@ -108,8 +111,8 @@ retained 状态随 Backend 下线 / epoch 换代清除（过期 epoch 的状态�
 
 ## 7. v4 HTTP 流式映射（kind = `http`）
 
-客户端仍用普通 HTTP 访问 `/api/proxy/:backendId/*`；当目标 Backend 是 v4 会话时，
-Gateway 自动改走 Channel 桥接（客户端与 v3 Backend 完全不感知）：
+客户端仍用普通 HTTP 访问 `/api/proxy/:backendId/*`；Gateway 自动改走 Channel
+桥接：
 
 1. Gateway 为该请求创建一条 **internal channel**（客户端端点是 HTTP 请求/响应流本身，
    不经拨号），向 Backend 发 `channel_offer {kind: 'http'}`；Backend 照常拨数据连接。
@@ -130,9 +133,11 @@ Gateway 自动改走 Channel 桥接（客户端与 v3 Backend 完全不感知）
   1 秒窗口令牌桶，超发暂停发送端 socket，超发量结转下一窗口；帧不拆分，
   单窗口最多超发一帧。
 
-## 7. 与 v3 的关系
+## 9. 与历史 v3 协议的关系
 
 v3 已整体移除（`peer_hello.protocolVersion` 必须为 4）：订阅/快照广播由
 Topic（含 retain）取代，`http_proxy_*` 由 Channel 流式桥取代，定向消息走
 消息 Channel。唯一保留的 v3 形态消息是 `backend_server_message`（带
-`targetPeerSessionId` 的定向回退路径，同 namespace 校验）。
+`targetPeerSessionId` 的定向回退路径，同 namespace 校验）。历史 v3 类型
+仅存于 `@zclaudia/protocol/gateway` 的冻结兼容入口（0.3.0 删除）；
+v4 规范类型见 `@zclaudia/gateway-protocol`。
