@@ -1,10 +1,9 @@
-# 发布流程:
-#   自动:包内 bump version → 提交 → 推送 `gateway-<package>-v<版本>` tag;
-#   手动:Actions 页面选择 Publish → 选择包运行(发布其 package.json 的当前版本,
-#         建议在 main 上触发)。
-# 两种方式都会先跑完整 lint/build/test 再发布对应 npm 包。
-# 需要在仓库 Secrets 配置 NPM_TOKEN(npmjs.com granular token,
-# 勾选 @zclaudia/gateway-protocol / -client / -backend 的读写权限)。
+# 发布流程(与 zclaudia-protocol 相同的 npm Trusted Publisher / OIDC 模式,无 token):
+#   自动:推送 `gateway-<package>-v<版本>` tag 或发布同名 tag 的 GitHub Release;
+#   手动:Actions → Publish → 选择包运行(发布该包 package.json 的当前版本,建议在 main)。
+# 前置:在 npmjs.com 对应包的 Trusted Publisher 配置信任 zclaudia/zclaudia-gateway
+# 和本文件(gateway-client / gateway-backend 需各自单独配置)。
+# client/backend 的 workspace:^ 依赖会在发布前改写为实际版本范围(npm publish 不改写)。
 name: Publish
 
 on:
@@ -13,6 +12,9 @@ on:
       - 'gateway-protocol-v*'
       - 'gateway-client-v*'
       - 'gateway-backend-v*'
+  release:
+    types:
+      - published
   workflow_dispatch:
     inputs:
       package:
@@ -25,21 +27,26 @@ on:
           - gateway-client
           - gateway-backend
 
+permissions:
+  contents: read
+  id-token: write
+
 jobs:
   publish:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
       - uses: actions/checkout@v4
 
       - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.0
 
+      # Node 24 自带 npm 11:npm publish 走 Trusted Publisher(OIDC)必需
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
+          registry-url: https://registry.npmjs.org
           cache: pnpm
-          registry-url: 'https://registry.npmjs.org'
 
       - name: Resolve package
         id: meta
@@ -60,7 +67,7 @@ jobs:
             *) echo "::error::Unknown package: $pkg"; exit 1 ;;
           esac
           manifest_version=$(node -p "require('./$dir/package.json').version")
-          # tag 触发时校验 tag 与 manifest 一致,防止版本漂移
+          # tag / release 触发时校验 tag 与 manifest 一致,防止版本漂移
           if [ "$EVENT" != "workflow_dispatch" ]; then
             version="${TAG##*-v}"
             if [ "$manifest_version" != "$version" ]; then
@@ -79,8 +86,28 @@ jobs:
 
       - run: pnpm test
 
+      - name: Rewrite workspace ranges for npm publish
+        working-directory: ${{ steps.meta.outputs.dir }}
+        run: |
+          node -e '
+            const fs = require("fs");
+            const p = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            let touched = false;
+            for (const section of ["dependencies", "devDependencies", "peerDependencies"]) {
+              const deps = p[section];
+              if (!deps) continue;
+              for (const [name, range] of Object.entries(deps)) {
+                const spec = String(range);
+                if (!spec.startsWith("workspace:")) continue;
+                const base = spec.slice("workspace:".length);
+                deps[name] = base.includes("*") ? base.replace("*", p.version) : base + p.version;
+                touched = true;
+              }
+            }
+            fs.writeFileSync("package.json", JSON.stringify(p, null, 2) + "\n");
+            console.log(touched ? "rewrote workspace ranges to " + p.version : "no workspace ranges");
+          '
+
       - name: Publish
         working-directory: ${{ steps.meta.outputs.dir }}
-        run: pnpm publish --no-git-checks --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public
