@@ -1,0 +1,62 @@
+# 发布流程:包内 bump version → 提交 → 推送 `gateway-<package>-v<版本>` tag,
+# 本 workflow 跑完整 lint/build/test 后发布对应 npm 包。
+# 需要在仓库 Secrets 配置 NPM_TOKEN(npmjs.com granular token,
+# 勾选 @zclaudia/gateway-protocol / -client / -backend 的读写权限)。
+name: Publish
+
+on:
+  push:
+    tags:
+      - 'gateway-protocol-v*'
+      - 'gateway-client-v*'
+      - 'gateway-backend-v*'
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Resolve package from tag
+        id: meta
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          pkg="${TAG%-v*}"
+          version="${TAG##*-v}"
+          case "$pkg" in
+            gateway-protocol) dir=packages/protocol ;;
+            gateway-client)   dir=packages/client ;;
+            gateway-backend)  dir=packages/backend ;;
+            *) echo "::error::Unknown package in tag: $pkg"; exit 1 ;;
+          esac
+          manifest_version=$(node -p "require('./$dir/package.json').version")
+          if [ "$manifest_version" != "$version" ]; then
+            echo "::error::Tag $TAG claims $pkg@$version, but $dir/package.json is $manifest_version"
+            exit 1
+          fi
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm lint
+
+      - run: pnpm build
+
+      - run: pnpm test
+
+      - name: Publish
+        working-directory: ${{ steps.meta.outputs.dir }}
+        run: pnpm publish --no-git-checks --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
