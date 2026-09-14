@@ -1,5 +1,8 @@
-# 发布流程:包内 bump version → 提交 → 推送 `gateway-<package>-v<版本>` tag,
-# 本 workflow 跑完整 lint/build/test 后发布对应 npm 包。
+# 发布流程:
+#   自动:包内 bump version → 提交 → 推送 `gateway-<package>-v<版本>` tag;
+#   手动:Actions 页面选择 Publish → 选择包运行(发布其 package.json 的当前版本,
+#         建议在 main 上触发)。
+# 两种方式都会先跑完整 lint/build/test 再发布对应 npm 包。
 # 需要在仓库 Secrets 配置 NPM_TOKEN(npmjs.com granular token,
 # 勾选 @zclaudia/gateway-protocol / -client / -backend 的读写权限)。
 name: Publish
@@ -10,6 +13,17 @@ on:
       - 'gateway-protocol-v*'
       - 'gateway-client-v*'
       - 'gateway-backend-v*'
+  workflow_dispatch:
+    inputs:
+      package:
+        description: '要发布的包(取该包 package.json 的当前版本)'
+        type: choice
+        required: true
+        default: gateway-protocol
+        options:
+          - gateway-protocol
+          - gateway-client
+          - gateway-backend
 
 jobs:
   publish:
@@ -27,25 +41,35 @@ jobs:
           cache: pnpm
           registry-url: 'https://registry.npmjs.org'
 
-      - name: Resolve package from tag
+      - name: Resolve package
         id: meta
         env:
+          EVENT: ${{ github.event_name }}
           TAG: ${{ github.ref_name }}
+          DISPATCH_PKG: ${{ inputs.package }}
         run: |
-          pkg="${TAG%-v*}"
-          version="${TAG##*-v}"
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            pkg="$DISPATCH_PKG"
+          else
+            pkg="${TAG%-v*}"
+          fi
           case "$pkg" in
             gateway-protocol) dir=packages/protocol ;;
             gateway-client)   dir=packages/client ;;
             gateway-backend)  dir=packages/backend ;;
-            *) echo "::error::Unknown package in tag: $pkg"; exit 1 ;;
+            *) echo "::error::Unknown package: $pkg"; exit 1 ;;
           esac
           manifest_version=$(node -p "require('./$dir/package.json').version")
-          if [ "$manifest_version" != "$version" ]; then
-            echo "::error::Tag $TAG claims $pkg@$version, but $dir/package.json is $manifest_version"
-            exit 1
+          # tag 触发时校验 tag 与 manifest 一致,防止版本漂移
+          if [ "$EVENT" != "workflow_dispatch" ]; then
+            version="${TAG##*-v}"
+            if [ "$manifest_version" != "$version" ]; then
+              echo "::error::Tag $TAG claims $pkg@$version, but $dir/package.json is $manifest_version"
+              exit 1
+            fi
           fi
           echo "dir=$dir" >> "$GITHUB_OUTPUT"
+          echo "Releasing $pkg@$manifest_version ($dir)"
 
       - run: pnpm install --frozen-lockfile
 
