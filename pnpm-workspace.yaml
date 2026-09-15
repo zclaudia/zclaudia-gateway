@@ -1,2 +1,5 @@
 packages:
   - 'packages/*'
+allowBuilds:
+  better-sqlite3: true # native — credential/epoch SQLite storage
+  esbuild: true # postinstall: platform binary
