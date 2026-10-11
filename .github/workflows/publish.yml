@@ -1,9 +1,14 @@
 # 发布流程(与 zclaudia-protocol 相同的 npm Trusted Publisher / OIDC 模式,无 token):
 #   自动:推送 `gateway-<package>-v<版本>` tag 或发布同名 tag 的 GitHub Release;
-#   手动:Actions → Publish → 选择包运行(发布该包 package.json 的当前版本,建议在 main)。
+#   手动:Actions → Publish → 选择包运行(默认发布该包 package.json 的当前版本,建议在 main):
+#     可选 version:仅本次发布把 package.json 版本临时改写为该值(如 0.2.0-rc.1),
+#       不改变仓库内容;tag/release 流程不受影响,tag 与 manifest 的一致性校验保留。
+#     可选 tag:指定 npm dist-tag;留空时稳定版用 latest、预发布版取标识符第一段
+#       (0.2.0-rc.1 → rc)。npm 默认会给预发布版本打 latest,这里刻意不沿用该默认。
 # 前置:在 npmjs.com 对应包的 Trusted Publisher 配置信任 zclaudia/zclaudia-gateway
 # 和本文件(gateway-client / gateway-backend 需各自单独配置)。
-# client/backend 的 workspace:^ 依赖会在发布前改写为实际版本范围(npm publish 不改写)。
+# client/backend 的 workspace:^ 依赖会在发布前改写为实际版本范围(npm publish 不改写);
+# 用 version 覆盖发布 client/backend 时,其依赖的兄弟包必须已在 npm 上存在同名版本。
 name: Publish
 
 on:
@@ -18,7 +23,7 @@ on:
   workflow_dispatch:
     inputs:
       package:
-        description: '要发布的包(取该包 package.json 的当前版本)'
+        description: '要发布的包(默认取该包 package.json 的当前版本)'
         type: choice
         required: true
         default: gateway-protocol
@@ -26,6 +31,14 @@ on:
           - gateway-protocol
           - gateway-client
           - gateway-backend
+      version:
+        description: '可选:覆盖本次发布的版本(如 0.2.0-rc.1);留空用 package.json 当前版本。仅手动触发生效'
+        type: string
+        required: false
+      tag:
+        description: '可选:npm dist-tag(如 next);留空时稳定版 latest、预发布版取标识符(rc/beta)'
+        type: string
+        required: false
 
 permissions:
   contents: read
@@ -84,6 +97,48 @@ jobs:
 
       - run: pnpm test
 
+      # 仅改写本次发布用的 package.json,不改仓库;放在安装/构建/测试之后,
+      # 保证校验的是仓库真实状态,也避免与 pnpm lockfile 的 manifest 一致性冲突。
+      - name: Apply version override (manual dispatch only)
+        if: inputs.version != ''
+        working-directory: ${{ steps.meta.outputs.dir }}
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          PKG: ${{ inputs.package }}
+        run: |
+          set -euo pipefail
+          before=$(node -p "require('./package.json').version")
+          # npm 自身校验 semver,非法输入在此失败(npm 还接受 minor/preminor 等 bump 关键字)
+          if ! npm version "$RELEASE_VERSION" --no-git-tag-version --allow-same-version=true > /dev/null; then
+            echo "::error::npm 拒绝了版本输入 '$RELEASE_VERSION'(需为合法 semver 或 npm bump 关键字)"
+            exit 1
+          fi
+          version=$(node -p "require('./package.json').version")
+          echo "Overriding version -> $version (build only, repo unchanged)"
+          if [ "$version" != "$before" ] && [ "$PKG" != "gateway-protocol" ]; then
+            echo "::warning::$PKG 的 workspace 依赖将被改写为 ^$version,确认兄弟包已发布同名版本,否则安装会失败"
+          fi
+
+      - name: Resolve dist-tag
+        id: dist_tag
+        working-directory: ${{ steps.meta.outputs.dir }}
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          version=$(node -p "require('./package.json').version")
+          core="${version%%+*}"              # 去掉 build metadata
+          if [ -n "${REQUESTED_TAG:-}" ]; then
+            tag="$REQUESTED_TAG"
+          elif [[ "$core" == *-* ]]; then
+            pre="${core#*-}"                 # 预发布标识符,如 rc.1 / beta
+            tag="${pre%%.*}"                 # 取第一段,如 rc / beta
+          else
+            tag="latest"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Publishing version $version with dist-tag $tag"
+
       - name: Rewrite workspace ranges for npm publish
         working-directory: ${{ steps.meta.outputs.dir }}
         run: |
@@ -108,4 +163,4 @@ jobs:
 
       - name: Publish
         working-directory: ${{ steps.meta.outputs.dir }}
-        run: npm publish --access public
+        run: npm publish --access public --tag "${{ steps.dist_tag.outputs.tag }}"
