@@ -25,3 +25,54 @@ jobs:
       - run: pnpm build
 
       - run: pnpm test
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install
+        run: pip install -e 'packages/python[dev]'
+
+      - name: Lint and type-check
+        working-directory: packages/python
+        run: |
+          ruff check src tests
+          mypy
+
+      - name: Unit tests
+        working-directory: packages/python
+        run: pytest tests/unit
+
+  # Cross-language contract suite: Python SDK backend + TypeScript peer
+  # against the real gateway built from this commit.
+  python-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm build
+
+      - name: Install Python SDK
+        run: pip install -e 'packages/python[dev]'
+
+      - name: Contract tests
+        working-directory: packages/python
+        run: pytest tests/contract

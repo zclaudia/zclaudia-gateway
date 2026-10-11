@@ -1,0 +1,132 @@
+# 发布流程(PyPI Trusted Publisher / OIDC,无 token,与 npm 侧 publish.yml 同构):
+#   自动:推送 `gateway-python-v<版本>` tag,或发布同名 tag 的 GitHub Release → 正式 PyPI
+#     (tag 与 pyproject.toml 版本不一致会失败,防漂移);
+#   手动:Actions → Publish Python → Run workflow,选择目标仓库:
+#     testpypi(默认,首发布验证)/ pypi(发布 packages/python/pyproject.toml 的当前版本)。
+#     可选填入 version(如 0.1.0.dev2):仅本次构建把 pyproject.toml 的版本临时改写为该值,
+#     不改变仓库内容——用于 TestPyPI 反复验证(同版本不可重复上传)。
+# 前置(两个索引要各配一份,账号独立):
+#   pypi.org / test.pypi.org → 项目的 Publishing 设置 → 添加(pending) GitHub publisher,
+#   信任 owner=zclaudia、repo=zclaudia-gateway、workflow=.github/workflows/publish-python.yml,
+#   Environment 留空(与本文件的 job 一致,未声明 environment)。
+# 发布前跑单元 + 跨语言契约测试(真实网关),契约套件是发布闸门。
+name: Publish Python
+
+on:
+  push:
+    tags:
+      - 'gateway-python-v*'
+  release:
+    types:
+      - published
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: '发布目标(testpypi = 首发布验证; pypi = 正式)'
+        type: choice
+        required: true
+        default: testpypi
+        options:
+          - testpypi
+          - pypi
+      version:
+        description: '可选:覆盖本次发布的版本号(如 0.1.0.dev2);留空用 pyproject.toml 当前版本。仅手动触发生效'
+        type: string
+        required: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # Release 事件可能是为 npm 包打的 tag:只在 gateway-python-v* 上运行。
+    if: github.event_name != 'release' || startsWith(github.ref_name, 'gateway-python-v')
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Apply version override (manual dispatch only)
+        if: inputs.version != ''
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          python -m pip install --quiet packaging
+          python - <<'PY'
+          import os
+          import pathlib
+          import re
+          from packaging.version import InvalidVersion, Version
+
+          raw = os.environ["RELEASE_VERSION"].strip()
+          try:
+              version = str(Version(raw))
+          except InvalidVersion as exc:
+              raise SystemExit(f"Invalid PEP 440 version {raw!r}: {exc}")
+
+          path = pathlib.Path("packages/python/pyproject.toml")
+          text = path.read_text()
+          updated, count = re.subn(r'(?m)^version = "[^"]*"$', f'version = "{version}"', text, count=1)
+          if count != 1:
+              raise SystemExit("could not find the project version line in packages/python/pyproject.toml")
+          path.write_text(updated)
+          print(f"Overriding package version -> {version} (build only, repo unchanged)")
+          PY
+
+      - name: Resolve version and verify tag
+        env:
+          EVENT: ${{ github.event_name }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(python -c "import tomllib; print(tomllib.load(open('packages/python/pyproject.toml','rb'))['project']['version'])")
+          if [ "$EVENT" = "push" ]; then
+            expected="${TAG#gateway-python-v}"
+            if [ "$version" != "$expected" ]; then
+              echo "::error::Tag $TAG claims $expected, but packages/python/pyproject.toml is $version"
+              exit 1
+            fi
+          fi
+          echo "Releasing zclaudia-gateway $version"
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm build
+
+      - name: Install Python SDK and build tooling
+        run: |
+          python -m pip install --upgrade build
+          pip install -e 'packages/python[dev]'
+
+      - name: Unit and contract tests
+        working-directory: packages/python
+        run: |
+          pytest tests/unit
+          pytest tests/contract
+
+      - name: Build sdist and wheel
+        working-directory: packages/python
+        run: python -m build
+
+      - name: Publish to TestPyPI (Trusted Publisher / OIDC)
+        if: inputs.repository == 'testpypi'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: packages/python/dist/
+          repository-url: https://test.pypi.org/legacy/
+
+      - name: Publish to PyPI (Trusted Publisher / OIDC)
+        if: inputs.repository != 'testpypi'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: packages/python/dist/
