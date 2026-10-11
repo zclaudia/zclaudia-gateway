@@ -288,6 +288,8 @@ response.end
 
 ### Phase 4：Hermes 试点
 
+> **进度（2026-10-11）**：原生 Python Backend SDK 已落地（`packages/python`，PyPI `zclaudia-gateway` 0.1.0，[ADR-0006](docs/adr/0006-python-backend-sdk.md)）——即"协议稳定且确有需要时再实现多语言 SDK"的兑现，Hermes 接入不再依赖 Node sidecar（sidecar 路线保留为可选替代，本阶段接入选型自行裁决）。发布闸门为跨语言契约套件（`packages/python/tests/contract`：Python SDK 作 Backend + TS client SDK 作对端，对真实网关运行）。
+
 目标：通过一个 JSON-RPC 应用验证通用 Channel 与本地 Adapter 模型。
 
 可行性依据（2026-09 对 hermes-client-mobile 的代码调研）：

@@ -122,7 +122,9 @@ docker compose up -d        # 容器部署（读取 .env）
 | `@zclaudia/gateway-client` | 控制连接、Channel、Topic、指数退避重连（快速重开模型）；面向 WHATWG WebSocket，可注入 socketFactory |
 | `@zclaudia/gateway-backend` | Backend 注册与心跳、channel offer 处理（拨号即接受）、Topic 发布、`serveHttp` HTTP channel 服务 |
 
-契约测试位于 [`src/__tests__/phase3-sdk-contract.test.ts`](src/__tests__/phase3-sdk-contract.test.ts)：两个 SDK 经真实 Gateway 实例互通（channel 双向收发、Topic、HTTP、断线重连恢复订阅），使用 Node 原生 WHATWG WebSocket——与 WebView 客户端相同的 API 面。
+Python 后端可用官方 Python SDK（[packages/python](packages/python)，[ADR-0006](docs/adr/0006-python-backend-sdk.md)，PyPI 名 `zclaudia-gateway`）：`GatewayBackend` 等价实现注册/心跳/Channel/Topic/`serve_http`，asyncio + `websockets`，需 Python ≥ 3.11。
+
+契约测试位于 [`src/__tests__/phase3-sdk-contract.test.ts`](src/__tests__/phase3-sdk-contract.test.ts)：两个 SDK 经真实 Gateway 实例互通（channel 双向收发、Topic、HTTP、断线重连恢复订阅），使用 Node 原生 WHATWG WebSocket——与 WebView 客户端相同的 API 面。跨语言契约套件位于 [`packages/python/tests/contract`](packages/python/tests/contract)：Python SDK 作 Backend、TS client SDK 作远端对端，对真实网关实例运行（发布闸门）。
 
 ## 设计决策
 

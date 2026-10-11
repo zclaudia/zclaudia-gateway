@@ -1,6 +1,8 @@
 # Gateway Protocol v4 — Channels（草案）
 
 > 状态：Draft（随实现演进）。承载决策见 [ADR-0003](adr/0003-channel-transport.md)。
+> 参考实现：TypeScript（`packages/protocol` / `packages/client` / `packages/backend`）与
+> Python（`packages/python`，[ADR-0006](adr/0006-python-backend-sdk.md)）。
 > v4 是唯一协议版本：`peer_hello.protocolVersion` 必须为 4，非 v4 握手被拒绝并返回
 > `PROTOCOL_VERSION_MISMATCH`。唯一保留的 v3 形态消息是 `backend_server_message`
 > 定向回退（见文末）。
@@ -141,3 +143,80 @@ Topic（含 retain）取代，`http_proxy_*` 由 Channel 流式桥取代，定�
 `targetPeerSessionId` 的定向回退路径，同 namespace 校验）。历史 v3 类型
 仅存于 `@zclaudia/protocol/gateway` 的冻结兼容入口（0.3.0 删除）；
 v4 规范类型见 `@zclaudia/gateway-protocol`。
+
+## 10. 附录：Backend wire 参考
+
+字段与数值由两套 SDK（TS/Python）与网关实现共同锁定。新增字段保持向后兼容，
+改义或删除需升协议版本；接收侧必须容忍未知消息类型与未知错误码。
+
+### 10.1 握手
+
+`peer_hello`（Backend 实际发送形态）：
+
+| 字段 | 值 |
+| --- | --- |
+| `type` / `protocolVersion` | `"peer_hello"` / `4` |
+| `namespace` | 必须等于服务端凭证记录的 namespace，不一致返回 `UNAUTHORIZED`（不构成授权） |
+| `clientProtocolVersion` | 应用层版本号，Backend 自报（默认 1），Gateway 只透传 |
+| `peerType` | `"client+backend"`；仅 `zgb_`/`zga_` 凭证可声明（设备凭证被拒） |
+| `gatewaySecret` | 凭证 token（`zgd_`/`zgb_`/`zga_`；字段名为 wire 兼容保留） |
+| `identity` | `{deviceId, instanceId, name?, channel?}` |
+| `backend` | `{visible, capabilities, backendProtocolVersion, minClientProtocolVersion?}` |
+
+`peer_ready`（Gateway → Backend，握手成功）：
+
+| 字段 | 值 |
+| --- | --- |
+| `type` / `protocolVersion` | `"peer_ready"` / `4` |
+| `peerSessionId` | 本次连接的会话 id |
+| `recoveryToken` | 预留字段（v4 不做无缝恢复） |
+| `backend` | `{backendId, epoch, leaseTtlMs}`——Backend 必须以此为准 |
+| `registrySync` | `{items: BackendPresenceV4[]}`（同 namespace 的在线 Backend 目录） |
+
+`BackendPresenceV4`（registry 项）：`namespace`、`backendId`、`instanceId`、
+`deviceId`、`name`、`channel`、`visible`、`capabilities`、
+`backendProtocolVersion`、`minClientProtocolVersion?`、`epoch`、`connectedAt`、
+`lastSeenAt`、`gatewayProtocolVersion?`。
+
+**Backend 身份**：唯一键 `(namespace, instanceId, environment)`，environment 即
+`identity.channel`（默认 `"prod"`）。`backendId` 跨重连稳定；`epoch` 每次连接
+递增，旧代次的 channel/topic 订阅/retained 状态全部失效。
+
+### 10.2 心跳与租约
+
+- `backend_heartbeat {epoch, observedAt?}`：建议间隔 10s（SDK 默认）；`observedAt`
+  为 Backend 侧墙钟，Gateway 忽略。
+- 租约 TTL 由 `peer_ready.backend.leaseTtlMs` 下发（默认 30s）。超时未心跳 →
+  租约失效：registry 移除、全部 channel 以 `epoch_changed`/`backend_offline` 关闭、
+  retained topic 清除。
+- Gateway 回 `heartbeat_ack {epoch, streamDemand: false}`；`streamDemand` 恒为
+  `false`（v3 的流需求协商已移除，字段为 ack 形状稳定保留）。
+
+### 10.3 错误模型
+
+`gateway_error {code, message, recovery?}`，`code` ∈ `INVALID_MESSAGE` /
+`PROTOCOL_VERSION_MISMATCH` / `UNAUTHORIZED` / `BACKEND_OFFLINE` /
+`RATE_LIMITED`；`recovery` 当前不发送，未知值按"无恢复动作"处理。
+
+### 10.4 数值与配额（当前实现）
+
+| 项 | 值 | 位置 |
+| --- | ---: | --- |
+| 租约 TTL | 30 s（`leaseTtlMs` 下发） | `state.ts` |
+| SDK 心跳间隔 | 10 s | SDK 默认 |
+| channel ticket TTL（= 配对超时） | 30 s | `server.ts` |
+| 单 Peer 并发 channel | 32（超限 `channel_open` 返回 `RATE_LIMITED`） | `server.ts` |
+| Backend access token TTL | 24 h（`POST /api/backend/token` 换出） | `server.ts` |
+| WS maxPayload（控制面与数据面） | 50 MB | `server.ts` |
+| JSON 请求体上限 | 15 MB | `server.ts` |
+| 每 IP WS 连接数 | 10 | `server.ts` |
+| 认证失败限流 / 代理限流 | 10 次/min/IP / 200 次/min/IP | `server.ts` |
+| retained topic 上限 | 64 个/Backend | `server.ts` |
+| per-channel 字节速率 | 默认不限（`channelByteRateLimit` 可配） | `server.ts` |
+
+### 10.5 定向回退
+
+`backend_server_message {backendId, targetPeerSessionId?, message}`：Backend →
+Gateway → 目标 peer 的单向回退路径（消息 Channel 重建期间的过渡手段）。缺
+`targetPeerSessionId` 的消息被 Gateway 丢弃，不再广播。
+

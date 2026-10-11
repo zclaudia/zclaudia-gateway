@@ -11,6 +11,7 @@
 | [0003](0003-channel-transport.md) | Channel 传输承载：每 Channel 一条 WS 连接 | Accepted |
 | [0004](0004-sdk-packaging.md) | SDK 包存放与发布策略（workspace 同仓） | Accepted |
 | [0005](0005-admin-web-ui.md) | 管理端 Web UI：同进程托管与 Cookie 会话 | Accepted |
+| [0006](0006-python-backend-sdk.md) | Python Backend SDK：原生实现、打包与发布 | Accepted |
 
 ## 待定决策
 
