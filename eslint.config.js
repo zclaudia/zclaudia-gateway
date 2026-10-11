@@ -20,4 +20,16 @@ export default tseslint.config(
     files: ['packages/admin-ui/**/*.{ts,tsx}'],
     rules: { 'no-undef': 'off' },
   },
+  {
+    // Node-side harness for the Python contract suite (start-gateway /
+    // peer-client): plain Node ESM, so its runtime globals are Node's.
+    files: ['packages/python/**/*.mjs'],
+    languageOptions: {
+      globals: {
+        console: 'readonly',
+        process: 'readonly',
+        setTimeout: 'readonly',
+      },
+    },
+  },
 );
