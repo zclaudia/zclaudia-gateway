@@ -1,0 +1,539 @@
+"""Gateway Backend SDK (Protocol v4).
+
+Registration + lease heartbeat, channel offer handling (dial-is-accept),
+topic publishing, HTTP-over-channel serving, and enrollment-credential
+exchange — the Python equivalent of ``@zclaudia/gateway-backend``.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import logging
+import time
+import urllib.error
+import urllib.request
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any, Literal
+
+from websockets.asyncio.client import connect as ws_connect
+from websockets.exceptions import ConnectionClosed
+
+from .channel import (
+    MAX_MESSAGE_SIZE,
+    GatewayChannel,
+    _log_task_failure,
+    dial_channel,
+    invoke,
+    to_http_base,
+    to_ws_base,
+)
+from .protocol import (
+    CHANNEL_KIND_HTTP,
+    GATEWAY_PROTOCOL_V4,
+    PEER_TYPE_CLIENT_BACKEND,
+    ChannelOffer,
+    GatewayError,
+    PeerReady,
+    normalize_identity,
+)
+
+logger = logging.getLogger("zclaudia_gateway")
+
+GatewayBackendState = Literal["idle", "connecting", "connected", "closed"]
+
+StateHandler = Callable[[GatewayBackendState], Any]
+RawMessageHandler = Callable[[dict[str, Any]], Any]
+PeerReadyTimeout = 10.0
+
+
+@dataclass(frozen=True)
+class ChannelOfferInfo:
+    """Metadata accompanying a channel offer delivered to a handler."""
+
+    channel_id: str
+    kind: str | None = None
+    source_peer_session_id: str | None = None
+
+
+ChannelHandler = Callable[[GatewayChannel, ChannelOfferInfo], Any]
+
+
+class GatewayBackend:
+    """A registered Backend peer: connects, holds a lease, serves channels.
+
+    Typical use::
+
+        backend = GatewayBackend(url=..., credential="zgb_...", namespace=...,
+                                 identity={"device_id": "srv-1", "instance_id": "i-1"})
+        backend.on_channel("rpc", handler)
+        backend.serve_http(http_handler)
+        backend_id, epoch = await backend.connect()
+        await backend.publish_topic("resources", snapshot, retain=True)
+        ...
+        await backend.close()
+
+    Reconnection (default on) runs in the background with exponential
+    backoff; every reconnect establishes a new epoch while the backendId
+    stays stable, and all channels from the previous epoch are gone.
+    """
+
+    def __init__(
+        self,
+        url: str,
+        credential: str,
+        namespace: str,
+        identity: dict[str, Any],
+        *,
+        visible: bool = True,
+        capabilities: list[str] | None = None,
+        backend_protocol_version: int = 1,
+        exchange_enrollment: bool = True,
+        heartbeat_interval_ms: int = 10_000,
+        reconnect: bool = True,
+        reconnect_min_ms: int = 1000,
+        reconnect_max_ms: int = 30_000,
+        max_message_size: int = MAX_MESSAGE_SIZE,
+        open_timeout: float = 10.0,
+    ) -> None:
+        self._credential = credential
+        self._namespace = namespace
+        self._identity = normalize_identity(identity)
+        self._visible = visible
+        self._capabilities = list(capabilities or [])
+        self._backend_protocol_version = backend_protocol_version
+        self._exchange_enrollment = exchange_enrollment
+        self._heartbeat_interval = heartbeat_interval_ms / 1000.0
+        self._reconnect = reconnect
+        self._reconnect_min = reconnect_min_ms / 1000.0
+        self._reconnect_max = reconnect_max_ms / 1000.0
+        self._max_message_size = max_message_size
+        self._open_timeout = open_timeout
+
+        self._ws_base = to_ws_base(url)
+        self._control_url = f"{self._ws_base}/ws"
+        self._token_url = f"{to_http_base(self._ws_base)}/api/backend/token"
+
+        self._backend_id = ""
+        self._epoch = 0
+        self._lease_ttl_ms = 0
+        self._peer_session_id = ""
+
+        self._state: GatewayBackendState = "idle"
+        self._closed = False
+        self._ws: Any = None
+        self._reader_task: asyncio.Task[None] | None = None
+        self._heartbeat_task: asyncio.Task[None] | None = None
+        self._supervisor_task: asyncio.Task[None] | None = None
+        self._closed_event: asyncio.Event | None = None
+        self._reconnect_attempt = 0
+
+        self._channel_handlers: dict[str, ChannelHandler] = {}
+        self._default_channel_handler: ChannelHandler | None = None
+        self._channels: dict[str, GatewayChannel] = {}
+
+        self._state_handlers: list[StateHandler] = []
+        self._message_handlers: list[RawMessageHandler] = []
+
+    # --- Introspection -----------------------------------------------------
+
+    @property
+    def backend_id(self) -> str:
+        """The gateway-assigned backend UUID (stable across reconnects)."""
+        return self._backend_id
+
+    @property
+    def epoch(self) -> int:
+        """Current lease epoch (increases on every reconnect)."""
+        return self._epoch
+
+    @property
+    def state(self) -> GatewayBackendState:
+        return self._state
+
+    @property
+    def lease_ttl_ms(self) -> int:
+        """Lease TTL granted by the gateway (heartbeats must be more frequent)."""
+        return self._lease_ttl_ms
+
+    @property
+    def peer_session_id(self) -> str:
+        return self._peer_session_id
+
+    # --- Handler registration ---------------------------------------------
+
+    def on_state(self, handler: StateHandler) -> Callable[[], None]:
+        self._state_handlers.append(handler)
+        return lambda: self._state_handlers.remove(handler)
+
+    def on_message(self, handler: RawMessageHandler) -> Callable[[], None]:
+        """Raw tap on inbound control messages (e.g. the directed
+        ``backend_server_message`` fallback). Messages the SDK consumes
+        internally (``channel_offer``) are still delivered here."""
+        self._message_handlers.append(handler)
+        return lambda: self._message_handlers.remove(handler)
+
+    def on_channel(self, kind: str, handler: ChannelHandler) -> None:
+        """Register a handler for a specific channel kind (e.g. ``'rpc'``)."""
+        self._channel_handlers[kind] = handler
+
+    def on_any_channel(self, handler: ChannelHandler) -> None:
+        """Fallback handler for kinds without a specific handler."""
+        self._default_channel_handler = handler
+
+    def serve_http(self, handler: Any) -> None:
+        """Serve HTTP-over-channel requests (gateway ``/api/proxy``).
+
+        The handler receives an :class:`~zclaudia_gateway.http.HttpServeRequest`
+        and returns an :class:`~zclaudia_gateway.http.HttpServeResponse`
+        (sync or async); the SDK does the frame plumbing
+        (``docs/protocol-v4.md`` §7).
+        """
+        from .http import build_http_handler
+
+        self.on_channel(CHANNEL_KIND_HTTP, build_http_handler(handler))
+
+    # --- Lifecycle ---------------------------------------------------------
+
+    async def connect(self) -> tuple[str, int]:
+        """Connect and complete the handshake; returns ``(backend_id, epoch)``.
+
+        Raises on handshake failure. After a successful connect, unexpected
+        disconnects are auto-recovered in the background (unless
+        ``reconnect=False``), matching the TypeScript SDK.
+        """
+        if self._ws is not None or (self._supervisor_task is not None and not self._supervisor_task.done()):
+            raise RuntimeError("Already connected")
+        self._closed = False
+        self._closed_event = asyncio.Event()
+        self._reconnect_attempt = 0
+        await self._establish()
+        self._supervisor_task = asyncio.ensure_future(self._supervise())
+        return self._backend_id, self._epoch
+
+    async def wait_closed(self) -> None:
+        """Wait until the backend is fully closed.
+
+        Set by :meth:`close`, or by a terminal disconnect when
+        ``reconnect=False``.
+        """
+        if self._closed_event is None:
+            return
+        await self._closed_event.wait()
+
+    async def close(self) -> None:
+        """Close the control connection and all channels (idempotent)."""
+        self._closed = True
+        if self._closed_event is not None:
+            self._closed_event.set()
+
+        supervisor = self._supervisor_task
+        self._supervisor_task = None
+        if supervisor is not None and not supervisor.done():
+            supervisor.cancel()
+
+        ws = self._ws
+        if ws is not None:
+            try:
+                await ws.close(1000)
+            except Exception:
+                pass
+
+        for task in (self._heartbeat_task, self._reader_task):
+            if task is not None and not task.done():
+                task.cancel()
+        if supervisor is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await supervisor
+        self._heartbeat_task = None
+        self._reader_task = None
+        self._ws = None
+
+        for channel in list(self._channels.values()):
+            await channel.close()
+        self._channels.clear()
+
+        self._set_state("closed")
+
+    async def __aenter__(self) -> GatewayBackend:
+        await self.connect()
+        return self
+
+    async def __aexit__(self, *exc_info: Any) -> None:
+        await self.close()
+
+    # --- Sending -----------------------------------------------------------
+
+    async def send(self, message: dict[str, Any]) -> None:
+        """Send a raw control message (e.g. the directed fallback path)."""
+        ws = self._ws
+        if ws is None:
+            raise RuntimeError("Not connected")
+        try:
+            await ws.send(json.dumps(message))
+        except ConnectionClosed as exc:
+            raise RuntimeError("Not connected") from exc
+
+    async def publish_topic(self, topic: str, payload: Any = None, *, retain: bool = False) -> None:
+        """Publish a Topic payload (the gateway fans out to subscribers).
+
+        ``retain=True`` stores the payload as the topic's current state and
+        replays it to new subscribers immediately after they subscribe.
+        """
+        message: dict[str, Any] = {"type": "topic_publish", "topic": topic, "payload": payload}
+        if retain:
+            message["retain"] = True
+        await self.send(message)
+
+    # --- Internals ---------------------------------------------------------
+
+    def _set_state(self, state: GatewayBackendState) -> None:
+        if self._state == state:
+            return
+        self._state = state
+        for handler in list(self._state_handlers):
+            invoke(handler, state)
+
+    async def _establish(self) -> None:
+        self._set_state("connecting")
+        # Re-resolve on every attempt: an exchanged access token may have
+        # expired while we were disconnected.
+        credential = await self._resolve_credential()
+        ws = await ws_connect(
+            self._control_url,
+            max_size=self._max_message_size,
+            open_timeout=self._open_timeout,
+        )
+        self._ws = ws
+        try:
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "peer_hello",
+                        "protocolVersion": GATEWAY_PROTOCOL_V4,
+                        "namespace": self._namespace,
+                        "clientProtocolVersion": self._backend_protocol_version,
+                        "peerType": PEER_TYPE_CLIENT_BACKEND,
+                        "gatewaySecret": credential,
+                        "identity": self._identity,
+                        "backend": {
+                            "visible": self._visible,
+                            "capabilities": self._capabilities,
+                            "backendProtocolVersion": self._backend_protocol_version,
+                        },
+                    }
+                )
+            )
+            ready = await self._await_peer_ready(ws)
+        except BaseException:
+            self._ws = None
+            try:
+                await ws.close()
+            except Exception:
+                pass
+            raise
+
+        if ready.backend_id is None or ready.epoch is None:
+            self._ws = None
+            try:
+                await ws.close()
+            except Exception:
+                pass
+            raise RuntimeError("Gateway did not assign a backend identity")
+
+        self._backend_id = ready.backend_id
+        self._epoch = ready.epoch
+        self._lease_ttl_ms = ready.lease_ttl_ms or 0
+        self._peer_session_id = ready.peer_session_id
+        self._reader_task = asyncio.ensure_future(self._read_control(ws))
+        self._heartbeat_task = asyncio.ensure_future(self._heartbeat_loop(ws))
+        self._reconnect_attempt = 0
+        self._set_state("connected")
+
+    async def _await_peer_ready(self, ws: Any) -> PeerReady:
+        async def wait() -> PeerReady:
+            while True:
+                raw = await ws.recv()
+                if isinstance(raw, bytes):
+                    continue
+                try:
+                    message = json.loads(raw)
+                except ValueError:
+                    continue
+                if not isinstance(message, dict):
+                    continue
+                kind = message.get("type")
+                if kind == "peer_ready":
+                    return PeerReady.parse(message)
+                if kind == "gateway_error":
+                    raise GatewayError(str(message.get("code") or "UNKNOWN"), str(message.get("message") or ""))
+
+        try:
+            return await asyncio.wait_for(wait(), timeout=PeerReadyTimeout)
+        except TimeoutError:
+            raise RuntimeError("peer_ready timeout") from None
+
+    async def _read_control(self, ws: Any) -> None:
+        try:
+            async for raw in ws:
+                if isinstance(raw, bytes):
+                    continue
+                try:
+                    message = json.loads(raw)
+                except ValueError:
+                    continue
+                if not isinstance(message, dict):
+                    continue
+                if message.get("type") == "channel_offer":
+                    try:
+                        offer = ChannelOffer.parse(message)
+                    except ValueError:
+                        continue
+                    task = asyncio.ensure_future(self._handle_offer(offer))
+                    task.add_done_callback(_log_task_failure)
+                tap = list(self._message_handlers)
+                for handler in tap:
+                    invoke(handler, message)
+        except ConnectionClosed:
+            pass
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("control read loop failed")
+
+    async def _heartbeat_loop(self, ws: Any) -> None:
+        try:
+            while True:
+                await asyncio.sleep(self._heartbeat_interval)
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "backend_heartbeat",
+                            "epoch": self._epoch,
+                            "observedAt": int(time.time() * 1000),
+                        }
+                    )
+                )
+        except (ConnectionClosed, asyncio.CancelledError):
+            pass
+        except Exception:
+            logger.debug("heartbeat loop stopped", exc_info=True)
+
+    async def _supervise(self) -> None:
+        """Own the connection lifecycle: wait for a drop, then reconnect."""
+        while True:
+            reader = self._reader_task
+            if reader is not None:
+                try:
+                    await reader
+                except asyncio.CancelledError:
+                    raise
+            self._teardown_connection()
+            if self._closed or not self._reconnect:
+                self._set_state("closed")
+                if self._closed_event is not None:
+                    self._closed_event.set()
+                return
+            self._set_state("connecting")
+            while True:
+                if self._closed:
+                    self._set_state("closed")
+                    if self._closed_event is not None:
+                        self._closed_event.set()
+                    return
+                try:
+                    await self._establish()
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning("reconnect attempt failed: %s", exc)
+                    await asyncio.sleep(self._next_backoff())
+
+    def _teardown_connection(self) -> None:
+        heartbeat = self._heartbeat_task
+        if heartbeat is not None and not heartbeat.done():
+            heartbeat.cancel()
+        self._heartbeat_task = None
+        self._reader_task = None
+        self._ws = None
+
+    def _next_backoff(self) -> float:
+        delay = min(self._reconnect_min * (2**self._reconnect_attempt), self._reconnect_max)
+        self._reconnect_attempt += 1
+        return delay
+
+    async def _handle_offer(self, offer: ChannelOffer) -> None:
+        if self._closed:
+            return
+        handler: ChannelHandler | None = None
+        if offer.kind:
+            handler = self._channel_handlers.get(offer.kind)
+        if handler is None:
+            handler = self._default_channel_handler
+        if handler is None:
+            await self._reject(offer.channel_id, "no_handler")
+            return
+        try:
+            channel = await dial_channel(
+                self._ws_base,
+                offer.data_path,
+                offer.ticket,
+                offer.channel_id,
+                offer.kind,
+                max_message_size=self._max_message_size,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("channel dial failed")
+            await self._reject(offer.channel_id, "dial_failed")
+            return
+        self._channels[offer.channel_id] = channel
+        channel.on_close(lambda: self._channels.pop(offer.channel_id, None))
+        try:
+            info = ChannelOfferInfo(
+                channel_id=offer.channel_id,
+                kind=offer.kind,
+                source_peer_session_id=offer.source_peer_session_id,
+            )
+            invoke(handler, channel, info)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("channel handler failed")
+            await channel.close()
+            await self._reject(offer.channel_id, "dial_failed")
+
+    async def _reject(self, channel_id: str, reason: str) -> None:
+        try:
+            await self.send({"type": "channel_reject", "channelId": channel_id, "reason": reason})
+        except RuntimeError:
+            pass
+
+    async def _resolve_credential(self) -> str:
+        if not self._exchange_enrollment or not self._credential.startswith("zgb_"):
+            return self._credential
+        body = await asyncio.to_thread(self._exchange_enrollment_blocking)
+        data = body.get("data") or {}
+        token = data.get("token")
+        if not token:
+            raise RuntimeError("Enrollment exchange returned no token")
+        return str(token)
+
+    def _exchange_enrollment_blocking(self) -> dict[str, Any]:
+        request = urllib.request.Request(
+            self._token_url,
+            method="POST",
+            headers={"Authorization": f"Bearer {self._credential}"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:
+                parsed = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"Enrollment exchange failed: HTTP {exc.code}") from exc
+        if not isinstance(parsed, dict):
+            raise RuntimeError("Enrollment exchange returned a non-object body")
+        return parsed
