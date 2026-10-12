@@ -70,6 +70,20 @@ def _log_task_failure(task: asyncio.Task[Any]) -> None:
         logger.error("background handler failed", exc_info=exc)
 
 
+class ChannelClosedError(RuntimeError):
+    """The channel is closed: nothing can be sent over it any more.
+
+    Raised when sending on an already closed channel, or when the peer closes
+    it mid-write (the underlying ``ConnectionClosed`` is folded into this).
+    Subclasses ``RuntimeError``, so callers written against earlier SDK
+    releases keep catching it.
+    """
+
+    def __init__(self, channel_id: str | None = None) -> None:
+        super().__init__(f"Channel {channel_id} is closed" if channel_id else "Channel is closed")
+        self.channel_id = channel_id
+
+
 class GatewayChannel:
     """A live data-plane channel (one relayed WebSocket).
 
@@ -127,8 +141,11 @@ class GatewayChannel:
 
     async def send(self, data: ChannelData) -> None:
         if self._closed:
-            raise RuntimeError("Channel is closed")
-        await self._ws.send(data)
+            raise ChannelClosedError(self.channel_id)
+        try:
+            await self._ws.send(data)
+        except ConnectionClosed as exc:
+            raise ChannelClosedError(self.channel_id) from exc
 
     def on_message(self, handler: MessageHandler) -> Callable[[], None]:
         """Register a message handler; returns an unsubscribe callable.
@@ -160,6 +177,10 @@ class GatewayChannel:
             self._inbox = inbox
             self.on_message(inbox.put_nowait)
             self.on_close(lambda: inbox.put_nowait(_CHANNEL_END))
+            if self._closed:
+                # Closed before the consumer registered: the close handler
+                # above would never run, so end the iteration right away.
+                inbox.put_nowait(_CHANNEL_END)
         return self
 
     async def __anext__(self) -> ChannelData:

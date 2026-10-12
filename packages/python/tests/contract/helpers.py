@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import json
 import shutil
 import subprocess
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 TESTS_DIR = Path(__file__).resolve().parents[1]  # packages/python/tests
 PYTHON_PKG = TESTS_DIR.parent  # packages/python
@@ -105,3 +108,147 @@ async def until(predicate: Callable[[], Any], timeout: float = 5.0, interval: fl
         if loop.time() > deadline:
             raise AssertionError("condition not met in time")
         await asyncio.sleep(interval)
+
+
+@dataclass
+class HttpResponse:
+    status: int
+    headers: dict[str, str]
+    body: bytes
+
+
+class ProxyHttpStream:
+    """One in-flight HTTP/1.1 request against the gateway (stdlib only).
+
+    The dev extras ship no HTTP client, and the streaming tests need to read a
+    response before it ends and then drop the connection — which is what the
+    gateway sees as a client abort. ``next_body_chunk`` decodes chunked
+    transfer encoding, where each gateway ``res.write`` arrives as one chunk.
+    """
+
+    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, *, timeout: float = 15.0) -> None:
+        self._reader = reader
+        self._writer = writer
+        self._timeout = timeout
+        self._chunked = False
+        self._length: int | None = None
+        self._received = 0
+        self._eof = False
+        self.status = 0
+        self.headers: dict[str, str] = {}
+
+    async def _wait(self, awaitable: Any) -> Any:
+        return await asyncio.wait_for(awaitable, self._timeout)
+
+    async def read_head(self) -> None:
+        line = await self._wait(self._reader.readline())
+        if not line:
+            raise AssertionError("gateway closed the connection before the response line")
+        self.status = int(line.decode("latin-1").split(" ", 2)[1])
+        while True:
+            line = await self._wait(self._reader.readline())
+            if line in (b"\r\n", b"\n", b""):
+                break
+            name, _, value = line.decode("latin-1").partition(":")
+            self.headers[name.strip().lower()] = value.strip()
+        self._chunked = "chunked" in self.headers.get("transfer-encoding", "").lower()
+        if not self._chunked and "content-length" in self.headers:
+            self._length = int(self.headers["content-length"])
+
+    async def next_body_chunk(self) -> bytes:
+        """Next slice of the response body; empty bytes once the body ended."""
+        if self._eof:
+            return b""
+        if self._chunked:
+            return await self._read_chunked()
+        if self._length is not None:
+            return await self._read_sized()
+        data = await self._wait(self._reader.read(65536))
+        if not data:
+            self._eof = True
+        return data
+
+    async def _read_chunked(self) -> bytes:
+        line = await self._wait(self._reader.readline())
+        size_text = line.split(b";", 1)[0].strip()
+        size = int(size_text, 16) if size_text else 0
+        if size == 0:
+            self._eof = True
+            return b""
+        data = await self._wait(self._reader.readexactly(size))
+        await self._wait(self._reader.readexactly(2))  # the chunk's trailing CRLF
+        return data
+
+    async def _read_sized(self) -> bytes:
+        remaining = (self._length or 0) - self._received
+        if remaining <= 0:
+            self._eof = True
+            return b""
+        data = await self._wait(self._reader.readexactly(min(remaining, 65536)))
+        self._received += len(data)
+        return data
+
+    async def read_body(self) -> bytes:
+        chunks: list[bytes] = []
+        while (chunk := await self.next_body_chunk()):
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    async def close(self) -> None:
+        self._writer.close()
+        with contextlib.suppress(Exception):
+            await self._writer.wait_closed()
+
+
+async def open_proxy_request(
+    base_url: str,
+    method: str,
+    path: str,
+    *,
+    headers: Mapping[str, str] | None = None,
+    body: bytes | None = None,
+    timeout: float = 15.0,
+) -> ProxyHttpStream:
+    """Send a request to the gateway and return the stream once its head is in.
+
+    ``path`` is appended to the base URL's own path, so a proxy base of
+    ``http://host/api/proxy/<backendId>`` plus ``/stream`` reaches the right
+    place.
+    """
+    parts = urlsplit(base_url)
+    host = parts.hostname or "127.0.0.1"
+    port = parts.port or 80
+    target = f"{parts.path.rstrip('/')}{path}" if path.startswith("/") else f"{parts.path.rstrip('/')}/{path}"
+    reader, writer = await asyncio.open_connection(host, port)
+    stream = ProxyHttpStream(reader, writer, timeout=timeout)
+    try:
+        lines = [f"{method} {target} HTTP/1.1", f"Host: {host}:{port}", "Connection: close"]
+        for name, value in (headers or {}).items():
+            lines.append(f"{name}: {value}")
+        if body is not None:
+            lines.append(f"Content-Length: {len(body)}")
+        writer.write(("\r\n".join(lines) + "\r\n\r\n").encode("latin-1") + (body or b""))
+        await writer.drain()
+        await stream.read_head()
+    except BaseException:
+        await stream.close()
+        raise
+    return stream
+
+
+async def proxy_request(
+    base_url: str,
+    method: str,
+    path: str,
+    *,
+    headers: Mapping[str, str] | None = None,
+    body: bytes | None = None,
+    timeout: float = 15.0,
+) -> HttpResponse:
+    """Complete one proxied request and return ``(status, headers, body)``."""
+    stream = await open_proxy_request(base_url, method, path, headers=headers, body=body, timeout=timeout)
+    try:
+        payload = await stream.read_body()
+        return HttpResponse(stream.status, stream.headers, payload)
+    finally:
+        await stream.close()

@@ -61,6 +61,12 @@ def enrollment(gateway):
     return issue_credential(gateway["httpUrl"], type="backend", name="contract-backend")
 
 
+@pytest.fixture(scope="session")
+def device(gateway):
+    """A zgd_ device credential: what a phone presents to /api/proxy."""
+    return issue_credential(gateway["httpUrl"], type="device", name="contract-device")
+
+
 @pytest.fixture
 async def backend(gateway, enrollment):
     """A Python backend bound to the contract namespace (not yet connected)."""

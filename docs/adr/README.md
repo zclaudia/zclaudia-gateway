@@ -12,6 +12,7 @@
 | [0004](0004-sdk-packaging.md) | SDK 包存放与发布策略（workspace 同仓） | Accepted |
 | [0005](0005-admin-web-ui.md) | 管理端 Web UI：同进程托管与 Cookie 会话 | Accepted |
 | [0006](0006-python-backend-sdk.md) | Python Backend SDK：原生实现、打包与发布 | Accepted |
+| [0007](0007-python-streaming-http-and-asgi.md) | Python SDK：流式 HTTP、ASGI 适配与后台首连 | Accepted |
 
 ## 待定决策
 

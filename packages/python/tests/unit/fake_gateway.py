@@ -211,3 +211,47 @@ class FakeGateway:
         entry = self._data[channel_id]
         await asyncio.wait_for(entry["connected"].wait(), timeout)
         return entry["ws"]
+
+    async def offer_http(self, channel_id: str = "ch-http") -> ServerConnection:
+        """Offer an ``http`` channel; returns the gateway end of its data socket.
+
+        Unlike :meth:`offer_channel` with a driver handler, the returned
+        socket stays untouched: the test writes the request frames and reads
+        the response frames itself.
+        """
+
+        async def idle(ws: ServerConnection) -> None:
+            await ws.wait_closed()
+
+        await self.offer_channel(kind="http", channel_id=channel_id, on_connection=idle)
+        return await self.wait_for_data_connection(channel_id)
+
+
+async def send_http_request(
+    ws: ServerConnection,
+    method: str,
+    path: str,
+    *,
+    headers: dict[str, str] | None = None,
+    body: tuple[bytes, ...] = (),
+) -> None:
+    """Drive the request direction: head frame, body frames, end frame."""
+    await ws.send(json.dumps({"type": "http_request", "method": method, "path": path, "headers": headers or {}}))
+    for chunk in body:
+        await ws.send(chunk)
+    await ws.send(json.dumps({"type": "http_request_end"}))
+
+
+async def read_http_response(ws: ServerConnection, timeout: float = 5.0) -> tuple[dict[str, Any], bytes]:
+    """Collect the response direction: head frame, then body frames to close."""
+    meta = json.loads(await asyncio.wait_for(ws.recv(), timeout))
+    assert meta["type"] == "http_response"
+    chunks: list[bytes] = []
+    try:
+        while True:
+            frame = await asyncio.wait_for(ws.recv(), timeout)
+            assert isinstance(frame, bytes)
+            chunks.append(frame)
+    except ConnectionClosed:
+        pass
+    return meta, b"".join(chunks)

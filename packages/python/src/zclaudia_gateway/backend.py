@@ -78,6 +78,12 @@ class GatewayBackend:
     Reconnection (default on) runs in the background with exponential
     backoff; every reconnect establishes a new epoch while the backendId
     stays stable, and all channels from the previous epoch are gone.
+
+    :meth:`connect` waits for the first handshake and raises when it fails.
+    Applications that must come up while the gateway is unreachable use
+    :meth:`start` instead: it retries in the background and never raises for
+    an unreachable gateway (``await backend.wait_connected()`` to know when
+    the link is up).
     """
 
     def __init__(
@@ -127,8 +133,12 @@ class GatewayBackend:
         self._reader_task: asyncio.Task[None] | None = None
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._supervisor_task: asyncio.Task[None] | None = None
+        self._start_task: asyncio.Task[None] | None = None
         self._closed_event: asyncio.Event | None = None
+        self._connected_event = asyncio.Event()
         self._reconnect_attempt = 0
+        self._used_connect = False
+        self._used_start = False
 
         self._channel_handlers: dict[str, ChannelHandler] = {}
         self._default_channel_handler: ChannelHandler | None = None
@@ -190,10 +200,32 @@ class GatewayBackend:
         and returns an :class:`~zclaudia_gateway.http.HttpServeResponse`
         (sync or async); the SDK does the frame plumbing
         (``docs/protocol-v4.md`` §7).
+
+        Both directions are buffered: the handler is called once the request
+        body is complete and the response goes out in one piece. For SSE or
+        any other streamed response use :meth:`serve_http_stream` instead —
+        both register the ``http`` channel kind, so the last call wins.
         """
         from .http import build_http_handler
 
         self.on_channel(CHANNEL_KIND_HTTP, build_http_handler(handler))
+
+    def serve_http_stream(self, handler: Any) -> None:
+        """Serve HTTP-over-channel requests with a streaming handler.
+
+        The handler is an async function taking an
+        :class:`~zclaudia_gateway.http.HttpExchange`; it starts as soon as the
+        request head arrives, reads the body with ``read_chunk()`` /
+        ``body()``, and answers with ``await start(status, headers)`` followed
+        by ``await write(chunk)``. Closing the channel — which the SDK does
+        when the handler returns — ends the response.
+
+        Use instead of :meth:`serve_http`; both register the ``http`` channel
+        kind, so the last call wins.
+        """
+        from .http import build_http_stream_handler
+
+        self.on_channel(CHANNEL_KIND_HTTP, build_http_stream_handler(handler))
 
     # --- Lifecycle ---------------------------------------------------------
 
@@ -203,15 +235,57 @@ class GatewayBackend:
         Raises on handshake failure. After a successful connect, unexpected
         disconnects are auto-recovered in the background (unless
         ``reconnect=False``), matching the TypeScript SDK.
+
+        Use either this or :meth:`start`, not both: ``start`` only differs in
+        that it retries the first handshake in the background. A failed
+        ``connect`` leaves :meth:`start` available.
         """
+        if self._used_start:
+            raise RuntimeError("start() was already called; use connect() or start(), not both")
         if self._ws is not None or (self._supervisor_task is not None and not self._supervisor_task.done()):
             raise RuntimeError("Already connected")
         self._closed = False
         self._closed_event = asyncio.Event()
         self._reconnect_attempt = 0
         await self._establish()
+        self._used_connect = True
         self._supervisor_task = asyncio.ensure_future(self._supervise())
         return self._backend_id, self._epoch
+
+    async def start(self) -> None:
+        """Connect in the background, retrying until the gateway accepts.
+
+        Unlike :meth:`connect`, this returns immediately and never raises for
+        an unreachable gateway, a refused handshake (``gateway_error``), or a
+        temporarily invalid credential: the first attempt starts right away
+        and failures are retried with exponential backoff between
+        ``reconnect_min_ms`` and ``reconnect_max_ms``. Once connected, the
+        same background supervisor as :meth:`connect` keeps the link up.
+
+        Idempotent; pair it with :meth:`wait_connected` when something must
+        happen once the link is up. Do not mix it with :meth:`connect`.
+        """
+        if self._used_connect:
+            raise RuntimeError("connect() was already called; use start() or connect(), not both")
+        if self._start_task is not None and not self._start_task.done():
+            return
+        if self._ws is not None or (self._supervisor_task is not None and not self._supervisor_task.done()):
+            return
+        self._used_start = True
+        self._closed = False
+        self._closed_event = asyncio.Event()
+        self._reconnect_attempt = 0
+        self._start_task = asyncio.ensure_future(self._connect_until_up())
+
+    async def wait_connected(self) -> None:
+        """Wait until the backend reaches the ``connected`` state.
+
+        Returns immediately when already connected. State changes keep being
+        reported to :meth:`on_state` handlers, so this only adds a way to
+        await the link without polling. A backend that is closed before ever
+        connecting leaves this waiting, so cancel the waiter on shutdown.
+        """
+        await self._connected_event.wait()
 
     async def wait_closed(self) -> None:
         """Wait until the backend is fully closed.
@@ -234,6 +308,11 @@ class GatewayBackend:
         if supervisor is not None and not supervisor.done():
             supervisor.cancel()
 
+        starter = self._start_task
+        self._start_task = None
+        if starter is not None and not starter.done():
+            starter.cancel()
+
         ws = self._ws
         if ws is not None:
             try:
@@ -244,9 +323,10 @@ class GatewayBackend:
         for task in (self._heartbeat_task, self._reader_task):
             if task is not None and not task.done():
                 task.cancel()
-        if supervisor is not None:
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await supervisor
+        for task in (supervisor, starter):
+            if task is not None:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
         self._heartbeat_task = None
         self._reader_task = None
         self._ws = None
@@ -293,6 +373,10 @@ class GatewayBackend:
         if self._state == state:
             return
         self._state = state
+        if state == "connected":
+            self._connected_event.set()
+        else:
+            self._connected_event.clear()
         for handler in list(self._state_handlers):
             invoke(handler, state)
 
@@ -451,6 +535,29 @@ class GatewayBackend:
                 except Exception as exc:
                     logger.warning("reconnect attempt failed: %s", exc)
                     await asyncio.sleep(self._next_backoff())
+
+    async def _connect_until_up(self) -> None:
+        """Backing loop of :meth:`start`: retry the first connect forever.
+
+        Nothing here raises for a failed attempt — the application is allowed
+        to run while the gateway is unreachable — and the SDK's supervisor
+        takes over from the moment a handshake succeeds.
+        """
+        while True:
+            if self._closed:
+                return
+            try:
+                await self._establish()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("connect attempt failed: %s", exc)
+                await asyncio.sleep(self._next_backoff())
+                continue
+            if self._closed:  # closed while the handshake completed
+                return
+            self._supervisor_task = asyncio.ensure_future(self._supervise())
+            return
 
     def _teardown_connection(self) -> None:
         heartbeat = self._heartbeat_task
