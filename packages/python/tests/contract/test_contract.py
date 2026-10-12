@@ -169,3 +169,49 @@ async def test_enrollment_exchange_creates_access_credential(gateway, enrollment
     ]
     assert children, "expected an exchanged backend-access credential"
     assert children[0]["lastUsedAt"] is not None
+
+
+async def test_start_reports_a_refused_credential_against_the_real_gateway(gateway, enrollment):
+    from zclaudia_gateway import GatewayBackend
+
+    bad = "zgb_" + "0" * 48
+    client = GatewayBackend(
+        url=gateway["httpUrl"],
+        credential=bad,
+        namespace=NAMESPACE,
+        identity={"device_id": "contract-dev", "instance_id": "contract-bad", "name": "bad-credential"},
+        reconnect_min_ms=50,
+        reconnect_max_ms=100,
+    )
+    try:
+        await client.start()  # returns normally although the gateway refuses us
+        await until(lambda: client.last_error is not None)
+        assert client.state == "connecting"
+        assert client.last_error.code == "AUTH_FAILED"
+        assert bad not in repr(client.last_error)
+    finally:
+        await client.close()
+
+
+async def test_start_reports_an_unreachable_gateway_then_clears_on_connect(gateway, enrollment):
+    import socket
+
+    from zclaudia_gateway import GatewayBackend
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        dead_url = f"http://127.0.0.1:{sock.getsockname()[1]}"
+    client = GatewayBackend(
+        url=dead_url,
+        credential=enrollment["token"],
+        namespace=NAMESPACE,
+        identity={"device_id": "contract-dev", "instance_id": "contract-dead"},
+        reconnect_min_ms=50,
+        reconnect_max_ms=100,
+    )
+    try:
+        await client.start()
+        await until(lambda: client.last_error is not None)
+        assert client.last_error.code == "GATEWAY_UNREACHABLE"
+    finally:
+        await client.close()

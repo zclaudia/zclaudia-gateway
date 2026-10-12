@@ -48,6 +48,89 @@ export interface GatewayBackendOptions {
 
 export type GatewayBackendState = 'idle' | 'connecting' | 'connected' | 'closed';
 
+export type BackendErrorCode =
+  | 'AUTH_FAILED'
+  | 'GATEWAY_REJECTED'
+  | 'GATEWAY_UNREACHABLE'
+  | 'HANDSHAKE_TIMEOUT'
+  | 'PROTOCOL_ERROR'
+  | 'CONNECT_FAILED';
+
+/**
+ * Why the most recent connection attempt failed (`GatewayBackend.lastError`).
+ *
+ * Safe to log and to show to users: `message` is a fixed description per
+ * `code`; raw error text, URLs, headers and credentials never end up here.
+ * Branch on `code`, not on `message`.
+ *
+ * - `AUTH_FAILED` — the gateway refused the credential (`UNAUTHORIZED` during
+ *   the handshake, or HTTP 401/403 from the enrollment exchange);
+ * - `GATEWAY_REJECTED` — the gateway refused the handshake for another reason
+ *   (`gatewayCode` carries its error code when it is a known one);
+ * - `GATEWAY_UNREACHABLE` — no usable link: connection refused, DNS or network
+ *   failure, the connection dropped mid-handshake, or an unavailable endpoint;
+ * - `HANDSHAKE_TIMEOUT` — connected, but `peer_ready` never arrived;
+ * - `PROTOCOL_ERROR` — the gateway answered with something the SDK cannot use;
+ * - `CONNECT_FAILED` — anything else.
+ */
+export interface BackendErrorInfo {
+  readonly code: BackendErrorCode;
+  readonly message: string;
+  readonly gatewayCode?: string;
+  /** Wall-clock time of the failed attempt, in epoch milliseconds. */
+  readonly occurredAt: number;
+}
+
+const KNOWN_GATEWAY_ERROR_CODES: ReadonlySet<string> = new Set([
+  'INVALID_MESSAGE',
+  'PROTOCOL_VERSION_MISMATCH',
+  'UNAUTHORIZED',
+  'BACKEND_OFFLINE',
+  'RATE_LIMITED',
+]);
+
+const ERROR_MESSAGES: Record<BackendErrorCode, string> = {
+  AUTH_FAILED: 'The gateway refused the credential.',
+  GATEWAY_REJECTED: 'The gateway rejected the handshake.',
+  GATEWAY_UNREACHABLE: 'The gateway could not be reached.',
+  HANDSHAKE_TIMEOUT: 'The gateway did not complete the handshake in time.',
+  PROTOCOL_ERROR: 'The gateway sent an unexpected handshake response.',
+  CONNECT_FAILED: 'Connecting to the gateway failed.',
+};
+
+/** An attempt failure the SDK can classify; carries the original message for `connect()` callers. */
+class AttemptError extends Error {
+  constructor(
+    readonly code: BackendErrorCode,
+    message: string,
+    readonly gatewayCode?: string,
+    options?: { cause?: unknown },
+  ) {
+    super(message, options);
+    this.name = 'AttemptError';
+  }
+}
+
+function describeFailure(error: unknown): BackendErrorInfo {
+  let code: BackendErrorCode = 'CONNECT_FAILED';
+  let gatewayCode: string | undefined;
+  let message: string | undefined;
+  if (error instanceof AttemptError) {
+    code = error.code;
+    if (error.gatewayCode !== undefined && KNOWN_GATEWAY_ERROR_CODES.has(error.gatewayCode)) {
+      gatewayCode = error.gatewayCode;
+      if (code === 'GATEWAY_REJECTED') message = `The gateway rejected the handshake (${gatewayCode}).`;
+    }
+  }
+  const info: BackendErrorInfo = {
+    code,
+    message: message ?? ERROR_MESSAGES[code],
+    ...(gatewayCode !== undefined ? { gatewayCode } : {}),
+    occurredAt: Date.now(),
+  };
+  return Object.freeze(info);
+}
+
 export interface ChannelOfferInfo {
   channelId: string;
   kind?: string;
@@ -83,6 +166,7 @@ export class GatewayBackend {
   private defaultChannelHandler: ChannelHandler | null = null;
   private closed = false;
   private state: GatewayBackendState = 'idle';
+  private failure: BackendErrorInfo | null = null;
   private reconnectAttempt = 0;
   private stateHandlers: Array<(state: GatewayBackendState) => void> = [];
   private messageHandlers: Array<(message: Record<string, unknown>) => void> = [];
@@ -96,6 +180,23 @@ export class GatewayBackend {
   get id(): string { return this.backendId; }
   get currentEpoch(): number { return this.epoch; }
   get connectionState(): GatewayBackendState { return this.state; }
+
+  /**
+   * The most recent failed connection attempt, or `null`. Read-only and
+   * immutable; see {@link BackendErrorInfo} for the codes. Lifecycle:
+   *
+   * - **set / updated** by every failed attempt — the first handshake of
+   *   `connect()` (which also rejects) and every background reconnect attempt,
+   *   whose failures are otherwise silent — so while `connectionState` is
+   *   `'connecting'` it describes the latest failure;
+   * - **cleared** when a handshake succeeds, before the state becomes
+   *   `'connected'`, and when `connect()` begins a fresh run;
+   * - **kept** across a plain connection drop (a drop is not a failed attempt)
+   *   and by `close()`, which neither sets nor clears it, so a backend closed
+   *   after failing still tells why. Nothing is recorded once `close()` has
+   *   been called.
+   */
+  get lastError(): BackendErrorInfo | null { return this.failure; }
 
   onState(handler: (state: GatewayBackendState) => void): () => void {
     this.stateHandlers.push(handler);
@@ -177,7 +278,18 @@ export class GatewayBackend {
 
   async connect(): Promise<{ backendId: string; epoch: number }> {
     this.closed = false;
-    return this.establish();
+    this.failure = null;
+    try {
+      return await this.establish();
+    } catch (error) {
+      this.recordFailure(error);
+      throw error;
+    }
+  }
+
+  private recordFailure(error: unknown): void {
+    if (this.closed) return; // close() owns the final value; late failures must not change it
+    this.failure = describeFailure(error);
   }
 
   private async establish(): Promise<{ backendId: string; epoch: number }> {
@@ -188,21 +300,46 @@ export class GatewayBackend {
     const socket = this.factory(`${this.wsBase}/ws`);
     socket.binaryType = 'arraybuffer';
     this.socket = socket;
+    try {
+      return await this.handshake(socket, credential);
+    } catch (error) {
+      // A failed attempt must not leave a half-open socket behind: the retry
+      // loop would otherwise stack one per attempt.
+      if (this.socket === socket) this.socket = null;
+      try { socket.close(); } catch { /* already closed */ }
+      throw error;
+    }
+  }
+
+  private async handshake(socket: WebSocketLike, credential: string): Promise<{ backendId: string; epoch: number }> {
     await new Promise<void>((resolve, reject) => {
       socket.addEventListener('open', () => resolve());
-      socket.addEventListener('error', (err) => reject(err instanceof Error ? err : new Error('WebSocket error')));
+      socket.addEventListener('error', () => reject(new AttemptError('GATEWAY_UNREACHABLE', 'WebSocket error')));
     });
 
     const ready = new Promise<PeerReadyV4>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('peer_ready timeout')), 10_000);
+      const timer = setTimeout(() => reject(new AttemptError('HANDSHAKE_TIMEOUT', 'peer_ready timeout')), 10_000);
       socket.addEventListener('message', (event) => {
         if (typeof event.data !== 'string') return;
         const msg = JSON.parse(event.data);
         if (msg.type === 'peer_ready') { clearTimeout(timer); resolve(msg); }
-        else if (msg.type === 'gateway_error') { clearTimeout(timer); reject(new Error(`${msg.code}: ${msg.message}`)); }
+        else if (msg.type === 'gateway_error') {
+          clearTimeout(timer);
+          const code = String(msg.code);
+          reject(new AttemptError(
+            code === 'UNAUTHORIZED' ? 'AUTH_FAILED' : 'GATEWAY_REJECTED',
+            `${msg.code}: ${msg.message}`,
+            code,
+          ));
+        }
+      });
+      socket.addEventListener('close', () => {
+        clearTimeout(timer);
+        reject(new AttemptError('GATEWAY_UNREACHABLE', 'Connection closed before peer_ready'));
       });
     });
 
+    ready.catch(() => { /* surfaced by `await ready` below */ });
     socket.send(JSON.stringify({
       type: 'peer_hello',
       protocolVersion: GATEWAY_PROTOCOL_V4,
@@ -219,7 +356,7 @@ export class GatewayBackend {
     }));
 
     const readyMsg = await ready;
-    if (!readyMsg.backend) throw new Error('Gateway did not assign a backend identity');
+    if (!readyMsg.backend) throw new AttemptError('PROTOCOL_ERROR', 'Gateway did not assign a backend identity');
     this.backendId = readyMsg.backend.backendId;
     this.epoch = readyMsg.backend.epoch;
 
@@ -240,6 +377,7 @@ export class GatewayBackend {
     }, interval);
 
     this.reconnectAttempt = 0;
+    this.failure = null;
     this.setState('connected');
     return { backendId: this.backendId, epoch: this.epoch };
   }
@@ -263,7 +401,10 @@ export class GatewayBackend {
     this.reconnectAttempt += 1;
     setTimeout(() => {
       if (this.closed) return;
-      this.establish().catch(() => this.scheduleReconnect());
+      this.establish().catch((error: unknown) => {
+        this.recordFailure(error);
+        this.scheduleReconnect();
+      });
     }, delay);
   }
 
@@ -273,15 +414,25 @@ export class GatewayBackend {
       return this.opts.credential;
     }
     const httpBase = this.wsBase.replace(/^ws/, 'http');
-    const response = await fetch(`${httpBase}/api/backend/token`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${this.opts.credential}` },
-    });
-    if (!response.ok) {
-      throw new Error(`Enrollment exchange failed: HTTP ${response.status}`);
+    let response: Response;
+    try {
+      response = await fetch(`${httpBase}/api/backend/token`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${this.opts.credential}` },
+      });
+    } catch (error) {
+      throw new AttemptError('GATEWAY_UNREACHABLE', error instanceof Error ? error.message : 'fetch failed', undefined, { cause: error });
     }
-    const body = await response.json() as { data: { token: string } };
-    return body.data.token;
+    if (!response.ok) {
+      const code = response.status === 401 || response.status === 403 ? 'AUTH_FAILED' : 'GATEWAY_UNREACHABLE';
+      throw new AttemptError(code, `Enrollment exchange failed: HTTP ${response.status}`);
+    }
+    const body = await response.json().catch(() => null) as { data?: { token?: unknown } } | null;
+    const token = body?.data?.token;
+    if (typeof token !== 'string' || token === '') {
+      throw new AttemptError('PROTOCOL_ERROR', 'Enrollment exchange returned no token');
+    }
+    return token;
   }
 
   private async handleOffer(offer: ChannelOfferMessage): Promise<void> {

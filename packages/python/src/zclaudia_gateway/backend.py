@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from websockets.asyncio.client import connect as ws_connect
-from websockets.exceptions import ConnectionClosed
+from websockets.exceptions import ConnectionClosed, InvalidHandshake
 
 from .channel import (
     MAX_MESSAGE_SIZE,
@@ -32,6 +32,7 @@ from .channel import (
 )
 from .protocol import (
     CHANNEL_KIND_HTTP,
+    GATEWAY_ERROR_CODES,
     GATEWAY_PROTOCOL_V4,
     PEER_TYPE_CLIENT_BACKEND,
     ChannelOffer,
@@ -43,6 +44,15 @@ from .protocol import (
 logger = logging.getLogger("zclaudia_gateway")
 
 GatewayBackendState = Literal["idle", "connecting", "connected", "closed"]
+
+BackendErrorCode = Literal[
+    "AUTH_FAILED",
+    "GATEWAY_REJECTED",
+    "GATEWAY_UNREACHABLE",
+    "HANDSHAKE_TIMEOUT",
+    "PROTOCOL_ERROR",
+    "CONNECT_FAILED",
+]
 
 StateHandler = Callable[[GatewayBackendState], Any]
 RawMessageHandler = Callable[[dict[str, Any]], Any]
@@ -56,6 +66,80 @@ class ChannelOfferInfo:
     channel_id: str
     kind: str | None = None
     source_peer_session_id: str | None = None
+
+
+@dataclass(frozen=True)
+class BackendErrorInfo:
+    """Why the most recent connection attempt failed (:attr:`GatewayBackend.last_error`).
+
+    Safe to log and to show to users: ``message`` is a fixed description per
+    ``code``; the raw exception text, request headers, URLs and credentials
+    never end up here. Branch on ``code``, not on ``message``.
+
+    ``code`` is one of:
+
+    - ``AUTH_FAILED`` — the gateway refused the credential (``UNAUTHORIZED``
+      during the handshake, or HTTP 401/403 from the enrollment exchange);
+    - ``GATEWAY_REJECTED`` — the gateway refused the handshake for another
+      reason (``gateway_code`` carries its error code when it is a known one);
+    - ``GATEWAY_UNREACHABLE`` — no usable link: connection refused, DNS or
+      network failure, connect timeout, the connection dropped mid-handshake,
+      or a non-WebSocket / unavailable endpoint;
+    - ``HANDSHAKE_TIMEOUT`` — connected, but ``peer_ready`` never arrived;
+    - ``PROTOCOL_ERROR`` — the gateway answered with something the SDK cannot
+      use (e.g. a handshake without a backend identity);
+    - ``CONNECT_FAILED`` — anything else.
+    """
+
+    code: BackendErrorCode
+    message: str
+    gateway_code: str | None = None
+    occurred_at: float = 0.0
+    """Wall-clock time (``time.time()``) of the failed attempt."""
+
+
+class _AttemptError(RuntimeError):
+    """An attempt failure the SDK itself can classify (kept a ``RuntimeError``
+    so ``connect()`` callers written against earlier releases keep working)."""
+
+    def __init__(self, code: BackendErrorCode, detail: str) -> None:
+        super().__init__(detail)
+        self.code: BackendErrorCode = code
+
+
+_ERROR_MESSAGES: dict[BackendErrorCode, str] = {
+    "AUTH_FAILED": "The gateway refused the credential.",
+    "GATEWAY_REJECTED": "The gateway rejected the handshake.",
+    "GATEWAY_UNREACHABLE": "The gateway could not be reached.",
+    "HANDSHAKE_TIMEOUT": "The gateway did not complete the handshake in time.",
+    "PROTOCOL_ERROR": "The gateway sent an unexpected handshake response.",
+    "CONNECT_FAILED": "Connecting to the gateway failed.",
+}
+
+
+def _describe_failure(exc: BaseException) -> BackendErrorInfo:
+    """Map an attempt failure to a credential-free :class:`BackendErrorInfo`."""
+    code: BackendErrorCode = "CONNECT_FAILED"
+    gateway_code: str | None = None
+    message: str | None = None
+    if isinstance(exc, GatewayError):
+        gateway_code = exc.code if exc.code in GATEWAY_ERROR_CODES else None
+        if exc.code == "UNAUTHORIZED":
+            code = "AUTH_FAILED"
+        else:
+            code = "GATEWAY_REJECTED"
+            if gateway_code is not None:
+                message = f"The gateway rejected the handshake ({gateway_code})."
+    elif isinstance(exc, _AttemptError):
+        code = exc.code
+    elif isinstance(exc, (OSError, ConnectionClosed, InvalidHandshake)):
+        code = "GATEWAY_UNREACHABLE"
+    return BackendErrorInfo(
+        code=code,
+        message=message or _ERROR_MESSAGES[code],
+        gateway_code=gateway_code,
+        occurred_at=time.time(),
+    )
 
 
 ChannelHandler = Callable[[GatewayChannel, ChannelOfferInfo], Any]
@@ -84,6 +168,9 @@ class GatewayBackend:
     :meth:`start` instead: it retries in the background and never raises for
     an unreachable gateway (``await backend.wait_connected()`` to know when
     the link is up).
+
+    Because :meth:`start` does not raise, failed attempts are reported through
+    :attr:`last_error` instead (see there for its lifecycle).
     """
 
     def __init__(
@@ -128,6 +215,7 @@ class GatewayBackend:
         self._peer_session_id = ""
 
         self._state: GatewayBackendState = "idle"
+        self._last_error: BackendErrorInfo | None = None
         self._closed = False
         self._ws: Any = None
         self._reader_task: asyncio.Task[None] | None = None
@@ -162,6 +250,27 @@ class GatewayBackend:
     @property
     def state(self) -> GatewayBackendState:
         return self._state
+
+    @property
+    def last_error(self) -> BackendErrorInfo | None:
+        """The most recent failed connection attempt, or ``None``.
+
+        Read-only and immutable; see :class:`BackendErrorInfo` for the codes.
+        Lifecycle:
+
+        - **set / updated** by every failed attempt — the first handshake of
+          :meth:`connect` (which also raises) or :meth:`start` (which keeps
+          retrying and does not), and every reconnect attempt — so while
+          ``state == "connecting"`` it describes the latest failure;
+        - **cleared** when a handshake succeeds, before ``state`` becomes
+          ``"connected"``, and when :meth:`start` or :meth:`connect` begins a
+          fresh run (an idempotent repeat call changes nothing);
+        - **kept** across a plain connection drop (a drop is not a failed
+          attempt) and by :meth:`close`, which neither sets nor clears it, so
+          a backend closed after failing still tells why. Attempts cancelled
+          by :meth:`close` are not failures and are not recorded.
+        """
+        return self._last_error
 
     @property
     def lease_ttl_ms(self) -> int:
@@ -247,7 +356,12 @@ class GatewayBackend:
         self._closed = False
         self._closed_event = asyncio.Event()
         self._reconnect_attempt = 0
-        await self._establish()
+        self._last_error = None
+        try:
+            await self._establish()
+        except Exception as exc:
+            self._record_failure(exc)
+            raise
         self._used_connect = True
         self._supervisor_task = asyncio.ensure_future(self._supervise())
         return self._backend_id, self._epoch
@@ -275,6 +389,7 @@ class GatewayBackend:
         self._closed = False
         self._closed_event = asyncio.Event()
         self._reconnect_attempt = 0
+        self._last_error = None
         self._start_task = asyncio.ensure_future(self._connect_until_up())
 
     async def wait_connected(self) -> None:
@@ -380,6 +495,11 @@ class GatewayBackend:
         for handler in list(self._state_handlers):
             invoke(handler, state)
 
+    def _record_failure(self, exc: BaseException) -> None:
+        if self._closed:  # close() owns the final value; late failures must not change it
+            return
+        self._last_error = _describe_failure(exc)
+
     async def _establish(self) -> None:
         self._set_state("connecting")
         # Re-resolve on every attempt: an exchanged access token may have
@@ -425,7 +545,7 @@ class GatewayBackend:
                 await ws.close()
             except Exception:
                 pass
-            raise RuntimeError("Gateway did not assign a backend identity")
+            raise _AttemptError("PROTOCOL_ERROR", "Gateway did not assign a backend identity")
 
         self._backend_id = ready.backend_id
         self._epoch = ready.epoch
@@ -434,6 +554,7 @@ class GatewayBackend:
         self._reader_task = asyncio.ensure_future(self._read_control(ws))
         self._heartbeat_task = asyncio.ensure_future(self._heartbeat_loop(ws))
         self._reconnect_attempt = 0
+        self._last_error = None
         self._set_state("connected")
 
     async def _await_peer_ready(self, ws: Any) -> PeerReady:
@@ -457,7 +578,7 @@ class GatewayBackend:
         try:
             return await asyncio.wait_for(wait(), timeout=PeerReadyTimeout)
         except TimeoutError:
-            raise RuntimeError("peer_ready timeout") from None
+            raise _AttemptError("HANDSHAKE_TIMEOUT", "peer_ready timeout") from None
 
     async def _read_control(self, ws: Any) -> None:
         try:
@@ -533,6 +654,7 @@ class GatewayBackend:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
+                    self._record_failure(exc)
                     logger.warning("reconnect attempt failed: %s", exc)
                     await asyncio.sleep(self._next_backoff())
 
@@ -551,6 +673,7 @@ class GatewayBackend:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                self._record_failure(exc)
                 logger.warning("connect attempt failed: %s", exc)
                 await asyncio.sleep(self._next_backoff())
                 continue
@@ -627,7 +750,7 @@ class GatewayBackend:
         data = body.get("data") or {}
         token = data.get("token")
         if not token:
-            raise RuntimeError("Enrollment exchange returned no token")
+            raise _AttemptError("PROTOCOL_ERROR", "Enrollment exchange returned no token")
         return str(token)
 
     def _exchange_enrollment_blocking(self) -> dict[str, Any]:
@@ -640,7 +763,9 @@ class GatewayBackend:
             with urllib.request.urlopen(request, timeout=15) as response:
                 parsed = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            raise RuntimeError(f"Enrollment exchange failed: HTTP {exc.code}") from exc
+            exc.close()  # the error object owns the response socket; don't wait for the GC
+            code: BackendErrorCode = "AUTH_FAILED" if exc.code in (401, 403) else "GATEWAY_UNREACHABLE"
+            raise _AttemptError(code, f"Enrollment exchange failed: HTTP {exc.code}") from exc
         if not isinstance(parsed, dict):
-            raise RuntimeError("Enrollment exchange returned a non-object body")
+            raise _AttemptError("PROTOCOL_ERROR", "Enrollment exchange returned a non-object body")
         return parsed

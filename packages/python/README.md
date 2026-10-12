@@ -185,6 +185,48 @@ asyncio.run(main())
 `start()` and `connect()` are mutually exclusive on one instance — mixing them
 raises `RuntimeError` rather than running two supervisors.
 
+### Why is it not connecting? `last_error`
+
+`start()` returns normally even when the first handshake fails, so the reason
+is exposed on `backend.last_error` — `None` or an immutable `BackendErrorInfo`
+(`code`, `message`, `gateway_code`, `occurred_at`) describing the most recent
+failed attempt:
+
+```python
+await backend.start()
+await asyncio.sleep(2)
+if backend.state != "connected" and backend.last_error is not None:
+    if backend.last_error.code == "AUTH_FAILED":
+        show("The gateway refused the credential — check it in the settings.")
+    else:
+        show(backend.last_error.message)       # safe to display and to log
+```
+
+| `code` | Meaning |
+| --- | --- |
+| `AUTH_FAILED` | Credential refused: `UNAUTHORIZED` at the handshake, or HTTP 401/403 from the enrollment exchange |
+| `GATEWAY_REJECTED` | Handshake refused for another reason (`gateway_code` holds the gateway's code if it is a known one) |
+| `GATEWAY_UNREACHABLE` | Connection refused, DNS/network failure, connect timeout, connection dropped mid-handshake, or the endpoint is unavailable |
+| `HANDSHAKE_TIMEOUT` | Connected, but `peer_ready` never arrived |
+| `PROTOCOL_ERROR` | The gateway's answer was unusable (no backend identity, no token) |
+| `CONNECT_FAILED` | Anything else |
+
+Branch on `code`; `message` is a fixed description per code. Raw exception
+text, URLs, headers and credentials are never copied into it (they may still
+appear in the SDK's own log records).
+
+Lifecycle:
+
+- **Set or replaced** by every failed attempt: the first handshake of
+  `connect()` (which also raises, unchanged), each retry of `start()`, and each
+  reconnect after a drop. While `state == "connecting"` it is the latest failure.
+- **Cleared** when a handshake succeeds (before `state` turns `"connected"`)
+  and when `start()`/`connect()` begins a fresh run; an idempotent repeat
+  `start()` leaves it alone.
+- **Kept** by a plain connection drop (a drop is not a failed attempt) and by
+  `close()`, which neither sets nor clears it — so a backend closed after
+  failing still says why. Nothing is recorded once `close()` has been called.
+
 ## API sketch
 
 - `GatewayBackend(url, credential, namespace, identity, ...)` — `identity`
@@ -192,6 +234,8 @@ raises `RuntimeError` rather than running two supervisors.
 - `await connect() -> (backend_id, epoch)` · `await start()` ·
   `await wait_connected()` · `await close()` · `await wait_closed()` ·
   `async with` supported.
+- `state` · `last_error` (`BackendErrorInfo | None`, read-only) · `backend_id` ·
+  `epoch` · `on_state(handler)`.
 - `on_channel(kind, handler)` / `on_any_channel(handler)` — handler receives
   `(channel, info)`; sync or async.
 - `serve_http(handler)` — buffered `HttpServeRequest` → `HttpServeResponse`.
@@ -213,6 +257,7 @@ Channel objects (`GatewayChannel`): `await send(str|bytes)`, `on_message`,
 
 | Python SDK | Gateway protocol (`peer_hello.protocolVersion`) |
 | --- | --- |
+| 0.3.x | 4 |
 | 0.2.x | 4 |
 | 0.1.x | 4 |
 

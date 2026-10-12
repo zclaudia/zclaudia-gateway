@@ -47,11 +47,15 @@ class FakeGateway:
         reject_exchange: bool = False,
         exchange_token: str = "zga_exchanged",
         lease_ttl_ms: int = 30_000,
+        silent_hello: bool = False,
+        drop_on_hello: bool = False,
     ) -> None:
         self.reject_hello = reject_hello
         self.reject_exchange = reject_exchange
         self.exchange_token = exchange_token
         self.lease_ttl_ms = lease_ttl_ms
+        self.silent_hello = silent_hello  # read peer_hello, then never answer
+        self.drop_on_hello = drop_on_hello  # read peer_hello, then hang up without gateway_error
 
         self.hellos: list[dict[str, Any]] = []
         self.heartbeats: list[dict[str, Any]] = []
@@ -115,6 +119,12 @@ class FakeGateway:
             raw = await ws.recv()
             hello = json.loads(raw)
             self.hellos.append(hello)
+            if self.silent_hello:
+                await ws.wait_closed()
+                return
+            if self.drop_on_hello:
+                await ws.close(1011, "boom")
+                return
             if self.reject_hello is not None:
                 code, message = self.reject_hello
                 await ws.send(json.dumps({"type": "gateway_error", "code": code, "message": message}))

@@ -4,7 +4,7 @@ from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _distribution_version
 
 from .asgi import asgi_http_handler
-from .backend import ChannelOfferInfo, GatewayBackend, GatewayBackendState
+from .backend import BackendErrorCode, BackendErrorInfo, ChannelOfferInfo, GatewayBackend, GatewayBackendState
 from .channel import MAX_MESSAGE_SIZE, ChannelClosedError, GatewayChannel
 from .http import (
     HttpExchange,
@@ -30,6 +30,8 @@ __all__ = [
     "CHANNEL_KIND_HTTP",
     "GATEWAY_PROTOCOL_V4",
     "MAX_MESSAGE_SIZE",
+    "BackendErrorCode",
+    "BackendErrorInfo",
     "ChannelClosedError",
     "ChannelOffer",
     "ChannelOfferInfo",
