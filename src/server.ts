@@ -1742,7 +1742,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
     if (!peer.backendId || peer.epoch == null) return false;
     if (expectedEpoch !== undefined && peer.epoch !== expectedEpoch) return false;
     const lease = state.leases.get(peer.backendId);
-    return lease?.peerSessionId === peer.peerSessionId && lease.epoch === peer.epoch;
+    return lease?.peerSessionId === peer.peerSessionId && lease?.epoch === peer.epoch;
   }
 
   function unregisterRecoveryToken(peer: PeerSession): void {

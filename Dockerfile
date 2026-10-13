@@ -1,7 +1,7 @@
 # Stage 1: Build
-FROM node:22.14.0-slim AS builder
+FROM node:22.20.0-slim AS builder
 
-RUN npm install -g pnpm@9.15.0
+RUN npm install -g pnpm@12.4.1
 
 WORKDIR /app/zclaudia
 
@@ -20,6 +20,11 @@ RUN pnpm install --frozen-lockfile
 COPY src src
 COPY tsconfig.json ./
 
+# The server consumes @zclaudia/gateway-protocol as a workspace package whose
+# exports/types point at dist/, so build it before the server's tsc resolves it.
+COPY packages/protocol packages/protocol
+RUN pnpm --filter @zclaudia/gateway-protocol build
+
 # Server only — SDK packages are not part of the runtime image
 RUN pnpm exec tsc
 
@@ -28,9 +33,9 @@ COPY packages/admin-ui packages/admin-ui
 RUN pnpm --filter @zclaudia/admin-ui build
 
 # Stage 2: Production
-FROM node:22.14.0-slim AS runtime
+FROM node:22.20.0-slim AS runtime
 
-RUN npm install -g pnpm@9.15.0
+RUN npm install -g pnpm@12.4.1
 
 WORKDIR /app/zclaudia
 
@@ -44,6 +49,8 @@ RUN pnpm install --frozen-lockfile --prod
 
 # Copy built output
 COPY --from=builder /app/zclaudia/dist dist
+# Protocol dist: the runtime resolves the workspace dep through its exports map
+COPY --from=builder /app/zclaudia/packages/protocol/dist packages/protocol/dist
 # Admin web UI static bundle, served by the gateway at /admin (ADR-0005)
 COPY --from=builder /app/zclaudia/packages/admin-ui/dist admin-ui
 
