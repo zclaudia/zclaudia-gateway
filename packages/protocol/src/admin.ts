@@ -69,3 +69,17 @@ export type IssuedGatewayCredential = GatewayCredentialInfo & { token: string };
 export interface RevokeCredentialResponse {
   revoked: string[];
 }
+
+/**
+ * POST /api/admin/credentials/purge request body. Permanently deletes revoked
+ * credentials; ids that are not revoked (or unknown) are ignored.
+ */
+export interface PurgeCredentialsRequest {
+  /** Credential ids to delete; omitted = every revoked credential. */
+  ids?: string[];
+}
+
+/** POST /api/admin/credentials/purge response: ids actually deleted. */
+export interface PurgeCredentialsResponse {
+  deleted: string[];
+}

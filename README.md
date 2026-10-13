@@ -39,7 +39,7 @@ mobile ── HTTP /api/proxy ┘      │
 - `zgb_*` Backend 凭证：可注册 Backend；默认不过期；可经 `/api/backend/token` 交换为短期 `zga_*` 访问凭证（Backend SDK 默认行为）。
 - 撤销立即生效：在线连接被断开（close 1008），后续认证被拒；撤销 `zgb_*` 级联撤销其交换出的 `zga_*`。
 - 凭证在 WS（`peer_hello.gatewaySecret` 字段，名称保留以稳定 wire）与 HTTP（`Bearer <token>`）两侧通用。
-- 管理端点（需 `GATEWAY_ADMIN_TOKEN`，必填——它是签发凭证的信任根）：`POST/GET /api/admin/credentials`、`DELETE /api/admin/credentials/:id`；命令行封装见 [scripts/gateway-admin.sh](scripts/gateway-admin.sh)（`issue-backend` / `issue-device` / `list` / `revoke`，自动读取 `.env`）。
+- 管理端点（需 `GATEWAY_ADMIN_TOKEN`，必填——它是签发凭证的信任根）：`POST/GET /api/admin/credentials`、`DELETE /api/admin/credentials/:id`（吊销）、`POST /api/admin/credentials/purge`（永久删除已吊销凭证，可传 `ids`，缺省清理全部）；命令行封装见 [scripts/gateway-admin.sh](scripts/gateway-admin.sh)（`issue-backend` / `issue-device` / `list` / `revoke` / `purge`，自动读取 `.env`）。
 - **Web 管理控制台**（[ADR-0005](docs/adr/0005-admin-web-ui.md)）：容器镜像内置 UI，访问 `/admin`（本地 `http://localhost:3200/admin`）用管理员令牌登录，即可签发/吊销凭证、查看在线连接与凭证状态。登录用令牌换取 HttpOnly + SameSite=Strict 会话 Cookie（默认 12h，重启即登出），令牌本身不落浏览器；`/api/admin/*` 同时继续接受 Bearer 令牌，CLI 不受影响。源码在 [packages/admin-ui](packages/admin-ui)，开发用 `pnpm --filter @zclaudia/admin-ui dev`；非容器部署需设置 `GATEWAY_ADMIN_UI_DIR` 指向构建产物（`pnpm --filter @zclaudia/admin-ui build`）。
 
 ## 本地开发

@@ -430,6 +430,33 @@ export class GatewayStorage {
     return [id, ...children.map((c) => c.id)];
   }
 
+  /**
+   * Permanently delete revoked credentials — all of them, or only `ids`.
+   * Credentials that are not revoked are never touched, whatever the ids say.
+   * Safe for tokens: a revoked or missing row both fail authentication, and
+   * exchanged tokens whose parent row is gone are rejected too.
+   * Returns the ids actually deleted.
+   */
+  purgeRevokedCredentials(ids?: string[]): string[] {
+    const wanted = ids ? new Set(ids) : null;
+    if (this.memoryState) {
+      const deleted: string[] = [];
+      for (const record of this.memoryState.credentials.values()) {
+        if (record.revokedAt !== null && (!wanted || wanted.has(record.id))) deleted.push(record.id);
+      }
+      for (const id of deleted) this.memoryState.credentials.delete(id);
+      return deleted;
+    }
+    // Single statement, so the revoked check and the delete are atomic.
+    const rows = (wanted
+      ? this.sqlite.prepare(
+        'DELETE FROM credentials WHERE revoked_at IS NOT NULL AND id IN (SELECT value FROM json_each(?)) RETURNING id',
+      ).all(JSON.stringify([...wanted]))
+      : this.sqlite.prepare('DELETE FROM credentials WHERE revoked_at IS NOT NULL RETURNING id').all()
+    ) as Array<{ id: string }>;
+    return rows.map((r) => r.id);
+  }
+
   close(): void {
     this.db?.close();
   }

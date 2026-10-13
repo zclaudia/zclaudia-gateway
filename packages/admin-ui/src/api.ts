@@ -109,4 +109,12 @@ export const api = {
       method: 'DELETE',
     });
   },
+
+  /** Permanently delete revoked credentials: the given ids, or all revoked when omitted. */
+  async purgeCredentials(ids?: string[]): Promise<{ deleted: string[] }> {
+    return request<{ deleted: string[] }>('/api/admin/credentials/purge', {
+      method: 'POST',
+      body: JSON.stringify(ids ? { ids } : {}),
+    });
+  },
 };

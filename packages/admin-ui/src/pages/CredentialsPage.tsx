@@ -234,6 +234,61 @@ function RevokeDialog({
   );
 }
 
+function PurgeDialog({
+  ids,
+  single,
+  onClose,
+  onPurged,
+  onError,
+}: {
+  ids: string[];
+  /** Set when deleting one row; absent for the bulk clean-up. */
+  single: CredentialRecord | null;
+  onClose: () => void;
+  onPurged: () => void;
+  onError: (err: unknown) => void;
+}) {
+  const { t } = useI18n();
+  const [busy, setBusy] = useState(false);
+
+  async function handleConfirm() {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await api.purgeCredentials(ids);
+      onPurged();
+    } catch (err) {
+      onError(err);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="modal-backdrop">
+      <div className="modal">
+        <h3>{t('purge.title')}</h3>
+        <p>
+          {single ? (
+            <>
+              {t('purge.confirmOne')}
+              <strong>{single.name || single.id}</strong>
+              {t('revoke.confirmSuffix', { type: t(TYPE_KEYS[single.type]), namespace: single.namespace })}
+            </>
+          ) : t('purge.confirmAll', { count: ids.length })}
+        </p>
+        <p className="token-warning">{t('purge.warning')}</p>
+        <div className="modal-actions">
+          <button type="button" className="btn btn-ghost" onClick={onClose}>{t('common.cancel')}</button>
+          <button type="button" className="btn btn-danger" onClick={handleConfirm} disabled={busy}>
+            {busy ? t('purge.purging') : t('purge.confirm')}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function RevokedResultModal({ ids, onClose }: { ids: string[]; onClose: () => void }) {
   const { t } = useI18n();
   return (
@@ -266,6 +321,7 @@ export function CredentialsPage({ onSessionLost }: { onSessionLost: (err: unknow
   const [issued, setIssued] = useState<IssuedCredential | null>(null);
   const [revoking, setRevoking] = useState<CredentialRecord | null>(null);
   const [revokedIds, setRevokedIds] = useState<string[] | null>(null);
+  const [purging, setPurging] = useState<{ ids: string[]; single: CredentialRecord | null } | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -300,6 +356,11 @@ export function CredentialsPage({ onSessionLost }: { onSessionLost: (err: unknow
     return list;
   }, [credentials, typeFilter, statusFilter, namespaceFilter, search]);
 
+  const revokedAll = useMemo(
+    () => (credentials ?? []).filter((c) => credentialStatus(c) === 'revoked'),
+    [credentials],
+  );
+
   function showActionError(err: unknown) {
     setActionError(err);
     onSessionLost(err);
@@ -318,6 +379,14 @@ export function CredentialsPage({ onSessionLost }: { onSessionLost: (err: unknow
         <h2>{t('nav.credentials')}</h2>
         <div className="page-head-actions">
           <button type="button" className="btn btn-ghost" onClick={load}>{t('creds.refresh')}</button>
+          <button
+            type="button"
+            className="btn btn-danger"
+            disabled={revokedAll.length === 0}
+            onClick={() => setPurging({ ids: revokedAll.map((c) => c.id), single: null })}
+          >
+            {t('creds.purgeRevoked', { count: revokedAll.length })}
+          </button>
           <button type="button" className="btn btn-primary" onClick={() => setIssuing(true)}>
             {t('creds.issue')}
           </button>
@@ -397,6 +466,11 @@ export function CredentialsPage({ onSessionLost }: { onSessionLost: (err: unknow
                         {t('creds.revoke')}
                       </button>
                     )}
+                    {status === 'revoked' && (
+                      <button type="button" className="btn btn-small btn-danger" onClick={() => setPurging({ ids: [c.id], single: c })}>
+                        {t('creds.delete')}
+                      </button>
+                    )}
                   </td>
                 </tr>
               );
@@ -421,6 +495,15 @@ export function CredentialsPage({ onSessionLost }: { onSessionLost: (err: unknow
           onClose={() => setRevoking(null)}
           onRevoked={(ids) => { setRevoking(null); setRevokedIds(ids); load(); }}
           onError={showActionError}
+        />
+      )}
+      {purging && (
+        <PurgeDialog
+          ids={purging.ids}
+          single={purging.single}
+          onClose={() => setPurging(null)}
+          onPurged={() => { setPurging(null); load(); }}
+          onError={(err) => { setPurging(null); showActionError(err); }}
         />
       )}
       {revokedIds && <RevokedResultModal ids={revokedIds} onClose={() => setRevokedIds(null)} />}

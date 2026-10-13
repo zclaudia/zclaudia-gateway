@@ -12,6 +12,7 @@
 #   gateway-admin.sh issue-device  <namespace> <name> [ttl-days]
 #   gateway-admin.sh list
 #   gateway-admin.sh revoke <credential-id>
+#   gateway-admin.sh purge [credential-id]   # delete revoked credentials (all if no id)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -106,8 +107,21 @@ else:
     sys.exit(1)
 '
     ;;
+  purge)
+    body="{}"
+    [ -n "${2:-}" ] && body="{\"ids\":[\"$2\"]}"
+    api POST /api/admin/credentials/purge "$body" | python3 -c '
+import json, sys
+r = json.load(sys.stdin)
+if r.get("success"):
+    print("deleted %d revoked credential(s)" % len(r["data"]["deleted"]))
+else:
+    print("Error:", json.dumps(r.get("error"), ensure_ascii=False), file=sys.stderr)
+    sys.exit(1)
+'
+    ;;
   *)
-    sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
     exit 1
     ;;
 esac

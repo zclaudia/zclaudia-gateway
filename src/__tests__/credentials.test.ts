@@ -142,6 +142,50 @@ describeIfLoopback('Phase 1: Credential System', () => {
       expect(revokeAgain.status).toBe(404);
     });
 
+    test('purge deletes only revoked credentials', async () => {
+      const { httpUrl } = await startServer();
+      const admin = { Authorization: `Bearer ${ADMIN_TOKEN}`, 'Content-Type': 'application/json' };
+      const purge = async (body: unknown) => {
+        const res = await fetch(`${httpUrl}/api/admin/credentials/purge`, {
+          method: 'POST', headers: admin, body: JSON.stringify(body),
+        });
+        return { status: res.status, body: await res.json() };
+      };
+      const listIds = async () => {
+        const res = await fetch(`${httpUrl}/api/admin/credentials`, { headers: admin });
+        return ((await res.json()).data as Array<{ id: string }>).map((c) => c.id);
+      };
+      const revoke = (id: string) => fetch(`${httpUrl}/api/admin/credentials/${id}`, { method: 'DELETE', headers: admin });
+
+      const keep = (await issueCredential(httpUrl, { type: 'device', namespace: 'purge-ns' })).body.data;
+      const gone1 = (await issueCredential(httpUrl, { type: 'device', namespace: 'purge-ns' })).body.data;
+      const gone2 = (await issueCredential(httpUrl, { type: 'device', namespace: 'purge-ns' })).body.data;
+      await revoke(gone1.id);
+      await revoke(gone2.id);
+
+      // Active credentials are ignored even when named explicitly
+      const targeted = await purge({ ids: [keep.id, gone1.id] });
+      expect(targeted.status).toBe(200);
+      expect(targeted.body.data.deleted).toEqual([gone1.id]);
+      expect(await listIds()).toEqual(expect.arrayContaining([keep.id, gone2.id]));
+      expect(await listIds()).not.toContain(gone1.id);
+
+      // No ids: clean up every revoked credential, keep the active ones
+      const all = await purge({});
+      expect(all.body.data.deleted).toContain(gone2.id);
+      const remaining = await listIds();
+      expect(remaining).toContain(keep.id);
+      expect(remaining).not.toContain(gone2.id);
+
+      // A deleted credential's token stays rejected
+      const stale = await fetch(`${httpUrl}/api/admin/credentials/${gone1.id}`, { method: 'DELETE', headers: admin });
+      expect(stale.status).toBe(404);
+
+      expect((await purge({ ids: 'nope' })).status).toBe(400);
+      const anon = await fetch(`${httpUrl}/api/admin/credentials/purge`, { method: 'POST', body: '{}', headers: { 'Content-Type': 'application/json' } });
+      expect(anon.status).toBe(401);
+    });
+
     test('backend credentials default to no expiry, ttlDays is honored', async () => {
       const { httpUrl } = await startServer();
       const backend = await issueCredential(httpUrl, { type: 'backend', namespace: 'hermes' });

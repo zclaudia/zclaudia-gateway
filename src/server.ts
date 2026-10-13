@@ -521,6 +521,22 @@ export function createGatewayServer(config: GatewayConfig): Server {
     res.json({ success: true, data: { revoked: revokedIds } });
   });
 
+  // Permanently delete revoked credentials: the given ids, or all of them when
+  // `ids` is omitted. Only revoked rows are ever deleted — active/expired ones
+  // must be revoked first, so a stray request cannot erase a live credential.
+  app.post('/api/admin/credentials/purge', requireAdmin, (req: Request, res: Response) => {
+    const { ids } = (req.body ?? {}) as { ids?: unknown };
+    if (ids !== undefined && (!Array.isArray(ids) || !ids.every((id) => typeof id === 'string'))) {
+      res.status(400).json({ success: false, error: { code: 'INVALID_REQUEST', message: 'ids must be an array of strings' } });
+      return;
+    }
+    const deleted = storage.purgeRevokedCredentials(ids as string[] | undefined);
+    if (deleted.length > 0) {
+      audit('credential.purged', { count: deleted.length, ids: deleted.join(',') });
+    }
+    res.json({ success: true, data: { deleted } });
+  });
+
   // --- Backend enrollment -> short-lived access credential (ADR-0002) ---
   app.post('/api/backend/token', (req: Request, res: Response) => {
     const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
