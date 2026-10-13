@@ -59,6 +59,9 @@ BackendErrorCode = Literal[
 StateHandler = Callable[[GatewayBackendState], Any]
 RawMessageHandler = Callable[[dict[str, Any]], Any]
 PeerReadyTimeout = 10.0
+# Re-exchange an access token this long before the gateway says it expires,
+# so a reconnect never presents one that dies mid-handshake.
+ACCESS_TOKEN_REFRESH_MARGIN_MS = 60_000
 
 
 @dataclass(frozen=True)
@@ -238,6 +241,14 @@ class GatewayBackend:
         self._closed_event: asyncio.Event | None = None
         self._connected_event = asyncio.Event()
         self._reconnect_attempt = 0
+        # Access token exchanged from a zgb_ enrollment credential, reused
+        # across reconnects until shortly before it expires: every exchange
+        # mints a new credential row on the gateway. Kept across close() —
+        # the token stays valid server-side either way, and a later connect()
+        # in the same process should not mint another one; a token the
+        # gateway no longer accepts is dropped on its first UNAUTHORIZED.
+        self._access_token: str | None = None
+        self._access_expires_at_ms: int | None = None
         self._used_connect = False
         self._used_start = False
 
@@ -520,9 +531,22 @@ class GatewayBackend:
 
     async def _establish(self) -> None:
         self._set_state("connecting")
-        # Re-resolve on every attempt: an exchanged access token may have
-        # expired while we were disconnected.
-        credential = await self._resolve_credential()
+        # Resolved on every attempt, but an unexpired exchanged access token
+        # is reused rather than minting a new one (see _resolve_credential).
+        credential, cached = await self._resolve_credential()
+        try:
+            await self._handshake(credential)
+        except GatewayError as exc:
+            # The gateway no longer accepts the cached token (revoked, its
+            # database replaced, ...): drop it and exchange afresh within this
+            # attempt. A refused enrollment credential still fails the attempt.
+            if not cached or exc.code != "UNAUTHORIZED":
+                raise
+            self._drop_access_token()
+            credential, _ = await self._resolve_credential()
+            await self._handshake(credential)
+
+    async def _handshake(self, credential: str) -> None:
         ws = await ws_connect(
             self._control_url,
             max_size=self._max_message_size,
@@ -770,15 +794,31 @@ class GatewayBackend:
         except RuntimeError:
             pass
 
-    async def _resolve_credential(self) -> str:
+    async def _resolve_credential(self) -> tuple[str, bool]:
+        """The credential for the next handshake, and whether it came from the cache."""
         if not self._exchange_enrollment or not self._credential.startswith("zgb_"):
-            return self._credential
+            return self._credential, False
+        if self._access_token is not None and self._access_token_fresh():
+            return self._access_token, True
+        self._drop_access_token()
         body = await asyncio.to_thread(self._exchange_enrollment_blocking)
         data = body.get("data") or {}
         token = data.get("token")
         if not token:
             raise _AttemptError("PROTOCOL_ERROR", "Enrollment exchange returned no token")
-        return str(token)
+        expires_at = data.get("expiresAt")
+        self._access_token = str(token)
+        self._access_expires_at_ms = int(expires_at) if isinstance(expires_at, (int, float)) else None
+        return self._access_token, False
+
+    def _access_token_fresh(self) -> bool:
+        if self._access_expires_at_ms is None:
+            return True
+        return time.time() * 1000 < self._access_expires_at_ms - ACCESS_TOKEN_REFRESH_MARGIN_MS
+
+    def _drop_access_token(self) -> None:
+        self._access_token = None
+        self._access_expires_at_ms = None
 
     def _exchange_enrollment_blocking(self) -> dict[str, Any]:
         request = urllib.request.Request(

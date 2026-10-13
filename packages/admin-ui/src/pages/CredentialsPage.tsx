@@ -425,6 +425,9 @@ export function CredentialsPage({ onSessionLost }: { onSessionLost: (err: unknow
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
   const [namespaceFilter, setNamespaceFilter] = useState('all');
   const [search, setSearch] = useState('');
+  // Expired backend-access tokens are dead short-lived tickets — noise by
+  // default. Still shown when explicitly filtering for expired credentials.
+  const [hideExpiredAccess, setHideExpiredAccess] = useState(true);
   const [issuing, setIssuing] = useState<{ initial?: IssueDialogInitial } | null>(null);
   const [issued, setIssued] = useState<IssuedCredential | null>(null);
   const [revoking, setRevoking] = useState<CredentialRecord[] | null>(null);
@@ -460,6 +463,9 @@ export function CredentialsPage({ onSessionLost }: { onSessionLost: (err: unknow
     let list = credentials ?? [];
     if (typeFilter !== 'all') list = list.filter((c) => c.type === typeFilter);
     if (statusFilter !== 'all') list = list.filter((c) => credentialStatus(c) === statusFilter);
+    if (hideExpiredAccess && statusFilter !== 'expired') {
+      list = list.filter((c) => !(c.type === 'backend-access' && credentialStatus(c) === 'expired'));
+    }
     if (namespaceFilter !== 'all') list = list.filter((c) => c.namespace === namespaceFilter);
     const q = search.trim().toLowerCase();
     if (q) {
@@ -470,7 +476,7 @@ export function CredentialsPage({ onSessionLost }: { onSessionLost: (err: unknow
         || (c.backendId?.toLowerCase().includes(q) ?? false));
     }
     return list;
-  }, [credentials, typeFilter, statusFilter, namespaceFilter, search]);
+  }, [credentials, typeFilter, statusFilter, namespaceFilter, search, hideExpiredAccess]);
 
   const revokedAll = useMemo(
     () => (credentials ?? []).filter((c) => credentialStatus(c) === 'revoked'),
@@ -588,6 +594,10 @@ export function CredentialsPage({ onSessionLost }: { onSessionLost: (err: unknow
           value={search}
           onChange={(e) => setSearch(e.target.value)}
         />
+        <label className="filter-toggle">
+          <input type="checkbox" checked={hideExpiredAccess} onChange={(e) => setHideExpiredAccess(e.target.checked)} />
+          {t('creds.hideExpiredAccess')}
+        </label>
       </div>
 
       {selectedRows.length > 0 && (

@@ -398,3 +398,14 @@ h2, h3 { margin: 0 0 12px; }
   background: var(--bg-hover);
 }
 .bulk-bar > span { margin-right: auto; }
+
+.filter-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  cursor: pointer;
+}
+.filter-toggle input { accent-color: var(--accent); cursor: pointer; }

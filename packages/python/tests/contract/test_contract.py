@@ -251,3 +251,34 @@ async def test_replaced_backend_stands_down_against_the_real_gateway(gateway):
         await first.close()
         await second.close()
 
+
+async def test_reconnects_do_not_mint_new_access_credentials(gateway):
+    """N reconnects in one process reuse the cached zga_ token: one exchange in total."""
+    from helpers import issue_credential
+
+    from zclaudia_gateway import GatewayBackend
+
+    enrollment = await asyncio.to_thread(issue_credential, gateway["httpUrl"], type="backend", name="contract-cache")
+
+    async def access_rows() -> int:
+        credentials = await asyncio.to_thread(list_credentials, gateway["httpUrl"])
+        return sum(
+            1 for c in credentials if c.get("type") == "backend-access" and c.get("parentId") == enrollment["id"]
+        )
+
+    backend = GatewayBackend(
+        url=gateway["httpUrl"],
+        credential=enrollment["token"],
+        namespace=NAMESPACE,
+        reconnect_min_ms=50,
+        reconnect_max_ms=100,
+    )
+    try:
+        await backend.connect()
+        for _ in range(5):
+            epoch = backend.epoch
+            await backend._ws.close()  # simulated network drop
+            await until(lambda epoch=epoch: backend.state == "connected" and backend.epoch > epoch)
+        assert await access_rows() == 1
+    finally:
+        await backend.close()

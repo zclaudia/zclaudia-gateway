@@ -63,8 +63,11 @@ asyncio.run(main())
 disconnects; every reconnect gets a fresh `epoch` while the `backend_id`
 stays stable, and channels from the previous epoch are gone (the gateway
 sends `channel_closed`). Enrollment credentials (`zgb_`) are exchanged for
-short-lived access credentials (`zga_`) before each connect unless
-`exchange_enrollment=False`.
+short-lived access credentials (`zga_`) unless `exchange_enrollment=False`.
+The access token is cached and reused across reconnects (and a later
+`connect()` after `close()`) until 60 s before it expires — each exchange
+mints a new credential on the gateway — and is exchanged afresh at once if
+the gateway stops accepting it.
 
 ### Backend identity
 

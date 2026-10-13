@@ -227,6 +227,43 @@ describeIfLoopback('Phase 3: SDK contract', () => {
     expect(second.currentEpoch).toBe(taken.epoch);
   });
 
+  test('backend SDK reuses its exchanged access token across reconnects', async () => {
+    const { httpUrl } = await startServer();
+    const admin = { Authorization: `Bearer ${TEST_ADMIN_TOKEN}` };
+    const issued = await fetch(`${httpUrl}/api/admin/credentials`, {
+      method: 'POST',
+      headers: { ...admin, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'backend', namespace: 'sdk-test', name: 'cache-backend' }),
+    });
+    const enrollment = (await issued.json()).data as { id: string; token: string };
+    const accessCredentials = async () => {
+      const res = await fetch(`${httpUrl}/api/admin/credentials`, { headers: admin });
+      return ((await res.json()).data as Array<{ id: string; type: string; parentId: string | null; revokedAt: number | null }>)
+        .filter((c) => c.type === 'backend-access' && c.parentId === enrollment.id);
+    };
+    const backend = makeBackend(httpUrl, 'cache-backend', enrollment.token); // zgb_: exchanged for zga_
+    (backend as unknown as { opts: { reconnectMinMs: number } }).opts.reconnectMinMs = 50;
+    await backend.connect();
+
+    const drop = async () => {
+      const epoch = backend.currentEpoch;
+      (backend as unknown as { socket: { close: (code: number) => void } }).socket.close(4000);
+      await until(() => backend.connectionState === 'connected' && backend.currentEpoch > epoch);
+    };
+    for (let i = 0; i < 3; i++) await drop();
+    expect(await accessCredentials()).toHaveLength(1); // four connections, one exchange
+
+    // Revoking the access token alone: the cached copy is refused, replaced in the same attempt
+    const [access] = await accessCredentials();
+    const epoch = backend.currentEpoch;
+    await fetch(`${httpUrl}/api/admin/credentials/${access.id}`, { method: 'DELETE', headers: admin });
+    await until(() => backend.connectionState === 'connected' && backend.currentEpoch > epoch);
+    expect(backend.lastError).toBeNull();
+    const after = await accessCredentials();
+    expect(after).toHaveLength(2);
+    expect(after.filter((c) => c.revokedAt === null)).toHaveLength(1);
+  });
+
   test('client waits for a known backendId to come online', async () => {
     const { httpUrl } = await startServer();
     const client = makeClient(httpUrl, 'wait-client');

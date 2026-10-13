@@ -4,7 +4,10 @@ Backend SDK for the zclaudia gateway (Protocol v4): registration and
 heartbeats, channel offers (dial-is-accept), topic publishing with retain,
 and `serveHttp` for answering the gateway's streaming HTTP proxy over a
 channel. Reconnects with exponential backoff; supports enrollment-credential
-exchange (`zgb_` → short-lived access credential).
+exchange (`zgb_` → short-lived access credential). The access token is cached
+and reused across reconnects until 60 s before it expires (each exchange
+mints a new credential on the gateway), and exchanged afresh at once if the
+gateway stops accepting it.
 
 ```ts
 import { GatewayBackend } from '@zclaudia/gateway-backend';

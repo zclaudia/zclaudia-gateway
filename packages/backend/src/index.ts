@@ -96,6 +96,12 @@ export interface BackendErrorInfo {
   readonly occurredAt: number;
 }
 
+/**
+ * Re-exchange an access token this long before the gateway says it expires,
+ * so a reconnect never presents one that dies mid-handshake.
+ */
+const ACCESS_TOKEN_REFRESH_MARGIN_MS = 60_000;
+
 const KNOWN_GATEWAY_ERROR_CODES: ReadonlySet<string> = new Set([
   'INVALID_MESSAGE',
   'PROTOCOL_VERSION_MISMATCH',
@@ -184,6 +190,15 @@ export class GatewayBackend {
   private state: GatewayBackendState = 'idle';
   private failure: BackendErrorInfo | null = null;
   private reconnectAttempt = 0;
+  /**
+   * Access token exchanged from a zgb_ enrollment credential, reused across
+   * reconnects until shortly before it expires: every exchange mints a new
+   * credential row on the gateway. Kept across close() — the token stays
+   * valid server-side either way, and a later connect() should not mint
+   * another; a token the gateway no longer accepts is dropped on its first
+   * UNAUTHORIZED.
+   */
+  private accessToken: { token: string; expiresAt: number | null } | null = null;
   private stateHandlers: Array<(state: GatewayBackendState) => void> = [];
   private messageHandlers: Array<(message: Record<string, unknown>) => void> = [];
 
@@ -315,9 +330,22 @@ export class GatewayBackend {
 
   private async establish(): Promise<{ backendId: string; epoch: number }> {
     this.setState('connecting');
-    // Re-resolve on every attempt: an exchanged access token may have
-    // expired while we were disconnected.
-    const credential = await this.resolveCredential();
+    // Resolved on every attempt, but an unexpired exchanged access token is
+    // reused rather than minting a new one (see resolveCredential).
+    const { credential, cached } = await this.resolveCredential();
+    try {
+      return await this.attempt(credential);
+    } catch (error) {
+      // The gateway no longer accepts the cached token (revoked, its database
+      // replaced, ...): drop it and exchange afresh within this attempt. A
+      // refused enrollment credential still fails the attempt.
+      if (!cached || !(error instanceof AttemptError) || error.gatewayCode !== 'UNAUTHORIZED') throw error;
+      this.accessToken = null;
+      return await this.attempt((await this.resolveCredential()).credential);
+    }
+  }
+
+  private async attempt(credential: string): Promise<{ backendId: string; epoch: number }> {
     const socket = this.factory(`${this.wsBase}/ws`);
     socket.binaryType = 'arraybuffer';
     this.socket = socket;
@@ -436,10 +464,16 @@ export class GatewayBackend {
   }
 
   /** Exchange an enrollment credential for a short-lived access token. */
-  private async resolveCredential(): Promise<string> {
+  /** The credential for the next handshake, and whether it came from the cache. */
+  private async resolveCredential(): Promise<{ credential: string; cached: boolean }> {
     if (this.opts.exchangeEnrollment === false || !this.opts.credential.startsWith('zgb_')) {
-      return this.opts.credential;
+      return { credential: this.opts.credential, cached: false };
     }
+    const held = this.accessToken;
+    if (held && (held.expiresAt === null || Date.now() < held.expiresAt - ACCESS_TOKEN_REFRESH_MARGIN_MS)) {
+      return { credential: held.token, cached: true };
+    }
+    this.accessToken = null;
     const httpBase = this.wsBase.replace(/^ws/, 'http');
     let response: Response;
     try {
@@ -454,12 +488,14 @@ export class GatewayBackend {
       const code = response.status === 401 || response.status === 403 ? 'AUTH_FAILED' : 'GATEWAY_UNREACHABLE';
       throw new AttemptError(code, `Enrollment exchange failed: HTTP ${response.status}`);
     }
-    const body = await response.json().catch(() => null) as { data?: { token?: unknown } } | null;
+    const body = await response.json().catch(() => null) as { data?: { token?: unknown; expiresAt?: unknown } } | null;
     const token = body?.data?.token;
     if (typeof token !== 'string' || token === '') {
       throw new AttemptError('PROTOCOL_ERROR', 'Enrollment exchange returned no token');
     }
-    return token;
+    const expiresAt = body?.data?.expiresAt;
+    this.accessToken = { token, expiresAt: typeof expiresAt === 'number' ? expiresAt : null };
+    return { credential: token, cached: false };
   }
 
   private async handleOffer(offer: ChannelOfferMessage): Promise<void> {

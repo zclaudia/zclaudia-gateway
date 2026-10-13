@@ -12,6 +12,7 @@ import asyncio
 import inspect
 import json
 import secrets
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
@@ -49,6 +50,7 @@ class FakeGateway:
         lease_ttl_ms: int = 30_000,
         silent_hello: bool = False,
         drop_on_hello: bool = False,
+        exchange_ttl_ms: int | None = None,
     ) -> None:
         self.reject_hello = reject_hello
         self.reject_exchange = reject_exchange
@@ -56,6 +58,8 @@ class FakeGateway:
         self.lease_ttl_ms = lease_ttl_ms
         self.silent_hello = silent_hello  # read peer_hello, then never answer
         self.drop_on_hello = drop_on_hello  # read peer_hello, then hang up without gateway_error
+        self.exchange_ttl_ms = exchange_ttl_ms  # None = exchanged tokens never expire
+        self.revoked_tokens: set[str] = set()  # hellos with these secrets get UNAUTHORIZED
 
         self.hellos: list[dict[str, Any]] = []
         self.heartbeats: list[dict[str, Any]] = []
@@ -97,8 +101,9 @@ class FakeGateway:
         self.token_requests.append({"authorization": authorization})
         if self.reject_exchange or not authorization.startswith("Bearer zgb_"):
             return connection.respond(401, json.dumps({"success": False}))
+        expires_at = None if self.exchange_ttl_ms is None else int(time.time() * 1000) + self.exchange_ttl_ms
         body = json.dumps(
-            {"success": True, "data": {"token": self.exchange_token, "expiresAt": None, "namespace": "test-ns"}}
+            {"success": True, "data": {"token": self.exchange_token, "expiresAt": expires_at, "namespace": "test-ns"}}
         )
         return connection.respond(201, body)
 
@@ -125,8 +130,11 @@ class FakeGateway:
             if self.drop_on_hello:
                 await ws.close(1011, "boom")
                 return
-            if self.reject_hello is not None:
-                code, message = self.reject_hello
+            reject = self.reject_hello
+            if reject is None and hello.get("gatewaySecret") in self.revoked_tokens:
+                reject = ("UNAUTHORIZED", "Invalid gateway secret")
+            if reject is not None:
+                code, message = reject
                 await ws.send(json.dumps({"type": "gateway_error", "code": code, "message": message}))
                 await ws.close(1008, "rejected")
                 return
