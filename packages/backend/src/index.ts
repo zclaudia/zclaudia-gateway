@@ -6,6 +6,7 @@
  */
 import {
   CHANNEL_KIND_HTTP,
+  GATEWAY_CLOSE_BACKEND_REPLACED,
   GATEWAY_PROTOCOL_V4,
   type ChannelOfferMessage,
   type HttpRequestFrame,
@@ -64,7 +65,8 @@ export type BackendErrorCode =
   | 'GATEWAY_UNREACHABLE'
   | 'HANDSHAKE_TIMEOUT'
   | 'PROTOCOL_ERROR'
-  | 'CONNECT_FAILED';
+  | 'CONNECT_FAILED'
+  | 'REPLACED';
 
 /**
  * Why the most recent connection attempt failed (`GatewayBackend.lastError`).
@@ -81,7 +83,10 @@ export type BackendErrorCode =
  *   failure, the connection dropped mid-handshake, or an unavailable endpoint;
  * - `HANDSHAKE_TIMEOUT` — connected, but `peer_ready` never arrived;
  * - `PROTOCOL_ERROR` — the gateway answered with something the SDK cannot use;
- * - `CONNECT_FAILED` — anything else.
+ * - `CONNECT_FAILED` — anything else;
+ * - `REPLACED` — not a failed attempt: a newer connection with the same
+ *   backend credential took over this backend's identity, so this instance
+ *   stopped (state `'closed'`, no reconnect) instead of fighting it.
  */
 export interface BackendErrorInfo {
   readonly code: BackendErrorCode;
@@ -106,6 +111,7 @@ const ERROR_MESSAGES: Record<BackendErrorCode, string> = {
   HANDSHAKE_TIMEOUT: 'The gateway did not complete the handshake in time.',
   PROTOCOL_ERROR: 'The gateway sent an unexpected handshake response.',
   CONNECT_FAILED: 'Connecting to the gateway failed.',
+  REPLACED: 'Another connection using the same backend credential replaced this one.',
 };
 
 /** An attempt failure the SDK can classify; carries the original message for `connect()` callers. */
@@ -204,7 +210,12 @@ export class GatewayBackend {
    * - **kept** across a plain connection drop (a drop is not a failed attempt)
    *   and by `close()`, which neither sets nor clears it, so a backend closed
    *   after failing still tells why. Nothing is recorded once `close()` has
-   *   been called.
+   *   been called;
+   * - **set to `REPLACED`** when the gateway hands this backend's identity to
+   *   a newer connection (one credential = one backend, newest wins). The
+   *   backend then stops for good — state `'closed'`, no reconnect — because
+   *   reconnecting would replace the newer one in turn. Call `connect()` to
+   *   take the identity back deliberately.
    */
   get lastError(): BackendErrorInfo | null { return this.failure; }
 
@@ -377,7 +388,7 @@ export class GatewayBackend {
       if (msg.type === 'channel_offer') void this.handleOffer(msg as unknown as ChannelOfferMessage);
       for (const handler of this.messageHandlers) handler(msg);
     });
-    socket.addEventListener('close', () => this.handleClose(socket));
+    socket.addEventListener('close', (event) => this.handleClose(socket, event?.code));
 
     const interval = this.opts.heartbeatIntervalMs ?? 10_000;
     this.heartbeatTimer = setInterval(() => {
@@ -392,10 +403,16 @@ export class GatewayBackend {
     return { backendId: this.backendId, epoch: this.epoch };
   }
 
-  private handleClose(socket: WebSocketLike): void {
+  private handleClose(socket: WebSocketLike, code?: number): void {
     if (this.socket !== socket) return; // stale socket from a previous session
     this.socket = null;
     if (this.heartbeatTimer) { clearInterval(this.heartbeatTimer); this.heartbeatTimer = null; }
+    if (code === GATEWAY_CLOSE_BACKEND_REPLACED && !this.closed) {
+      // Replaced, not dropped: stand down rather than replace the newer one back.
+      this.failure = { code: 'REPLACED', message: ERROR_MESSAGES.REPLACED, occurredAt: Date.now() };
+      this.setState('closed');
+      return;
+    }
     if (this.closed || this.opts.reconnect === false) {
       this.setState('closed');
       return;

@@ -12,6 +12,7 @@ from test_start import closed_port_url
 
 import zclaudia_gateway.backend as backend_module
 from zclaudia_gateway import BackendErrorInfo, GatewayBackend, GatewayError
+from zclaudia_gateway.protocol import GATEWAY_CLOSE_BACKEND_REPLACED
 
 SECRET = "zgb_SUPER-secret-credential"
 
@@ -329,3 +330,29 @@ async def test_error_text_does_not_leak_credentials_or_raw_exceptions(
     assert unreachable.last_error.code == "GATEWAY_UNREACHABLE"
     for leaked in (SECRET, "hunter2", "admin", "127.0.0.1", "Errno"):
         assert leaked not in text_of(unreachable.last_error)
+
+
+async def test_replaced_backend_stands_down_instead_of_reconnecting(
+    gateway: FakeGateway, backends: Callable[..., GatewayBackend]
+) -> None:
+    backend = backends(gateway.url)
+    await backend.connect()
+    assert gateway.connection_count == 1
+
+    # The gateway handed this backendId to a newer connection (ADR-0010)
+    assert gateway.control_ws is not None
+    await gateway.control_ws.close(GATEWAY_CLOSE_BACKEND_REPLACED, "Backend replaced by a newer connection")
+    await until(lambda: backend.state == "closed")
+
+    error = backend.last_error
+    assert error is not None and error.code == "REPLACED"
+    assert error.message and error.occurred_at > 0
+    await asyncio.sleep(0.2)  # several backoff periods: no reconnect, no flapping
+    assert gateway.connection_count == 1
+    assert backend.state == "closed"
+
+    # Taking the identity back is a deliberate call, and it clears the record
+    await backend.connect()
+    assert backend.state == "connected"
+    assert backend.last_error is None
+    assert gateway.connection_count == 2

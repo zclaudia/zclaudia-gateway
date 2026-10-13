@@ -14,6 +14,11 @@ from typing import Any
 
 GATEWAY_PROTOCOL_V4 = 4
 
+# WebSocket close code on a backend's control connection when a newer
+# connection for the same backendId takes over (newest wins, ADR-0009/0010).
+# The replaced backend must not reconnect, or the two would flap forever.
+GATEWAY_CLOSE_BACKEND_REPLACED = 4001
+
 CHANNEL_KIND_HTTP = "http"
 
 PEER_TYPE_CLIENT_BACKEND = "client+backend"

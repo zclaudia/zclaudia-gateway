@@ -32,6 +32,7 @@ from .channel import (
 )
 from .protocol import (
     CHANNEL_KIND_HTTP,
+    GATEWAY_CLOSE_BACKEND_REPLACED,
     GATEWAY_ERROR_CODES,
     GATEWAY_PROTOCOL_V4,
     PEER_TYPE_CLIENT_BACKEND,
@@ -52,6 +53,7 @@ BackendErrorCode = Literal[
     "HANDSHAKE_TIMEOUT",
     "PROTOCOL_ERROR",
     "CONNECT_FAILED",
+    "REPLACED",
 ]
 
 StateHandler = Callable[[GatewayBackendState], Any]
@@ -88,7 +90,10 @@ class BackendErrorInfo:
     - ``HANDSHAKE_TIMEOUT`` — connected, but ``peer_ready`` never arrived;
     - ``PROTOCOL_ERROR`` — the gateway answered with something the SDK cannot
       use (e.g. a handshake without a backend identity);
-    - ``CONNECT_FAILED`` — anything else.
+    - ``CONNECT_FAILED`` — anything else;
+    - ``REPLACED`` — not a failed attempt: a newer connection with the same
+      backend credential took over this backend's identity, so this instance
+      stopped (``state == "closed"``, no reconnect) instead of fighting it.
     """
 
     code: BackendErrorCode
@@ -114,6 +119,7 @@ _ERROR_MESSAGES: dict[BackendErrorCode, str] = {
     "HANDSHAKE_TIMEOUT": "The gateway did not complete the handshake in time.",
     "PROTOCOL_ERROR": "The gateway sent an unexpected handshake response.",
     "CONNECT_FAILED": "Connecting to the gateway failed.",
+    "REPLACED": "Another connection using the same backend credential replaced this one.",
 }
 
 
@@ -275,7 +281,12 @@ class GatewayBackend:
         - **kept** across a plain connection drop (a drop is not a failed
           attempt) and by :meth:`close`, which neither sets nor clears it, so
           a backend closed after failing still tells why. Attempts cancelled
-          by :meth:`close` are not failures and are not recorded.
+          by :meth:`close` are not failures and are not recorded;
+        - **set to** ``REPLACED`` when the gateway hands this backend's
+          identity to a newer connection (one credential = one backend, newest
+          wins). The backend then stops for good — ``state == "closed"``, no
+          reconnect — because reconnecting would replace the newer one in
+          turn. Call :meth:`connect` or :meth:`start` to take it back.
         """
         return self._last_error
 
@@ -634,6 +645,7 @@ class GatewayBackend:
     async def _supervise(self) -> None:
         """Own the connection lifecycle: wait for a drop, then reconnect."""
         while True:
+            ws = self._ws
             reader = self._reader_task
             if reader is not None:
                 try:
@@ -641,6 +653,16 @@ class GatewayBackend:
                 except asyncio.CancelledError:
                     raise
             self._teardown_connection()
+            if not self._closed and getattr(ws, "close_code", None) == GATEWAY_CLOSE_BACKEND_REPLACED:
+                # Replaced, not dropped: stand down rather than replace the newer one back.
+                self._last_error = BackendErrorInfo(
+                    code="REPLACED", message=_ERROR_MESSAGES["REPLACED"], occurred_at=time.time()
+                )
+                logger.warning("backend %s was replaced by a newer connection; not reconnecting", self._backend_id)
+                self._set_state("closed")
+                if self._closed_event is not None:
+                    self._closed_event.set()
+                return
             if self._closed or not self._reconnect:
                 self._set_state("closed")
                 if self._closed_event is not None:

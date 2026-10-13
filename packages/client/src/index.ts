@@ -98,6 +98,44 @@ export class GatewayClient {
     return () => { this.registryHandlers = this.registryHandlers.filter((h) => h !== handler); };
   }
 
+  /**
+   * Resolve with the backend's presence once `backendId` is in the registry
+   * (immediately if it already is). A backend's id is fixed when its
+   * credential is issued (ADR-0009), so clients can be configured with it and
+   * simply wait for it to come online — no picking from the registry.
+   *
+   * Waits across reconnects. Rejects after `timeoutMs` (default: wait
+   * indefinitely) or when `signal` aborts. A backend outside this
+   * credential's namespace or backend scope never appears, exactly like an
+   * offline one — set a timeout if that is possible.
+   */
+  waitForBackend(backendId: string, options: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<BackendPresenceV4> {
+    const present = this.registryItems.find((item) => item.backendId === backendId);
+    if (present) return Promise.resolve(present);
+    const { timeoutMs, signal } = options;
+    if (signal?.aborted) return Promise.reject(signal.reason);
+    return new Promise((resolve, reject) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const onAbort = () => { cleanup(); reject(signal!.reason); };
+      const unsubscribe = this.onRegistry((items) => {
+        const found = items.find((item) => item.backendId === backendId);
+        if (found) { cleanup(); resolve(found); }
+      });
+      function cleanup() {
+        unsubscribe();
+        if (timer !== undefined) clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
+      }
+      if (timeoutMs !== undefined) {
+        timer = setTimeout(() => {
+          cleanup();
+          reject(new Error(`Backend ${backendId} did not come online within ${timeoutMs}ms`));
+        }, timeoutMs);
+      }
+      signal?.addEventListener('abort', onAbort, { once: true });
+    });
+  }
+
   private setState(state: GatewayClientState): void {
     this.state = state;
     for (const handler of this.stateHandlers) handler(state);

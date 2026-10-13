@@ -15,6 +15,7 @@ from .http import (
 )
 from .protocol import (
     CHANNEL_KIND_HTTP,
+    GATEWAY_CLOSE_BACKEND_REPLACED,
     GATEWAY_PROTOCOL_V4,
     ChannelOffer,
     GatewayError,
@@ -28,6 +29,7 @@ except PackageNotFoundError:  # source tree without an install
 
 __all__ = [
     "CHANNEL_KIND_HTTP",
+    "GATEWAY_CLOSE_BACKEND_REPLACED",
     "GATEWAY_PROTOCOL_V4",
     "MAX_MESSAGE_SIZE",
     "BackendErrorCode",

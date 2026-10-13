@@ -30,7 +30,8 @@ v4 沿用 `peer_hello`/`peer_ready` 消息形态，`protocolVersion` 必须为 4
 **Backend 身份**（[ADR-0009](adr/0009-credential-bound-backend-identity.md)）：
 由后端凭证授予。`zgb_` 签发时即确定 backendId（128-bit UUID），持该凭证（或其换发的
 `zga_`）连接者即该 Backend，`identity.instanceId`/`channel` 只作描述。同一 backendId
-多处连接时新连接顶替旧连接。尚未绑定的旧版凭证仍按 `(tenant, namespace, instanceId,
+多处连接时新连接顶替旧连接：网关以关闭码 `4001`（`GATEWAY_CLOSE_BACKEND_REPLACED`）关闭旧连接，
+被顶替的 Backend 不得重连，否则两者会无限互踢（[ADR-0010](adr/0010-replaced-backend-stands-down.md)）。尚未绑定的旧版凭证仍按 `(tenant, namespace, instanceId,
 environment)` 映射（tenant 预留恒为空；environment 即 `identity.channel`，默认
 `prod`），并因此必须携带 `identity.instanceId`。
 

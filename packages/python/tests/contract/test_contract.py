@@ -215,3 +215,39 @@ async def test_start_reports_an_unreachable_gateway_then_clears_on_connect(gatew
         assert client.last_error.code == "GATEWAY_UNREACHABLE"
     finally:
         await client.close()
+
+
+async def test_replaced_backend_stands_down_against_the_real_gateway(gateway):
+    """Two processes sharing one credential: the newest wins and the loser stops (ADR-0010)."""
+    from helpers import issue_credential
+
+    from zclaudia_gateway import GatewayBackend
+
+    credential = await asyncio.to_thread(issue_credential, gateway["httpUrl"], type="backend", name="contract-twins")
+
+    def make() -> GatewayBackend:
+        return GatewayBackend(
+            url=gateway["httpUrl"],
+            credential=credential["token"],
+            namespace=NAMESPACE,
+            reconnect_min_ms=50,
+            reconnect_max_ms=100,
+        )
+
+    first, second = make(), make()
+    try:
+        backend_id, _ = await first.connect()
+        assert backend_id == credential["backendId"]
+        taken_id, taken_epoch = await second.connect()
+        assert taken_id == backend_id
+
+        await until(lambda: first.state == "closed")
+        assert first.last_error is not None and first.last_error.code == "REPLACED"
+        await asyncio.sleep(0.5)  # many backoff periods: no flapping
+        assert first.state == "closed"
+        assert second.state == "connected"
+        assert second.epoch == taken_epoch
+    finally:
+        await first.close()
+        await second.close()
+

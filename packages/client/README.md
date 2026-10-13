@@ -17,6 +17,10 @@ const client = new GatewayClient({
   identity: { name: 'My laptop' }, // optional, display only
 });
 await client.connect();
+// A backend's id comes with its credential, so it can be configured up front;
+// waitForBackend resolves once it is online (immediately if it already is).
+const backendId = 'BACKEND_ID_FROM_ADMIN_CONSOLE';
+await client.waitForBackend(backendId, { timeoutMs: 30_000 });
 await client.subscribeTopic(backendId, 'resources', (payload) => { /* ... */ });
 const channel = await client.openChannel(backendId, 'myapp');
 ```

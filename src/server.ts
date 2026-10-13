@@ -22,6 +22,7 @@ import type {
   PeerReadyV4,
   RegistrySnapshotV4,
 } from '@zclaudia/gateway-protocol';
+import { GATEWAY_CLOSE_BACKEND_REPLACED } from '@zclaudia/gateway-protocol';
 import type {
   GatewayNotificationConfig as NotificationConfig,
   PushNotificationRequestMessage,
@@ -31,6 +32,9 @@ import { validateGatewayMessage, filterProxyResponseHeaders, PROXY_REQUEST_HEADE
 import { GatewayState, type PeerSession } from './state.js';
 import { GatewayPushNotificationService } from './push-notification.js';
 import { AdminSessionStore, ADMIN_SESSION_COOKIE, readSessionCookie } from './admin-session.js';
+
+/** How long a replaced backend gets to answer the close handshake before it is terminated. */
+const REPLACED_CLOSE_GRACE_MS = 2000;
 
 // ============================================================================
 // Config & Helpers
@@ -1765,7 +1769,13 @@ export function createGatewayServer(config: GatewayConfig): Server {
     if (previousPeer) {
       previousPeer.backendId = undefined;
       previousPeer.epoch = undefined;
-      previousPeer.ws.terminate();
+      // A distinct close code tells the SDK it was replaced, not dropped, so
+      // it stands down instead of reconnecting and replacing the newer
+      // connection in turn (ADR-0010). A half-dead peer never answers the
+      // close handshake, so terminate it shortly after.
+      const ws = previousPeer.ws;
+      ws.close(GATEWAY_CLOSE_BACKEND_REPLACED, 'Backend replaced by a newer connection');
+      setTimeout(() => { if (ws.readyState !== WebSocket.CLOSED) ws.terminate(); }, REPLACED_CLOSE_GRACE_MS).unref();
     }
   }
 

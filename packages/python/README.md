@@ -226,6 +226,7 @@ if backend.state != "connected" and backend.last_error is not None:
 | `HANDSHAKE_TIMEOUT` | Connected, but `peer_ready` never arrived |
 | `PROTOCOL_ERROR` | The gateway's answer was unusable (no backend identity, no token) |
 | `CONNECT_FAILED` | Anything else |
+| `REPLACED` | Not a failed attempt: another connection using the same credential took over this backend (one credential = one backend, newest wins). The backend stops — `state == "closed"`, no reconnect — instead of fighting it; `connect()`/`start()` takes it back deliberately ([ADR-0010](../../docs/adr/0010-replaced-backend-stands-down.md)) |
 
 Branch on `code`; `message` is a fixed description per code. Raw exception
 text, URLs, headers and credentials are never copied into it (they may still
@@ -242,6 +243,9 @@ Lifecycle:
 - **Kept** by a plain connection drop (a drop is not a failed attempt) and by
   `close()`, which neither sets nor clears it — so a backend closed after
   failing still says why. Nothing is recorded once `close()` has been called.
+- **Set to `REPLACED`** when a newer connection with the same credential takes
+  over this backend; it then stays closed (no reconnect) until `connect()` or
+  `start()` is called.
 
 ## API sketch
 

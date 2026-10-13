@@ -15,6 +15,14 @@ import type { PushNotificationRequestMessage } from './notifications.js';
 
 export const GATEWAY_PROTOCOL_V4 = 4;
 
+/**
+ * WebSocket close code the gateway sends on a backend's control connection
+ * when a newer connection for the same backendId takes over (newest wins,
+ * ADR-0009/ADR-0010). The replaced backend must not reconnect: doing so
+ * would replace the newer one in turn and the two would flap forever.
+ */
+export const GATEWAY_CLOSE_BACKEND_REPLACED = 4001;
+
 // ============================================================================
 // Scalar aliases
 // ============================================================================

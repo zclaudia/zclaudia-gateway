@@ -56,6 +56,7 @@ backend.onState((state) => {
 | `HANDSHAKE_TIMEOUT` | Connected, but `peer_ready` never arrived |
 | `PROTOCOL_ERROR` | The gateway's answer was unusable (no backend identity, no token) |
 | `CONNECT_FAILED` | Anything else |
+| `REPLACED` | Not a failed attempt: another connection using the same credential took over this backend (one credential = one backend, newest wins). The backend stops — state `'closed'`, no reconnect — instead of fighting it; `connect()` takes it back deliberately ([ADR-0010](https://github.com/zclaudia/zclaudia-gateway/blob/main/docs/adr/0010-replaced-backend-stands-down.md)) |
 
 Branch on `code`; `message` is a fixed description per code — raw error text,
 URLs, headers and credentials are never copied into it.
@@ -64,7 +65,9 @@ Lifecycle: **set or replaced** by every failed attempt (`connect()`'s first
 handshake and each background reconnect); **cleared** when a handshake succeeds
 (before the state becomes `'connected'`) and when `connect()` starts a fresh
 run; **kept** across a plain drop (not a failed attempt) and by `close()`,
-which neither sets nor clears it. Nothing is recorded after `close()`. The
-Python SDK exposes the same codes and lifecycle as `last_error`.
+which neither sets nor clears it. Nothing is recorded after `close()`. **Set to
+`REPLACED`** when a newer connection with the same credential takes over; the
+backend then stays closed until `connect()` is called. The Python SDK exposes
+the same codes and lifecycle as `last_error`.
 
 Gateway server and protocol spec: [zclaudia/zclaudia-gateway](https://github.com/zclaudia/zclaudia-gateway).

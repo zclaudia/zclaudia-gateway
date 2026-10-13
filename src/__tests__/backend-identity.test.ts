@@ -11,6 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
+import { GATEWAY_CLOSE_BACKEND_REPLACED } from '@zclaudia/gateway-protocol';
 import { createGatewayServer } from '../server.js';
 import { GatewayStorage } from '../storage.js';
 import { closeTestServer, listenTestServer, TEST_ADMIN_TOKEN } from './test-server.js';
@@ -155,12 +156,13 @@ describeIfLoopback('ADR-0009: credential-bound backend identity and device scope
       const { wsUrl, httpUrl } = await startServer();
       const credential = await issue(httpUrl, { type: 'backend', namespace: 'bind-ns' });
       const first = await registerBackend(wsUrl, credential.token, 'bind-ns', { instanceId: 'host-a' });
-      const firstClosed = new Promise<void>((resolve) => first.ws.on('close', () => resolve()));
+      const firstClosed = new Promise<number>((resolve) => first.ws.on('close', (code) => resolve(code)));
 
       const second = await registerBackend(wsUrl, credential.token, 'bind-ns', { instanceId: 'host-b' });
       expect(second.backendId).toBe(first.backendId);
       expect(second.ready.backend.epoch).toBeGreaterThan(first.ready.backend.epoch);
-      await firstClosed;
+      // A distinct close code, so the loser's SDK stands down (ADR-0010)
+      expect(await firstClosed).toBe(GATEWAY_CLOSE_BACKEND_REPLACED);
     });
 
     test('exchanged access tokens inherit the backendId', async () => {

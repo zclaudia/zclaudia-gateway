@@ -206,6 +206,55 @@ describeIfLoopback('Phase 3: SDK contract', () => {
     expect(await missing.text()).toBe('not found');
   });
 
+  test('a replaced backend stands down instead of flapping (ADR-0010)', async () => {
+    const { httpUrl } = await startServer();
+    const first = makeBackend(httpUrl, 'twin-a');
+    (first as unknown as { opts: { reconnectMinMs: number } }).opts.reconnectMinMs = 50;
+    const { backendId, epoch } = await first.connect();
+
+    // A second process with the same credential: same backend, newest wins
+    const second = makeBackend(httpUrl, 'twin-b');
+    (second as unknown as { opts: { reconnectMinMs: number } }).opts.reconnectMinMs = 50;
+    const taken = await second.connect();
+    expect(taken.backendId).toBe(backendId);
+    expect(taken.epoch).toBeGreaterThan(epoch);
+
+    await until(() => first.connectionState === 'closed');
+    expect(first.lastError?.code).toBe('REPLACED');
+    await delay(500); // many backoff periods: the loser must not take it back
+    expect(first.connectionState).toBe('closed');
+    expect(second.connectionState).toBe('connected');
+    expect(second.currentEpoch).toBe(taken.epoch);
+  });
+
+  test('client waits for a known backendId to come online', async () => {
+    const { httpUrl } = await startServer();
+    const client = makeClient(httpUrl, 'wait-client');
+    await client.connect();
+
+    // The id is known before the backend ever connects (it comes with the credential)
+    const res = await fetch(`${httpUrl}/api/admin/credentials`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${TEST_ADMIN_TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'backend', namespace: 'sdk-test', name: 'late-backend' }),
+    });
+    const credential = (await res.json()).data as { token: string; backendId: string };
+
+    const waiting = client.waitForBackend(credential.backendId, { timeoutMs: 5000 });
+    const backend = makeBackend(httpUrl, 'late-backend', credential.token);
+    await backend.connect();
+    expect((await waiting).backendId).toBe(credential.backendId);
+
+    // Already online: resolves immediately
+    expect((await client.waitForBackend(credential.backendId)).backendId).toBe(credential.backendId);
+
+    await expect(client.waitForBackend('not-a-backend', { timeoutMs: 100 })).rejects.toThrow(/did not come online/);
+    const abort = new AbortController();
+    const aborted = client.waitForBackend('not-a-backend', { signal: abort.signal });
+    abort.abort(new Error('gave up'));
+    await expect(aborted).rejects.toThrow('gave up');
+  });
+
   test('backend SDK reconnects with a fresh epoch and raw messages pass through', async () => {
     const { httpUrl } = await startServer();
     const backend = makeBackend(httpUrl, 'brc-backend');
