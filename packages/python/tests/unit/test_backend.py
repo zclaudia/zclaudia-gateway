@@ -91,9 +91,28 @@ async def test_connect_options_are_carried(gateway, backends):
     assert hello["clientProtocolVersion"] == 7
 
 
-async def test_identity_requires_device_and_instance():
-    with pytest.raises(ValueError):
-        GatewayBackend(url="ws://127.0.0.1:1", credential="zgb_x", namespace="ns", identity={"device_id": "d"})
+async def test_identity_omitted_sends_no_identity(gateway, backends):
+    # Bound credential (ADR-0008): the credential grants the backendId, so
+    # url/credential/namespace are enough and the hello carries no identity.
+    backend = backends(gateway.url, identity=None)
+    backend_id, _ = await backend.connect()
+    assert backend_id == BACKEND_ID
+    assert "identity" not in gateway.hellos[0]
+
+
+async def test_identity_defaults_to_omitted(gateway):
+    backend = GatewayBackend(url=gateway.url, credential="zgb_x", namespace="ns", exchange_enrollment=False)
+    try:
+        await backend.connect()
+        assert "identity" not in gateway.hellos[0]
+    finally:
+        await backend.close()
+
+
+async def test_partial_identity_sends_only_provided_keys(gateway, backends):
+    backend = backends(gateway.url, identity={"name": "srv"})
+    await backend.connect()
+    assert gateway.hellos[0]["identity"] == {"name": "srv"}
 
 
 async def test_gateway_error_fails_connect(make_gateway, backends):

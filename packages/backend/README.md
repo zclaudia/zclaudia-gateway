@@ -13,11 +13,25 @@ const backend = new GatewayBackend({
   url: 'https://gateway.example.com',
   credential: 'zgb_...',
   namespace: 'myapp',
-  identity: { deviceId: 'server-1', instanceId: 'inst-1' },
+  identity: { name: 'My server' }, // optional, display only
 });
-await backend.connect();
+await backend.connect(); // backend.backendId is the one bound to the credential
 backend.publishTopic('resources', snapshot, { retain: true });
 ```
+
+The backend's identity comes from its credential: a `zgb_` credential is
+bound to a `backendId` when it is issued, so `url`, `credential` and
+`namespace` are all a backend needs. `identity` is optional and descriptive
+(`name` is shown in the registry). Run several backends by issuing one
+credential per backend — backends sharing a credential replace each other.
+
+**Legacy (unbound) backend credentials** — issued before credential binding
+and not yet migrated — still derive the `backendId` from
+`(namespace, identity.instanceId, identity.channel)`. Such a backend must keep
+passing a stable `instanceId`: never a hostname, pod name or random value, or
+every restart gets a new `backendId`. The gateway rejects a legacy backend
+hello without `instanceId` (`INVALID_MESSAGE`). See
+[ADR-0008](https://github.com/zclaudia/zclaudia-gateway/blob/main/docs/adr/0008-credential-bound-backend-identity.md).
 
 ## Why is it not connecting? `lastError`
 

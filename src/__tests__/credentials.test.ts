@@ -325,11 +325,14 @@ describeIfLoopback('Phase 1: Credential System', () => {
       const backendId = ready.backend.backendId;
 
       const online = (await listBackends()).find((b) => b.backendId === backendId);
+      // A credential-bound identity is not keyed by instanceId/environment
       expect(online).toMatchObject({
         namespace: 'observe-ns',
-        instanceId: 'observe-backend',
-        environment: 'prod',
+        name: 'host-obs',
+        instanceId: '',
+        environment: '',
         lastCredentialId: enrollment.body.data.id,
+        boundCredentials: 1,
         online: { epoch: ready.backend.epoch },
       });
       const registeredAt = online!.lastSeenAt;

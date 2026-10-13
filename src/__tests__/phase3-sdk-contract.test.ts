@@ -56,10 +56,12 @@ describeIfLoopback('Phase 3: SDK contract', () => {
     return { httpUrl };
   }
 
-  function makeBackend(url: string, instanceId: string) {
+  // A backend credential *is* one backend (ADR-0008): a second backend in
+  // the same test needs its own credential, or it replaces the first.
+  function makeBackend(url: string, instanceId: string, credential = GATEWAY_SECRET) {
     const backend = new GatewayBackend({
       url,
-      credential: GATEWAY_SECRET,
+      credential,
       namespace: 'sdk-test',
       identity: { deviceId: `dev-${instanceId}`, instanceId, name: instanceId },
       heartbeatIntervalMs: 2000,
@@ -213,7 +215,7 @@ describeIfLoopback('Phase 3: SDK contract', () => {
     // Raw inbound tap: registry_snapshot arrives when another backend joins
     const tapped: string[] = [];
     backend.onMessage((msg) => tapped.push(msg.type as string));
-    const backend2 = makeBackend(httpUrl, 'brc-other');
+    const backend2 = makeBackend(httpUrl, 'brc-other', await issueToken(httpUrl, 'backend', 'sdk-test'));
     await backend2.connect();
     await until(() => tapped.includes('registry_snapshot'));
 

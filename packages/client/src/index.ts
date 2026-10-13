@@ -33,7 +33,8 @@ export interface GatewayClientOptions {
   /** Issued credential token (zgd_ device credential or an exchanged zga_ access token). Shared secrets and the admin token are not accepted. */
   credential: string;
   namespace: string;
-  identity: { deviceId: string; instanceId: string; name?: string };
+  /** Descriptive only (display/diagnostics); never used for authorization. Omit to send no identity. */
+  identity?: { deviceId?: string; instanceId?: string; name?: string };
   clientProtocolVersion?: number;
   socketFactory?: SocketFactory;
   /** Auto-reconnect with backoff after unexpected disconnects. Default true. */
@@ -134,7 +135,7 @@ export class GatewayClient {
       clientProtocolVersion: this.opts.clientProtocolVersion,
       peerType: 'client-only',
       gatewaySecret: this.opts.credential,
-      identity: this.opts.identity,
+      ...(this.opts.identity ? { identity: this.opts.identity } : {}),
     }));
 
     const readyMsg = await ready;

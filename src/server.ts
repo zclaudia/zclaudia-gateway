@@ -70,6 +70,8 @@ interface GatewayConfig {
   adminStaticDir?: string;
   /** Admin web UI session TTL. Default 12h. Fixed expiry, no sliding renewal. */
   adminSessionTtlMs?: number;
+  /** Storage override (tests); default opens the data-dir database. Closed with the server. */
+  storage?: GatewayStorage;
 }
 
 function isVitestProcess(): boolean {
@@ -107,12 +109,15 @@ function validatePeerHelloV4(message: unknown): string | null {
   if (msg.peerType !== 'client-only' && msg.peerType !== 'client+backend') {
     return 'peer_hello.peerType must be client-only or client+backend';
   }
-  if (!msg.identity || typeof msg.identity !== 'object') return 'peer_hello.identity is required';
-  const identity = msg.identity as Record<string, unknown>;
-  if (typeof identity.deviceId !== 'string') return 'peer_hello.identity.deviceId must be a string';
-  if (typeof identity.instanceId !== 'string') return 'peer_hello.identity.instanceId must be a string';
-  if (identity.channel !== undefined && typeof identity.channel !== 'string') return 'peer_hello.identity.channel must be a string';
-  if (identity.name !== undefined && typeof identity.name !== 'string') return 'peer_hello.identity.name must be a string';
+  // identity is descriptive except for legacy backend credentials, whose
+  // instanceId is enforced after authentication (ADR-0008).
+  if (msg.identity !== undefined) {
+    if (!msg.identity || typeof msg.identity !== 'object') return 'peer_hello.identity must be an object';
+    const identity = msg.identity as Record<string, unknown>;
+    for (const field of ['deviceId', 'instanceId', 'channel', 'name']) {
+      if (identity[field] !== undefined && typeof identity[field] !== 'string') return `peer_hello.identity.${field} must be a string`;
+    }
+  }
   if (msg.peerType === 'client+backend') {
     if (!msg.backend || typeof msg.backend !== 'object') return 'peer_hello.backend is required for client+backend peers';
     const backend = msg.backend as Record<string, unknown>;
@@ -131,7 +136,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
   if (!config.adminToken) {
     throw new Error('adminToken is required: issued credentials are the only authentication');
   }
-  const storage = new GatewayStorage();
+  const storage = config.storage ?? new GatewayStorage();
   const pushNotificationService = new GatewayPushNotificationService(config.notificationConfig);
   const state = new GatewayState();
   const recoveryTokens = new Map<string, string>();
@@ -264,6 +269,91 @@ export function createGatewayServer(config: GatewayConfig): Server {
     console.log(`[audit] ${event} ${parts}`);
   }
 
+  // ==========================================================================
+  // Backend identity & device scope (ADR-0008)
+  // ==========================================================================
+
+  /**
+   * A bound credential *is* its backend: the hello's instanceId/channel are
+   * descriptive only. Legacy (unbound) credentials keep the old
+   * (namespace, instanceId, environment) mapping until migrated.
+   */
+  function resolveBackendIdentity(
+    credential: CredentialInfo,
+    namespace: string,
+    identity: { instanceId?: string; name?: string },
+    channel: string,
+  ): string {
+    if (credential.backendId) {
+      // An in-place-bound identity remembers the instanceId it used to be
+      // keyed by; a different one means the credential is shared by another
+      // backend that the observation window missed — they will keep replacing
+      // each other until it gets its own credential.
+      const known = storage.getBackendIdentity(credential.backendId);
+      if (known?.instanceId && identity.instanceId && identity.instanceId !== known.instanceId) {
+        audit('backend.instance_mismatch', { backendId: credential.backendId, credentialId: credential.id, expected: known.instanceId, got: identity.instanceId });
+      }
+      return credential.backendId;
+    }
+    return storage.getOrCreateBackendIdV4({ namespace, instanceId: identity.instanceId ?? '', environment: channel, name: identity.name });
+  }
+
+  const OWNER_FLAP_WINDOW_MS = 60_000;
+  const OWNER_FLAP_THRESHOLD = 3;
+  const ownerReplacements = new Map<string, number[]>();
+
+  /** Repeated takeovers of one backendId usually mean a shared or leaked credential. */
+  function noteOwnerReplaced(backendId: string, credentialId: string): void {
+    const now = Date.now();
+    const recent = (ownerReplacements.get(backendId) ?? []).filter((t) => now - t < OWNER_FLAP_WINDOW_MS);
+    recent.push(now);
+    ownerReplacements.set(backendId, recent);
+    audit('backend.owner_replaced', { backendId, credentialId });
+    if (recent.length >= OWNER_FLAP_THRESHOLD) {
+      audit('backend.owner_flapping', { backendId, credentialId, replacements: recent.length, windowSec: OWNER_FLAP_WINDOW_MS / 1000 });
+    }
+  }
+
+  /** Namespace isolation, narrowed by a device credential's backend scope. */
+  function canReach(
+    scope: { namespace: string; allowedBackends: string[] | null },
+    target: { namespace: string; backendId: string },
+  ): boolean {
+    if (target.namespace !== scope.namespace) return false;
+    return scope.allowedBackends === null || scope.allowedBackends.includes(target.backendId);
+  }
+
+  function visibleRegistry(peer: PeerSession): BackendPresenceV4[] {
+    return state.getRegistrySnapshot(peer.namespace).filter((item) => canReach(peer, item));
+  }
+
+  function isKnownBackend(backendId: string, namespace: string): boolean {
+    return storage.getBackendIdentity(backendId)?.namespace === namespace;
+  }
+
+  /** null = whole namespace; otherwise a non-empty list of known backends in the namespace. Returns an error message on failure. */
+  function parseBackendScope(value: unknown, namespace: string): string[] | null | string {
+    if (value === null) return null;
+    if (!Array.isArray(value) || value.length === 0 || !value.every((id) => typeof id === 'string')) {
+      return 'allowedBackends must be null or a non-empty array of backend ids';
+    }
+    const ids = [...new Set(value as string[])];
+    const unknown = ids.filter((id) => !isKnownBackend(id, namespace));
+    if (unknown.length > 0) return `Unknown backends in this namespace: ${unknown.join(', ')}`;
+    return ids;
+  }
+
+  /** backendId → number of unrevoked backend credentials bound to it. */
+  function boundCredentialCounts(): Map<string, number> {
+    const counts = new Map<string, number>();
+    for (const c of storage.listCredentials()) {
+      if (c.type === 'backend' && c.revokedAt === null && c.backendId) {
+        counts.set(c.backendId, (counts.get(c.backendId) ?? 0) + 1);
+      }
+    }
+    return counts;
+  }
+
   function requireGatewayAuth(req: Request, res: Response, next: () => void): void {
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -299,7 +389,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
   // --- Poll Recovery: Registry ---
   app.get('/sync/registry', requireRecoveryToken, (_req: Request, res: Response) => {
     const peer = res.locals.peer as PeerSession;
-    res.json({ items: state.getRegistrySnapshot(peer.namespace) });
+    res.json({ items: visibleRegistry(peer) });
   });
 
   // --- Notification Config ---
@@ -447,6 +537,8 @@ export function createGatewayServer(config: GatewayConfig): Server {
       success: true,
       data: {
         backends: state.registry.items.size,
+        backendIdentities: storage.listBackendIdentities().length,
+        legacyBackendCredentials: credentials.filter((c) => c.type === 'backend' && c.revokedAt === null && c.backendId === null).length,
         peers: [...state.peers.values()].map((peer) => ({
           peerSessionId: peer.peerSessionId,
           namespace: peer.namespace,
@@ -463,8 +555,8 @@ export function createGatewayServer(config: GatewayConfig): Server {
   });
 
   app.post('/api/admin/credentials', requireAdmin, (req: Request, res: Response) => {
-    const { type, namespace, name, ttlDays } = (req.body ?? {}) as {
-      type?: unknown; namespace?: unknown; name?: unknown; ttlDays?: unknown;
+    const { type, namespace, name, ttlDays, backendId, allowedBackends } = (req.body ?? {}) as {
+      type?: unknown; namespace?: unknown; name?: unknown; ttlDays?: unknown; backendId?: unknown; allowedBackends?: unknown;
     };
     if (type !== 'device' && type !== 'backend') {
       res.status(400).json({ success: false, error: { code: 'INVALID_REQUEST', message: 'type must be device or backend' } });
@@ -489,18 +581,47 @@ export function createGatewayServer(config: GatewayConfig): Server {
         return;
       }
     }
+    if (backendId !== undefined) {
+      if (type !== 'backend') {
+        res.status(400).json({ success: false, error: { code: 'INVALID_REQUEST', message: 'backendId only applies to backend credentials' } });
+        return;
+      }
+      if (typeof backendId !== 'string' || !isKnownBackend(backendId, namespace)) {
+        res.status(400).json({ success: false, error: { code: 'INVALID_REQUEST', message: 'backendId must be a known backend in the same namespace' } });
+        return;
+      }
+    }
+    let scope: string[] | null | undefined;
+    if (allowedBackends !== undefined) {
+      if (type !== 'device') {
+        res.status(400).json({ success: false, error: { code: 'INVALID_REQUEST', message: 'allowedBackends only applies to device credentials' } });
+        return;
+      }
+      const parsed = parseBackendScope(allowedBackends, namespace);
+      if (typeof parsed === 'string') {
+        res.status(400).json({ success: false, error: { code: 'INVALID_REQUEST', message: parsed } });
+        return;
+      }
+      scope = parsed;
+    }
     const { credential, token } = storage.createCredential({
       type: type as CredentialType,
       namespace,
       name: typeof name === 'string' ? name : undefined,
       ttlMs,
+      backendId: typeof backendId === 'string' ? backendId : undefined,
+      allowedBackends: scope,
     });
-    audit('credential.issued', { id: credential.id, type: credential.type, namespace: credential.namespace, name: credential.name });
+    audit('credential.issued', {
+      id: credential.id, type: credential.type, namespace: credential.namespace, name: credential.name,
+      backendId: credential.backendId ?? 'none', scope: credential.allowedBackends ? credential.allowedBackends.join(',') : 'namespace',
+    });
     res.status(201).json({ success: true, data: { ...credential, token } });
   });
 
   // Known backend identities with online state (read-only; ADR-0008 step 1).
   app.get('/api/admin/backends', requireAdmin, (_req: Request, res: Response) => {
+    const bound = boundCredentialCounts();
     const data = storage.listBackendIdentities().map((identity) => {
       const presence = state.registry.items.get(identity.backendId);
       return {
@@ -512,14 +633,96 @@ export function createGatewayServer(config: GatewayConfig): Server {
         createdAt: identity.createdAt,
         lastSeenAt: identity.lastSeenAt,
         lastCredentialId: identity.lastCredentialId,
+        boundCredentials: bound.get(identity.backendId) ?? 0,
         online: presence ? { epoch: presence.epoch, connectedAt: presence.connectedAt } : null,
       };
     });
     res.json({ success: true, data });
   });
 
+  // Forget a backend identity — cleanup for identities left behind by
+  // instanceId drift. Refused whenever something may still resolve to it,
+  // since a legacy backend would silently get a fresh backendId next time.
+  app.delete('/api/admin/backends/:backendId', requireAdmin, (req: Request, res: Response) => {
+    const { backendId } = req.params;
+    const identity = storage.getBackendIdentity(backendId);
+    if (!identity) {
+      res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Backend identity not found' } });
+      return;
+    }
+    const conflict = (message: string) => res.status(409).json({ success: false, error: { code: 'CONFLICT', message } });
+    if (state.registry.items.has(backendId)) {
+      conflict('Backend is online');
+      return;
+    }
+    if ((boundCredentialCounts().get(backendId) ?? 0) > 0) {
+      conflict('Unrevoked backend credentials are bound to this backend; revoke them first');
+      return;
+    }
+    const last = identity.lastCredentialId ? storage.getCredential(identity.lastCredentialId) : undefined;
+    if (last && last.revokedAt === null && last.backendId === null) {
+      conflict('The legacy credential last seen registering this backend is still active; bind or revoke it first');
+      return;
+    }
+    storage.deleteBackendIdentity(backendId);
+    audit('backend.identity_deleted', { backendId, namespace: identity.namespace });
+    res.json({ success: true, data: null });
+  });
+
   app.get('/api/admin/credentials', requireAdmin, (_req: Request, res: Response) => {
     res.json({ success: true, data: storage.listCredentials() });
+  });
+
+  // ADR-0008 in-place migration: bind a legacy backend credential (and its
+  // live access tokens) to the identity it is known to register. Token unchanged.
+  app.post('/api/admin/credentials/:id/bind', requireAdmin, (req: Request, res: Response) => {
+    const credential = storage.getCredential(req.params.id);
+    if (!credential) {
+      res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Credential not found' } });
+      return;
+    }
+    if (credential.type !== 'backend' || credential.revokedAt !== null || credential.backendId !== null) {
+      res.status(409).json({ success: false, error: { code: 'CONFLICT', message: 'Only unrevoked, unbound backend credentials can be bound' } });
+      return;
+    }
+    const { backendId } = (req.body ?? {}) as { backendId?: unknown };
+    if (typeof backendId !== 'string' || !isKnownBackend(backendId, credential.namespace)) {
+      res.status(400).json({ success: false, error: { code: 'INVALID_REQUEST', message: 'backendId must be a known backend in the same namespace' } });
+      return;
+    }
+    storage.bindBackendCredential(credential.id, backendId);
+    audit('credential.bound', { id: credential.id, backendId });
+    res.json({ success: true, data: storage.getCredential(credential.id) });
+  });
+
+  // Change a device credential's backend scope. Live connections are closed
+  // so the new scope applies on reconnect, as with revocation.
+  app.patch('/api/admin/credentials/:id', requireAdmin, (req: Request, res: Response) => {
+    const credential = storage.getCredential(req.params.id);
+    if (!credential) {
+      res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Credential not found' } });
+      return;
+    }
+    if (credential.type !== 'device' || credential.revokedAt !== null) {
+      res.status(409).json({ success: false, error: { code: 'CONFLICT', message: 'Only unrevoked device credentials have a backend scope' } });
+      return;
+    }
+    const body = (req.body ?? {}) as { allowedBackends?: unknown };
+    if (!('allowedBackends' in body)) {
+      res.status(400).json({ success: false, error: { code: 'INVALID_REQUEST', message: 'allowedBackends is required (null = whole namespace)' } });
+      return;
+    }
+    const scope = parseBackendScope(body.allowedBackends, credential.namespace);
+    if (typeof scope === 'string') {
+      res.status(400).json({ success: false, error: { code: 'INVALID_REQUEST', message: scope } });
+      return;
+    }
+    storage.setAllowedBackends(credential.id, scope);
+    audit('credential.scope_changed', { id: credential.id, scope: scope ? scope.join(',') : 'namespace' });
+    for (const peer of state.peers.values()) {
+      if (peer.credentialId === credential.id) peer.ws.close(1008, 'Credential scope changed');
+    }
+    res.json({ success: true, data: storage.getCredential(credential.id) });
   });
 
   app.delete('/api/admin/credentials/:id', requireAdmin, (req: Request, res: Response) => {
@@ -582,6 +785,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
       name: `access:${auth.credential.name || auth.credential.id}`,
       parentId: auth.credential.id,
       ttlMs: config.backendAccessTokenTtlMs,
+      backendId: auth.credential.backendId,
     });
     audit('credential.exchanged', { parent: auth.credential.id, id: credential.id });
     res.status(201).json({ success: true, data: { token: accessToken, expiresAt: credential.expiresAt, namespace: credential.namespace } });
@@ -627,7 +831,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
       // answered like an offline backend to avoid an existence oracle.
       {
         const presence = state.registry.items.get(backendId);
-        if (!presence || presence.namespace !== auth.credential.namespace) {
+        if (!presence || !canReach(auth.credential, presence)) {
           res.status(502).json({ success: false, error: { code: 'BACKEND_OFFLINE', message: 'Backend not found or offline' } });
           return;
         }
@@ -891,7 +1095,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
     const lease = state.leases.get(msg.target);
     const backendPeer = lease ? state.peers.get(lease.peerSessionId) : undefined;
     // Same non-oracle answer for nonexistent, offline, and cross-namespace.
-    if (!presence || !lease || !backendPeer || presence.namespace !== peer.namespace) {
+    if (!presence || !lease || !backendPeer || !canReach(peer, presence)) {
       sendToWs(peer.ws, { type: 'gateway_error', code: 'BACKEND_OFFLINE', message: `Backend ${msg.target} not found or offline` } satisfies GatewayErrorV4);
       return;
     }
@@ -1064,7 +1268,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
       return;
     }
     const presence = state.registry.items.get(msg.backendId);
-    if (!presence || presence.namespace !== peer.namespace) {
+    if (!presence || !canReach(peer, presence)) {
       sendToWs(peer.ws, { type: 'gateway_error', code: 'BACKEND_OFFLINE', message: `Backend ${msg.backendId} not found or offline` } satisfies GatewayErrorV4);
       return;
     }
@@ -1296,9 +1500,16 @@ export function createGatewayServer(config: GatewayConfig): Server {
     if (message.protocolVersion !== 4) {
       sendToWs(ws, { type: 'gateway_error', code: 'PROTOCOL_VERSION_MISMATCH', message: `Expected protocol version 4, got ${message.protocolVersion}` } satisfies GatewayErrorV4); ws.close(); return null;
     }
+    const { peerType } = message;
+    const identity = message.identity ?? {};
+    const isBackend = peerType === 'client+backend' && !!message.backend;
+    // Legacy (unbound) backend credentials still derive identity from the
+    // hello, so they keep needing an instanceId (ADR-0008).
+    if (isBackend && !auth.credential.backendId && identity.instanceId === undefined) {
+      sendToWs(ws, { type: 'gateway_error', code: 'INVALID_MESSAGE', message: 'peer_hello.identity.instanceId is required for legacy (unbound) backend credentials' } satisfies GatewayErrorV4); ws.close(); return null;
+    }
     const peerSessionId = uuidv4();
     const recoveryToken = crypto.randomBytes(32).toString('hex');
-    const { identity, peerType } = message;
     const channel = identity.channel || 'prod';
     const peer: PeerSession = {
       peerSessionId,
@@ -1307,8 +1518,9 @@ export function createGatewayServer(config: GatewayConfig): Server {
       peerType,
       namespace: message.namespace,
       credentialId: auth.credential.id,
-      deviceId: identity.deviceId,
-      instanceId: identity.instanceId,
+      allowedBackends: auth.credential.type === 'device' ? auth.credential.allowedBackends : null,
+      deviceId: identity.deviceId ?? '',
+      instanceId: identity.instanceId ?? '',
       channel,
       name: identity.name || '',
       recoveryToken,
@@ -1316,28 +1528,30 @@ export function createGatewayServer(config: GatewayConfig): Server {
     };
 
     let backendInfo: PeerReadyV4['backend'] | undefined;
-    if (peerType === 'client+backend' && message.backend) {
-      // Stable UUID keyed by (namespace, instance, environment).
-      const backendId = storage.getOrCreateBackendIdV4({ namespace: message.namespace, instanceId: identity.instanceId, environment: channel, name: identity.name });
+    if (isBackend && message.backend) {
+      const backendId = resolveBackendIdentity(auth.credential, message.namespace, identity, channel);
       const previousLease = state.leases.get(backendId);
       const epoch = storage.allocateEpoch();
       peer.backendId = backendId; peer.epoch = epoch;
       if (previousLease && (previousLease.peerSessionId !== peerSessionId || previousLease.epoch !== epoch)) {
+        // Newest connection wins (ADR-0008): a restarted backend must not
+        // wait for its stale predecessor's lease to time out.
+        noteOwnerReplaced(backendId, auth.credential.id);
         handleBackendOwnerReplaced(backendId, previousLease.epoch, epoch, previousLease.peerSessionId);
       }
       state.addLease({ backendId, epoch, peerSessionId, leaseTtlMs: state.config.defaultLeaseTtlMs, lastHeartbeatAt: Date.now(), leaseTimer: null });
-      // ADR-0008 migration evidence: which enrollment credential registers
-      // which identity (an exchanged zga_ counts as its parent zgb_).
-      storage.touchBackendIdentity(backendId, auth.credential.parentId ?? auth.credential.id);
+      // Which enrollment credential registers which identity (an exchanged
+      // zga_ counts as its parent zgb_) — ADR-0008 migration evidence.
+      storage.touchBackendIdentity(backendId, auth.credential.parentId ?? auth.credential.id, identity.name);
       // gatewayProtocolVersion lets clients feature-detect from presence.
-      const presence: BackendPresenceV4 = { namespace: message.namespace, backendId, instanceId: identity.instanceId, deviceId: identity.deviceId, name: identity.name || '', channel, visible: message.backend.visible, capabilities: message.backend.capabilities, backendProtocolVersion: message.backend.backendProtocolVersion, minClientProtocolVersion: message.backend.minClientProtocolVersion, epoch, connectedAt: Date.now(), lastSeenAt: Date.now(), gatewayProtocolVersion: peer.protocolVersion };
+      const presence: BackendPresenceV4 = { namespace: message.namespace, backendId, instanceId: peer.instanceId, deviceId: peer.deviceId, name: peer.name, channel, visible: message.backend.visible, capabilities: message.backend.capabilities, backendProtocolVersion: message.backend.backendProtocolVersion, minClientProtocolVersion: message.backend.minClientProtocolVersion, epoch, connectedAt: Date.now(), lastSeenAt: Date.now(), gatewayProtocolVersion: peer.protocolVersion };
       state.registryUpsert(presence);
       backendInfo = { backendId, epoch, leaseTtlMs: state.config.defaultLeaseTtlMs };
     }
 
     state.addPeer(peer);
     recoveryTokens.set(recoveryToken, peerSessionId);
-    const registrySync: PeerReadyV4["registrySync"] = { items: state.getRegistrySnapshot(peer.namespace) };
+    const registrySync: PeerReadyV4["registrySync"] = { items: visibleRegistry(peer) };
     const ready: PeerReadyV4 = { type: 'peer_ready', protocolVersion: peer.protocolVersion, peerSessionId, recoveryToken, backend: backendInfo, registrySync };
     sendToWs(ws, ready);
 
@@ -1405,7 +1619,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
   // ========================================================================
 
   function handleRequestRegistrySnapshot(peer: PeerSession): void {
-    sendToWs(peer.ws, { type: 'registry_snapshot', items: state.getRegistrySnapshot(peer.namespace) } satisfies RegistrySnapshotV4);
+    sendToWs(peer.ws, { type: 'registry_snapshot', items: visibleRegistry(peer) } satisfies RegistrySnapshotV4);
   }
 
   function handleBackendServerMessage(peer: PeerSession, msg: BackendServerMessage): void {
@@ -1419,7 +1633,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
     // guessing session IDs.
     if (!msg.targetPeerSessionId) return;
     const targetPeer = state.peers.get(msg.targetPeerSessionId);
-    if (!targetPeer || targetPeer.namespace !== peer.namespace) return;
+    if (!targetPeer || !canReach(targetPeer, { namespace: peer.namespace, backendId })) return;
     sendToWs(targetPeer.ws, msg);
   }
 
@@ -1489,14 +1703,16 @@ export function createGatewayServer(config: GatewayConfig): Server {
   // ========================================================================
 
   function broadcastRegistrySnapshot(excludePeerSessionId?: string): void {
-    // Each peer only ever sees its own namespace's slice of the registry.
-    const perNamespace = new Map<string, RegistrySnapshotV4>();
+    // Each peer only ever sees its own namespace's slice of the registry,
+    // narrowed further by a device credential's backend scope.
+    const perScope = new Map<string, RegistrySnapshotV4>();
     for (const peer of state.peers.values()) {
       if (peer.peerSessionId === excludePeerSessionId) continue;
-      let msg = perNamespace.get(peer.namespace);
+      const scopeKey = `${peer.namespace}\x1f${peer.allowedBackends ? peer.allowedBackends.join(',') : '*'}`;
+      let msg = perScope.get(scopeKey);
       if (!msg) {
-        msg = { type: 'registry_snapshot', items: state.getRegistrySnapshot(peer.namespace) };
-        perNamespace.set(peer.namespace, msg);
+        msg = { type: 'registry_snapshot', items: visibleRegistry(peer) };
+        perScope.set(scopeKey, msg);
       }
       sendToWs(peer.ws, msg);
     }

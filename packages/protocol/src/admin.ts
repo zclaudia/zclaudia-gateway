@@ -44,7 +44,12 @@ export interface AdminCredentialCounters {
 
 /** GET /api/admin/overview data body. */
 export interface AdminOverview {
+  /** Online backends. */
   backends: number;
+  /** Known backend identities, online or not (ADR-0008). */
+  backendIdentities: number;
+  /** Unrevoked backend credentials not yet bound to a backend identity (ADR-0008 migration progress). */
+  legacyBackendCredentials: number;
   peers: AdminOverviewPeer[];
   credentials: AdminCredentialCounters;
   uptimeSec: number;
@@ -61,6 +66,26 @@ export interface IssueCredentialRequest {
   name?: string;
   /** Lifetime in days; null = no expiry; omitted = gateway default. */
   ttlDays?: number | null;
+  /**
+   * backend only: inherit an existing backend identity in the same namespace
+   * (rotation/migration). Omitted = a new backendId is generated.
+   */
+  backendId?: string;
+  /**
+   * device only: backendIds (same namespace, non-empty) the device may reach.
+   * Omitted/null = the whole namespace, including backends added later.
+   */
+  allowedBackends?: string[] | null;
+}
+
+/** POST /api/admin/credentials/:id/bind request body (legacy backend credentials only). */
+export interface BindBackendCredentialRequest {
+  backendId: string;
+}
+
+/** PATCH /api/admin/credentials/:id request body (device credentials only). Live connections are closed so the new scope applies on reconnect. */
+export interface UpdateCredentialRequest {
+  allowedBackends: string[] | null;
 }
 
 /** POST /api/admin/credentials response: the public credential plus the one-time plaintext token. */
@@ -105,6 +130,8 @@ export interface AdminBackendIdentity {
    * null if not seen since tracking began. Migration evidence for binding.
    */
   lastCredentialId: string | null;
+  /** Unrevoked backend credentials bound to this identity; 0 = only legacy credentials reach it. */
+  boundCredentials: number;
   /** null when offline. */
   online: { epoch: number; connectedAt: number } | null;
 }

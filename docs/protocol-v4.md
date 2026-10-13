@@ -27,9 +27,12 @@ v4 沿用 `peer_hello`/`peer_ready` 消息形态，`protocolVersion` 必须为 4
 `gatewaySecret` 字段承载 Gateway 签发的凭证（zgd_/zgb_/zga_；字段名为 wire
 兼容保留，共享密钥已移除）。namespace 与注册权限由服务端凭证记录决定。
 
-**Backend 身份（v4）**：唯一键为 `(tenant, namespace, instanceId, environment)`
-（tenant 预留恒为空；environment 即 `identity.channel`，默认 `prod`），backendId 为
-稳定的 128-bit UUID。
+**Backend 身份**（[ADR-0008](adr/0008-credential-bound-backend-identity.md)）：
+由后端凭证授予。`zgb_` 签发时即确定 backendId（128-bit UUID），持该凭证（或其换发的
+`zga_`）连接者即该 Backend，`identity.instanceId`/`channel` 只作描述。同一 backendId
+多处连接时新连接顶替旧连接。尚未绑定的旧版凭证仍按 `(tenant, namespace, instanceId,
+environment)` 映射（tenant 预留恒为空；environment 即 `identity.channel`，默认
+`prod`），并因此必须携带 `identity.instanceId`。
 
 ## 3. Channel 生命周期
 
@@ -160,7 +163,7 @@ v4 规范类型见 `@zclaudia/gateway-protocol`。
 | `clientProtocolVersion` | 应用层版本号，Backend 自报（默认 1），Gateway 只透传 |
 | `peerType` | `"client+backend"`；仅 `zgb_`/`zga_` 凭证可声明（设备凭证被拒） |
 | `gatewaySecret` | 凭证 token（`zgd_`/`zgb_`/`zga_`；字段名为 wire 兼容保留） |
-| `identity` | `{deviceId, instanceId, name?, channel?}` |
+| `identity` | 可选 `{deviceId?, instanceId?, name?, channel?}`；均为描述性字段，旧版（未绑定）后端凭证必须带 `instanceId` |
 | `backend` | `{visible, capabilities, backendProtocolVersion, minClientProtocolVersion?}` |
 
 `peer_ready`（Gateway → Backend，握手成功）：
@@ -171,16 +174,21 @@ v4 规范类型见 `@zclaudia/gateway-protocol`。
 | `peerSessionId` | 本次连接的会话 id |
 | `recoveryToken` | 预留字段（v4 不做无缝恢复） |
 | `backend` | `{backendId, epoch, leaseTtlMs}`——Backend 必须以此为准 |
-| `registrySync` | `{items: BackendPresenceV4[]}`（同 namespace 的在线 Backend 目录） |
+| `registrySync` | `{items: BackendPresenceV4[]}`（同 namespace 的在线 Backend 目录；设备凭证限定了后端范围时只含范围内的 Backend） |
 
 `BackendPresenceV4`（registry 项）：`namespace`、`backendId`、`instanceId`、
 `deviceId`、`name`、`channel`、`visible`、`capabilities`、
 `backendProtocolVersion`、`minClientProtocolVersion?`、`epoch`、`connectedAt`、
 `lastSeenAt`、`gatewayProtocolVersion?`。
 
-**Backend 身份**：唯一键 `(namespace, instanceId, environment)`，environment 即
-`identity.channel`（默认 `"prod"`）。`backendId` 跨重连稳定；`epoch` 每次连接
-递增，旧代次的 channel/topic 订阅/retained 状态全部失效。
+**Backend 身份**：见 §2——由后端凭证授予，旧版凭证仍按 `(namespace, instanceId,
+environment)` 映射。`backendId` 跨重连与凭证轮换稳定；`epoch` 每次连接递增，旧代次的
+channel/topic 订阅/retained 状态全部失效。
+
+**设备后端范围**：设备凭证可限定为若干 backendId（缺省为整个 namespace）。范围外的
+Backend 不出现在 registry 中，`channel_open`、`topic_subscribe` 与 HTTP 代理对其返回
+与"不存在/离线"相同的 `BACKEND_OFFLINE`；Backend 发往范围外设备的定向
+`backend_server_message` 被丢弃。
 
 ### 10.2 心跳与租约
 

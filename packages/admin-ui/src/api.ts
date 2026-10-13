@@ -1,4 +1,12 @@
-import type { BackendIdentity, CredentialRecord, IssueCredentialRequest, IssuedCredential, Overview } from './types.js';
+import type {
+  BackendIdentity,
+  BindBackendCredentialRequest,
+  CredentialRecord,
+  IssueCredentialRequest,
+  IssuedCredential,
+  Overview,
+  UpdateCredentialRequest,
+} from './types.js';
 import { formatMessage, getActiveLocale, type MsgKey } from './i18n.js';
 
 export class ApiError extends Error {
@@ -112,6 +120,29 @@ export const api = {
     return request<{ revoked: string[] }>(`/api/admin/credentials/${encodeURIComponent(id)}`, {
       method: 'DELETE',
     });
+  },
+
+  /** Bind a legacy (unbound, unrevoked) backend credential to an identity in place; the token is unchanged. */
+  async bindCredential(id: string, backendId: string): Promise<CredentialRecord> {
+    const body: BindBackendCredentialRequest = { backendId };
+    return request<CredentialRecord>(`/api/admin/credentials/${encodeURIComponent(id)}/bind`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+  },
+
+  /** Change a device credential's backend scope (null = whole namespace); its live connections are closed. */
+  async updateCredentialScope(id: string, allowedBackends: string[] | null): Promise<CredentialRecord> {
+    const body: UpdateCredentialRequest = { allowedBackends };
+    return request<CredentialRecord>(`/api/admin/credentials/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    });
+  },
+
+  /** Delete an offline backend identity with no bound credentials (409 CONFLICT otherwise). */
+  async deleteBackend(backendId: string): Promise<void> {
+    await request<null>(`/api/admin/backends/${encodeURIComponent(backendId)}`, { method: 'DELETE' });
   },
 
   /** Permanently delete revoked credentials: the given ids, or all revoked when omitted. */

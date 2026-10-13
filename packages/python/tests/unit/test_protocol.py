@@ -62,11 +62,15 @@ def test_normalize_identity_snake_and_wire_keys():
     assert normalize_identity({"device_id": "d", "instance_id": "i", "channel": "prod"})["channel"] == "prod"
 
 
-def test_normalize_identity_requires_ids():
-    with pytest.raises(ValueError):
-        normalize_identity({"device_id": "d"})
-    with pytest.raises(ValueError):
-        normalize_identity({})
+def test_normalize_identity_fields_are_optional():
+    assert normalize_identity({}) == {}
+    assert normalize_identity({"device_id": "d"}) == {"deviceId": "d"}
+    assert normalize_identity({"instanceId": "i"}) == {"instanceId": "i"}
+    assert normalize_identity({"name": "n"}) == {"name": "n"}
+    # None means "not provided"; other values are stringified onto the wire.
+    assert normalize_identity({"device_id": None, "instance_id": 7, "channel": None}) == {"instanceId": "7"}
+    # The wire spelling wins when both spellings are given.
+    assert normalize_identity({"deviceId": "wire", "device_id": "snake"}) == {"deviceId": "wire"}
 
 
 def test_peer_ready_parse():

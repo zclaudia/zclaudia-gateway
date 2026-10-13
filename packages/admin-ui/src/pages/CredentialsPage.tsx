@@ -1,10 +1,22 @@
-import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, localizeApiError } from '../api.js';
+import {
+  IssueDialog,
+  ScopeFields,
+  shortId,
+  TokenOnceModal,
+  TYPE_KEYS,
+  type IssueDialogInitial,
+  type ScopeMode,
+} from '../credentialDialogs.js';
 import { formatDateTime, relativeTime } from '../format.js';
 import { useI18n, type MsgKey } from '../i18n.js';
 import {
   CREDENTIAL_TOKEN_PREFIXES,
   credentialStatus,
+  identityLabel,
+  identityReachable,
+  type BackendIdentity,
   type CredentialRecord,
   type CredentialStatus,
   type CredentialType,
@@ -14,119 +26,68 @@ import {
 type TypeFilter = 'all' | CredentialType;
 type StatusFilter = 'all' | CredentialStatus;
 
-/** days === undefined → server default; null → never expires. */
-const TTL_CHOICES: Array<{ days: number | null | undefined }> = [
-  { days: undefined },
-  { days: 30 },
-  { days: 90 },
-  { days: 180 },
-  { days: 365 },
-  { days: null },
-];
-
 const STATUS_KEYS: Record<CredentialStatus, MsgKey> = {
   active: 'status.active',
   revoked: 'status.revoked',
   expired: 'status.expired',
 };
 
-const TYPE_KEYS: Record<CredentialType, MsgKey> = {
-  device: 'type.device',
-  backend: 'type.backend',
-  'backend-access': 'type.backendAccess',
-};
-
-function CopyButton({ text }: { text: string }) {
+function IdentitySummary({ backend }: { backend: BackendIdentity }) {
   const { t } = useI18n();
-  const [copied, setCopied] = useState(false);
-  async function copy() {
-    try {
-      await navigator.clipboard.writeText(text);
-    } catch {
-      // Clipboard API can be denied (e.g. insecure origin) — select fallback.
-      const range = document.createRange();
-      range.selectNodeContents(document.getElementById('token-once-text')!);
-      const selection = window.getSelection();
-      selection?.removeAllRanges();
-      selection?.addRange(range);
-      return;
-    }
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1500);
-  }
   return (
-    <button type="button" className="btn btn-secondary" onClick={copy}>
-      {copied ? t('token.copied') : t('token.copy')}
-    </button>
+    <span className="identity-summary" title={backend.backendId}>
+      <strong>{identityLabel(backend)}</strong>
+      <code className="muted">{shortId(backend.backendId)}</code>
+      {backend.online
+        ? <span className="badge badge-status-active">{t('backends.online')}</span>
+        : <span className="badge" title={formatDateTime(backend.lastSeenAt)}>{t('backends.offline')}</span>}
+      {backend.boundCredentials > 0 && (
+        <span className="badge badge-status-active">{t('binding.bound', { count: backend.boundCredentials })}</span>
+      )}
+    </span>
   );
 }
 
-function TokenOnceModal({ issued, onClose }: { issued: IssuedCredential; onClose: () => void }) {
-  const { t } = useI18n();
-  return (
-    <div className="modal-backdrop">
-      <div className="modal">
-        <h3>{t('token.title')}</h3>
-        <p className="muted">
-          {t('token.issuedAs', {
-            type: t(TYPE_KEYS[issued.type]),
-            namespace: issued.namespace,
-            name: issued.name || issued.id,
-          })}
-        </p>
-        <p className="token-warning">{t('token.warning')}</p>
-        <code id="token-once-text" className="token-once">{issued.token}</code>
-        <div className="modal-actions">
-          <CopyButton text={issued.token} />
-          <button type="button" className="btn btn-primary" onClick={onClose}>
-            {t('token.close')}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function IssueDialog({
-  namespaces,
+/**
+ * ADR-0008 step 3 for one legacy backend credential: bind it in place to the
+ * identity it was observed registering, split a shared credential, or pick an
+ * identity by hand when nothing was observed.
+ */
+function MigrateDialog({
+  credential,
+  backends,
   onClose,
-  onIssued,
-  onError,
+  onBound,
+  onIssueInheriting,
+  onSessionLost,
 }: {
-  namespaces: string[];
+  credential: CredentialRecord;
+  backends: BackendIdentity[];
   onClose: () => void;
-  onIssued: (issued: IssuedCredential) => void;
-  onError: (err: unknown) => void;
+  onBound: () => void;
+  onIssueInheriting: (backendId: string) => void;
+  onSessionLost: (err: unknown) => void;
 }) {
   const { t } = useI18n();
-  const [type, setType] = useState<'device' | 'backend'>('device');
-  const [namespace, setNamespace] = useState('');
-  const [name, setName] = useState('');
-  const [ttlChoice, setTtlChoice] = useState<number>(0);
+  const observed = backends.filter((b) => b.lastCredentialId === credential.id);
+  const nsIdentities = backends.filter((b) => b.namespace === credential.namespace);
+  const [choice, setChoice] = useState(observed.length === 1 ? observed[0].backendId : '');
   const [busy, setBusy] = useState(false);
+  // Raw error, localized at render so the text follows locale switches.
+  const [error, setError] = useState<unknown>(null);
 
-  function ttlLabel(index: number): string {
-    const choice = TTL_CHOICES[index];
-    if (choice.days === undefined) return t('ttl.default');
-    if (choice.days === null) return t('ttl.never');
-    return t('ttl.days', { days: choice.days });
-  }
+  const chosen = backends.find((b) => b.backendId === choice) ?? null;
 
-  async function handleSubmit(e: FormEvent) {
-    e.preventDefault();
-    if (!namespace.trim() || busy) return;
+  async function handleBind() {
+    if (!chosen || busy) return;
     setBusy(true);
+    setError(null);
     try {
-      const ttl = TTL_CHOICES[ttlChoice];
-      const issued = await api.issueCredential({
-        type,
-        namespace: namespace.trim(),
-        name: name.trim() || undefined,
-        ttlDays: ttl.days === undefined ? undefined : ttl.days,
-      });
-      onIssued(issued);
+      await api.bindCredential(credential.id, chosen.backendId);
+      onBound();
     } catch (err) {
-      onError(err);
+      setError(err);
+      onSessionLost(err);
     } finally {
       setBusy(false);
     }
@@ -134,55 +95,169 @@ function IssueDialog({
 
   return (
     <div className="modal-backdrop">
-      <form className="modal" onSubmit={handleSubmit}>
-        <h3>{t('issue.title')}</h3>
-        <label className="field">
-          <span>{t('field.type')}</span>
-          <select className="input" value={type} onChange={(e) => setType(e.target.value as 'device' | 'backend')}>
-            <option value="device">{t('issue.deviceOption')}</option>
-            <option value="backend">{t('issue.backendOption')}</option>
-          </select>
-        </label>
-        <label className="field">
-          <span>{t('field.namespaceRequired')}</span>
-          <input
-            className="input"
-            list="namespace-options"
-            value={namespace}
-            placeholder={t('issue.namespacePlaceholder')}
-            autoFocus
-            onChange={(e) => setNamespace(e.target.value)}
-          />
-          <datalist id="namespace-options">
-            {namespaces.map((ns) => <option key={ns} value={ns} />)}
-          </datalist>
-        </label>
-        <label className="field">
-          <span>{t('field.nameOptional')}</span>
-          <input
-            className="input"
-            value={name}
-            placeholder={t('issue.namePlaceholder')}
-            onChange={(e) => setName(e.target.value)}
-          />
-        </label>
-        <label className="field">
-          <span>{t('field.ttl')}</span>
-          <select className="input" value={ttlChoice} onChange={(e) => setTtlChoice(Number(e.target.value))}>
-            {TTL_CHOICES.map((choice, i) => <option key={i} value={i}>{ttlLabel(i)}</option>)}
-          </select>
-        </label>
+      <div className="modal modal-wide">
+        <h3>{t('migrate.title')}</h3>
+        <p>
+          <strong>{credential.name || credential.id}</strong>
+          <span className="muted"> · <code>{credential.namespace}</code></span>
+        </p>
+        <p className="muted">{t('migrate.intro')}</p>
+
+        {observed.length === 1 && (
+          <>
+            <p>{t('migrate.single')}</p>
+            <div className="option-list">
+              <div className="option-item"><IdentitySummary backend={observed[0]} /></div>
+            </div>
+          </>
+        )}
+
+        {observed.length > 1 && (
+          <>
+            <p>{t('migrate.shared', { count: observed.length })}</p>
+            <div className="option-list">
+              {observed.map((b) => (
+                <div key={b.backendId} className="option-item">
+                  <label className="choice">
+                    <input type="radio" name="migrate-choice" checked={choice === b.backendId} onChange={() => setChoice(b.backendId)} />
+                    <IdentitySummary backend={b} />
+                  </label>
+                  <button type="button" className="btn btn-small btn-secondary" onClick={() => onIssueInheriting(b.backendId)}>
+                    {t('migrate.issueInheriting')}
+                  </button>
+                </div>
+              ))}
+            </div>
+            <p className="token-warning">{t('migrate.sharedWarning')}</p>
+          </>
+        )}
+
+        {observed.length === 0 && (
+          <>
+            <p>{t('migrate.none')}</p>
+            {nsIdentities.length === 0 ? (
+              <p className="muted">{t('identity.noneInNamespace')}</p>
+            ) : (
+              <>
+                <select className="input" value={choice} onChange={(e) => setChoice(e.target.value)}>
+                  <option value="" disabled>{t('identity.select')}</option>
+                  {nsIdentities.map((b) => (
+                    <option key={b.backendId} value={b.backendId}>
+                      {identityLabel(b)} · {shortId(b.backendId)} · {t(b.online ? 'backends.online' : 'backends.offline')}
+                    </option>
+                  ))}
+                </select>
+                <p className="token-warning">{t('migrate.manualWarning')}</p>
+              </>
+            )}
+          </>
+        )}
+
+        {error !== null && <p className="form-error">{localizeApiError(error)}</p>}
         <div className="modal-actions">
           <button type="button" className="btn btn-ghost" onClick={onClose}>{t('common.cancel')}</button>
-          <button type="submit" className="btn btn-primary" disabled={busy || !namespace.trim()}>
-            {busy ? t('issue.submitting') : t('issue.submit')}
+          {observed.length === 0 && chosen && (
+            <button type="button" className="btn btn-secondary" onClick={() => onIssueInheriting(chosen.backendId)}>
+              {t('migrate.issueInheriting')}
+            </button>
+          )}
+          <button type="button" className="btn btn-primary" onClick={handleBind} disabled={busy || !chosen}>
+            {busy ? t('migrate.binding') : chosen ? t('migrate.bindTo', { name: identityLabel(chosen) }) : t('migrate.bind')}
           </button>
         </div>
-      </form>
+      </div>
     </div>
   );
 }
 
+function ScopeDialog({
+  credential,
+  backends,
+  credentials,
+  onClose,
+  onSaved,
+  onSessionLost,
+}: {
+  credential: CredentialRecord;
+  backends: BackendIdentity[];
+  credentials: CredentialRecord[];
+  onClose: () => void;
+  onSaved: () => void;
+  onSessionLost: (err: unknown) => void;
+}) {
+  const { t } = useI18n();
+  const nsIdentities = backends.filter((b) => b.namespace === credential.namespace);
+  // Ids of deleted identities can't be saved back (the server rejects unknown
+  // backends), so they start out removed from the selection.
+  const [droppedUnknown] = useState(
+    () => (credential.allowedBackends ?? []).filter((id) => !nsIdentities.some((b) => b.backendId === id)).length,
+  );
+  const [mode, setMode] = useState<ScopeMode>(credential.allowedBackends === null ? 'all' : 'specific');
+  const [selected, setSelected] = useState<string[]>(
+    () => (credential.allowedBackends ?? []).filter((id) => nsIdentities.some((b) => b.backendId === id)),
+  );
+  const [busy, setBusy] = useState(false);
+  // Raw error, localized at render so the text follows locale switches.
+  const [error, setError] = useState<unknown>(null);
+
+  const credentialsById = useMemo(() => new Map(credentials.map((c) => [c.id, c])), [credentials]);
+  const next = mode === 'all' ? null : selected;
+  const current = credential.allowedBackends;
+  const unchanged = next === null
+    ? current === null
+    : current !== null && current.length === next.length && next.every((id) => current.includes(id));
+
+  async function handleSave() {
+    if (busy || unchanged || (next !== null && next.length === 0)) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api.updateCredentialScope(credential.id, next);
+      onSaved();
+    } catch (err) {
+      setError(err);
+      onSessionLost(err);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="modal-backdrop">
+      <div className="modal">
+        <h3>{t('scope.title')}</h3>
+        <p>
+          <strong>{credential.name || credential.id}</strong>
+          <span className="muted"> · {t('type.device')} · <code>{credential.namespace}</code></span>
+        </p>
+        <ScopeFields
+          identities={nsIdentities}
+          credentialsById={credentialsById}
+          mode={mode}
+          selected={selected}
+          onModeChange={setMode}
+          onSelectedChange={setSelected}
+        />
+        {mode === 'specific' && droppedUnknown > 0 && (
+          <p className="field-hint">{t('scope.droppedUnknown', { count: droppedUnknown })}</p>
+        )}
+        <p className="token-warning">{t('scope.disconnectWarning')}</p>
+        {error !== null && <p className="form-error">{localizeApiError(error)}</p>}
+        <div className="modal-actions">
+          <button type="button" className="btn btn-ghost" onClick={onClose}>{t('common.cancel')}</button>
+          <button
+            type="button"
+            className="btn btn-primary"
+            onClick={handleSave}
+            disabled={busy || unchanged || (next !== null && next.length === 0)}
+          >
+            {busy ? t('scope.saving') : t('scope.save')}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
 function RevokeDialog({
   credential,
   onClose,
@@ -310,6 +385,7 @@ function RevokedResultModal({ ids, onClose }: { ids: string[]; onClose: () => vo
 export function CredentialsPage({ onSessionLost }: { onSessionLost: (err: unknown) => void }) {
   const { t } = useI18n();
   const [credentials, setCredentials] = useState<CredentialRecord[] | null>(null);
+  const [backends, setBackends] = useState<BackendIdentity[]>([]);
   // Raw errors, localized at render so text follows locale switches.
   const [error, setError] = useState<unknown>(null);
   const [actionError, setActionError] = useState<unknown>(null);
@@ -317,16 +393,19 @@ export function CredentialsPage({ onSessionLost }: { onSessionLost: (err: unknow
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
   const [namespaceFilter, setNamespaceFilter] = useState('all');
   const [search, setSearch] = useState('');
-  const [issuing, setIssuing] = useState(false);
+  const [issuing, setIssuing] = useState<{ initial?: IssueDialogInitial } | null>(null);
   const [issued, setIssued] = useState<IssuedCredential | null>(null);
   const [revoking, setRevoking] = useState<CredentialRecord | null>(null);
   const [revokedIds, setRevokedIds] = useState<string[] | null>(null);
   const [purging, setPurging] = useState<{ ids: string[]; single: CredentialRecord | null } | null>(null);
+  const [migrating, setMigrating] = useState<CredentialRecord | null>(null);
+  const [editingScope, setEditingScope] = useState<CredentialRecord | null>(null);
 
   const load = useCallback(async () => {
     try {
-      const list = await api.listCredentials();
+      const [list, backendList] = await Promise.all([api.listCredentials(), api.listBackends()]);
       setCredentials(list.sort((a, b) => b.createdAt - a.createdAt));
+      setBackends(backendList);
       setError(null);
     } catch (err) {
       setError(err);
@@ -337,9 +416,12 @@ export function CredentialsPage({ onSessionLost }: { onSessionLost: (err: unknow
   useEffect(() => { load(); }, [load]);
 
   const namespaces = useMemo(
-    () => [...new Set((credentials ?? []).map((c) => c.namespace))].sort(),
-    [credentials],
+    () => [...new Set([...(credentials ?? []).map((c) => c.namespace), ...backends.map((b) => b.namespace)])].sort(),
+    [credentials, backends],
   );
+
+  const backendsById = useMemo(() => new Map(backends.map((b) => [b.backendId, b])), [backends]);
+  const credentialsById = useMemo(() => new Map((credentials ?? []).map((c) => [c.id, c])), [credentials]);
 
   const filtered = useMemo(() => {
     let list = credentials ?? [];
@@ -351,7 +433,8 @@ export function CredentialsPage({ onSessionLost }: { onSessionLost: (err: unknow
       list = list.filter((c) =>
         c.name.toLowerCase().includes(q)
         || c.namespace.toLowerCase().includes(q)
-        || c.id.toLowerCase().includes(q));
+        || c.id.toLowerCase().includes(q)
+        || (c.backendId?.toLowerCase().includes(q) ?? false));
     }
     return list;
   }, [credentials, typeFilter, statusFilter, namespaceFilter, search]);
@@ -364,6 +447,38 @@ export function CredentialsPage({ onSessionLost }: { onSessionLost: (err: unknow
   function showActionError(err: unknown) {
     setActionError(err);
     onSessionLost(err);
+  }
+
+  function renderBackendOrScope(c: CredentialRecord, status: CredentialStatus) {
+    if (c.type === 'device') {
+      if (c.allowedBackends === null) return <span className="muted">{t('scope.all')}</span>;
+      const entries = c.allowedBackends.map((id) => {
+        const b = backendsById.get(id);
+        const stale = !b || !identityReachable(b, credentialsById);
+        return { id, label: b ? identityLabel(b) : shortId(id), stale };
+      });
+      const staleCount = entries.filter((e) => e.stale).length;
+      const title = entries.map((e) => `${e.label} (${e.id})${e.stale ? ` — ${t('scope.stale')}` : ''}`).join('\n');
+      return (
+        <span title={title}>
+          {t('scope.count', { count: entries.length })}
+          {staleCount > 0 && <> <span className="badge badge-status-expired">{t('scope.staleCount', { count: staleCount })}</span></>}
+        </span>
+      );
+    }
+    if (c.backendId !== null) {
+      const b = backendsById.get(c.backendId);
+      return (
+        <>
+          {b && <div className="cell-name">{identityLabel(b)}</div>}
+          <div className="cell-id"><code title={c.backendId}>{shortId(c.backendId)}</code></div>
+        </>
+      );
+    }
+    if (c.type === 'backend' && status !== 'revoked') {
+      return <span className="badge badge-legacy" title={t('binding.legacyTitle')}>{t('binding.legacy')}</span>;
+    }
+    return <span className="muted">—</span>;
   }
 
   if (error !== null && !credentials) {
@@ -387,7 +502,7 @@ export function CredentialsPage({ onSessionLost }: { onSessionLost: (err: unknow
           >
             {t('creds.purgeRevoked', { count: revokedAll.length })}
           </button>
-          <button type="button" className="btn btn-primary" onClick={() => setIssuing(true)}>
+          <button type="button" className="btn btn-primary" onClick={() => setIssuing({})}>
             {t('creds.issue')}
           </button>
         </div>
@@ -431,6 +546,7 @@ export function CredentialsPage({ onSessionLost }: { onSessionLost: (err: unknow
               <th>{t('col.name')}</th>
               <th>{t('col.type')}</th>
               <th>{t('col.namespace')}</th>
+              <th>{t('col.backendScope')}</th>
               <th>{t('col.status')}</th>
               <th>{t('col.createdAt')}</th>
               <th>{t('col.expiresAt')}</th>
@@ -440,7 +556,7 @@ export function CredentialsPage({ onSessionLost }: { onSessionLost: (err: unknow
           </thead>
           <tbody>
             {filtered.length === 0 && (
-              <tr><td colSpan={8} className="muted table-empty">{t('creds.noMatch')}</td></tr>
+              <tr><td colSpan={9} className="muted table-empty">{t('creds.noMatch')}</td></tr>
             )}
             {filtered.map((c) => {
               const status = credentialStatus(c);
@@ -456,21 +572,34 @@ export function CredentialsPage({ onSessionLost }: { onSessionLost: (err: unknow
                     </span>
                   </td>
                   <td><code>{c.namespace}</code></td>
+                  <td>{renderBackendOrScope(c, status)}</td>
                   <td><span className={`badge badge-status-${status}`}>{t(STATUS_KEYS[status])}</span></td>
                   <td title={formatDateTime(c.createdAt)}>{relativeTime(c.createdAt)}</td>
                   <td>{c.expiresAt === null ? t('creds.neverExpires') : <span title={formatDateTime(c.expiresAt)}>{relativeTime(c.expiresAt)}</span>}</td>
                   <td>{c.lastUsedAt === null ? t('creds.neverUsed') : <span title={formatDateTime(c.lastUsedAt)}>{relativeTime(c.lastUsedAt)}</span>}</td>
                   <td>
-                    {status === 'active' && (
-                      <button type="button" className="btn btn-small btn-danger" onClick={() => setRevoking(c)}>
-                        {t('creds.revoke')}
-                      </button>
-                    )}
-                    {status === 'revoked' && (
-                      <button type="button" className="btn btn-small btn-danger" onClick={() => setPurging({ ids: [c.id], single: c })}>
-                        {t('creds.delete')}
-                      </button>
-                    )}
+                    <div className="row-actions">
+                      {c.type === 'backend' && c.backendId === null && status !== 'revoked' && (
+                        <button type="button" className="btn btn-small btn-primary" onClick={() => setMigrating(c)}>
+                          {t('creds.migrate')}
+                        </button>
+                      )}
+                      {c.type === 'device' && status !== 'revoked' && (
+                        <button type="button" className="btn btn-small btn-secondary" onClick={() => setEditingScope(c)}>
+                          {t('creds.editScope')}
+                        </button>
+                      )}
+                      {status === 'active' && (
+                        <button type="button" className="btn btn-small btn-danger" onClick={() => setRevoking(c)}>
+                          {t('creds.revoke')}
+                        </button>
+                      )}
+                      {status === 'revoked' && (
+                        <button type="button" className="btn btn-small btn-danger" onClick={() => setPurging({ ids: [c.id], single: c })}>
+                          {t('creds.delete')}
+                        </button>
+                      )}
+                    </div>
                   </td>
                 </tr>
               );
@@ -483,9 +612,12 @@ export function CredentialsPage({ onSessionLost }: { onSessionLost: (err: unknow
       {issuing && (
         <IssueDialog
           namespaces={namespaces}
-          onClose={() => setIssuing(false)}
-          onIssued={(item) => { setIssuing(false); setIssued(item); load(); }}
-          onError={showActionError}
+          backends={backends}
+          credentials={credentials}
+          initial={issuing.initial}
+          onClose={() => setIssuing(null)}
+          onIssued={(item) => { setIssuing(null); setIssued(item); load(); }}
+          onSessionLost={onSessionLost}
         />
       )}
       {issued && <TokenOnceModal issued={issued} onClose={() => setIssued(null)} />}
@@ -504,6 +636,29 @@ export function CredentialsPage({ onSessionLost }: { onSessionLost: (err: unknow
           onClose={() => setPurging(null)}
           onPurged={() => { setPurging(null); load(); }}
           onError={(err) => { setPurging(null); showActionError(err); }}
+        />
+      )}
+      {migrating && (
+        <MigrateDialog
+          credential={migrating}
+          backends={backends}
+          onClose={() => setMigrating(null)}
+          onBound={() => { setMigrating(null); load(); }}
+          onIssueInheriting={(backendId) => {
+            setIssuing({ initial: { type: 'backend', namespace: migrating.namespace, backendId } });
+            setMigrating(null);
+          }}
+          onSessionLost={onSessionLost}
+        />
+      )}
+      {editingScope && (
+        <ScopeDialog
+          credential={editingScope}
+          backends={backends}
+          credentials={credentials}
+          onClose={() => setEditingScope(null)}
+          onSaved={() => { setEditingScope(null); load(); }}
+          onSessionLost={onSessionLost}
         />
       )}
       {revokedIds && <RevokedResultModal ids={revokedIds} onClose={() => setRevokedIds(null)} />}

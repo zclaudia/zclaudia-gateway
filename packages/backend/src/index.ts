@@ -34,7 +34,17 @@ export interface GatewayBackendOptions {
    */
   exchangeEnrollment?: boolean;
   namespace: string;
-  identity: { deviceId: string; instanceId: string; name?: string; channel?: string };
+  /**
+   * Descriptive identity reported in `peer_hello`. Optional: with a bound
+   * backend credential (ADR-0008) the gateway assigns the `backendId` from
+   * the credential, and these fields are display-only (`name` is shown in
+   * the registry). A legacy (unbound) backend credential still derives the
+   * backendId from `(namespace, instanceId, channel)`, so it needs a stable
+   * `instanceId` — never a hostname, pod name or random value — and the
+   * gateway rejects its hello without one (`INVALID_MESSAGE`).
+   * Only the fields provided are sent; omit it to send no identity at all.
+   */
+  identity?: { deviceId?: string; instanceId?: string; name?: string; channel?: string };
   visible?: boolean;
   capabilities?: string[];
   backendProtocolVersion?: number;
@@ -347,7 +357,7 @@ export class GatewayBackend {
       clientProtocolVersion: this.opts.backendProtocolVersion ?? 1,
       peerType: 'client+backend',
       gatewaySecret: credential,
-      identity: this.opts.identity,
+      ...(this.opts.identity ? { identity: this.opts.identity } : {}),
       backend: {
         visible: this.opts.visible ?? true,
         capabilities: this.opts.capabilities ?? [],

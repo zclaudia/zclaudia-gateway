@@ -27,10 +27,16 @@ export type Epoch = number;
 // Handshake
 // ============================================================================
 
+/**
+ * Self-reported peer description. Only `name` matters to a backend whose
+ * credential is bound to a backend identity (ADR-0008); the other fields are
+ * descriptive. Legacy (unbound) backend credentials still derive identity
+ * from (namespace, instanceId, channel) and therefore require `instanceId`.
+ */
 export interface PeerIdentity {
-  deviceId: string;
-  instanceId: string;
-  /** Environment ("prod" default); part of the v4 backend identity key. */
+  deviceId?: string;
+  instanceId?: string;
+  /** Environment ("prod" default); part of the legacy backend identity key. */
   channel?: string;
   name?: string;
 }
@@ -50,7 +56,7 @@ export interface PeerHelloV4 {
    * credential record, never from this hello.
    */
   gatewaySecret: string;
-  identity: PeerIdentity;
+  identity?: PeerIdentity;
   backend?: {
     visible: boolean;
     capabilities: string[];

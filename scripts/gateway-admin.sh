@@ -8,10 +8,13 @@
 #   GATEWAY_ADMIN_TOKEN  admin token — the root of trust for credential issuance
 #
 # Usage:
-#   gateway-admin.sh issue-backend <namespace> <name>
-#   gateway-admin.sh issue-device  <namespace> <name> [ttl-days]
+#   gateway-admin.sh issue-backend <namespace> <name> [inherit-backend-id]
+#   gateway-admin.sh issue-device  <namespace> <name> [ttl-days] [backend-id,...]
 #   gateway-admin.sh list
 #   gateway-admin.sh backends                # known backend identities + last credential
+#   gateway-admin.sh bind <credential-id> <backend-id>    # migrate a legacy backend credential in place
+#   gateway-admin.sh scope <credential-id> all|<backend-id,...>   # device backend scope
+#   gateway-admin.sh forget-backend <backend-id>          # delete an unused backend identity
 #   gateway-admin.sh revoke <credential-id>
 #   gateway-admin.sh purge [credential-id]   # delete revoked credentials (all if no id)
 set -euo pipefail
@@ -31,6 +34,24 @@ env_lookup() {
 : "${GATEWAY_URL:=$(env_lookup GATEWAY_URL)}"
 : "${GATEWAY_URL:=http://127.0.0.1:${GATEWAY_PORT:-3200}}"
 : "${GATEWAY_ADMIN_TOKEN:?set GATEWAY_ADMIN_TOKEN (env or ${ENV_FILE})}"
+
+# "a,b" -> ["a","b"]
+json_ids() {
+  python3 -c 'import json, sys; print(json.dumps([x for x in sys.argv[1].split(",") if x]))' "$1"
+}
+
+# Print success, or the error envelope and exit 1.
+check_ok() {
+  python3 -c '
+import json, sys
+r = json.load(sys.stdin)
+if r.get("success"):
+    print(sys.argv[1])
+else:
+    print("Error:", json.dumps(r.get("error"), ensure_ascii=False), file=sys.stderr)
+    sys.exit(1)
+' "$1"
+}
 
 api() {
   local method="$1" path="$2" body="${3:-}"
@@ -56,6 +77,10 @@ d = r["data"]
 print("id:       ", d["id"])
 print("type:     ", d["type"], " namespace:", d["namespace"], " name:", d.get("name") or "-")
 print("expires:  ", ts(d.get("expiresAt")))
+if d.get("backendId"):
+    print("backendId:", d["backendId"])
+if d.get("allowedBackends"):
+    print("backends: ", ", ".join(d["allowedBackends"]))
 print()
 print("token (shown ONCE, store it now):")
 print(" ", d["token"])
@@ -64,13 +89,16 @@ print(" ", d["token"])
 
 case "${1:-}" in
   issue-backend)
-    ns="${2:?usage: issue-backend <namespace> <name>}"; name="${3:?usage: issue-backend <namespace> <name>}"
-    api POST /api/admin/credentials "{\"type\":\"backend\",\"namespace\":\"$ns\",\"name\":\"$name\"}" | show_issued
+    ns="${2:?usage: issue-backend <namespace> <name> [inherit-backend-id]}"; name="${3:?usage: issue-backend <namespace> <name> [inherit-backend-id]}"
+    body="{\"type\":\"backend\",\"namespace\":\"$ns\",\"name\":\"$name\""
+    [ -n "${4:-}" ] && body+=",\"backendId\":\"$4\""
+    api POST /api/admin/credentials "$body}" | show_issued
     ;;
   issue-device)
     ns="${2:?usage: issue-device <namespace> <name> [ttl-days]}"; name="${3:?usage: issue-device <namespace> <name> [ttl-days]}"
     body="{\"type\":\"device\",\"namespace\":\"$ns\",\"name\":\"$name\""
     [ -n "${4:-}" ] && body+=",\"ttlDays\":$4"
+    [ -n "${5:-}" ] && body+=",\"allowedBackends\":$(json_ids "$5")"
     api POST /api/admin/credentials "$body}" | show_issued
     ;;
   list)
@@ -88,12 +116,18 @@ rows = r["data"]
 if not rows:
     print("(no credentials)")
     sys.exit(0)
-fmt = "{:<36}  {:<8}  {:<12}  {:<20}  {:<20}  {}"
-print(fmt.format("id", "type", "namespace", "name", "expires", "status"))
+fmt = "{:<36}  {:<8}  {:<12}  {:<20}  {:<20}  {:<8}  {}"
+print(fmt.format("id", "type", "namespace", "name", "expires", "status", "backend / scope"))
 for c in rows:
     status = "REVOKED" if c.get("revokedAt") else "active"
+    if c["type"] == "device":
+        scope = "%d backend(s)" % len(c["allowedBackends"]) if c.get("allowedBackends") else "all backends"
+    elif c["type"] == "backend" and not c.get("backendId"):
+        scope = "LEGACY (unbound)"
+    else:
+        scope = c.get("backendId") or "-"
     print(fmt.format(c["id"], c["type"], c["namespace"], (c.get("name") or "-")[:20],
-                     ts(c.get("expiresAt")), status))
+                     ts(c.get("expiresAt")), status, scope))
 '
     ;;
   backends)
@@ -121,6 +155,19 @@ for b in rows:
                      b.get("lastCredentialId") or "-"))
 '
     ;;
+  bind)
+    id="${2:?usage: bind <credential-id> <backend-id>}"; backend="${3:?usage: bind <credential-id> <backend-id>}"
+    api POST "/api/admin/credentials/$id/bind" "{\"backendId\":\"$backend\"}" | check_ok "bound (token unchanged)"
+    ;;
+  scope)
+    id="${2:?usage: scope <credential-id> all|<backend-id,...>}"; scope="${3:?usage: scope <credential-id> all|<backend-id,...>}"
+    if [ "$scope" = "all" ]; then value=null; else value="$(json_ids "$scope")"; fi
+    api PATCH "/api/admin/credentials/$id" "{\"allowedBackends\":$value}" | check_ok "scope updated (live connections were closed)"
+    ;;
+  forget-backend)
+    backend="${2:?usage: forget-backend <backend-id>}"
+    api DELETE "/api/admin/backends/$backend" | check_ok "backend identity deleted"
+    ;;
   revoke)
     id="${2:?usage: revoke <credential-id>}"
     api DELETE "/api/admin/credentials/$id" | python3 -c '
@@ -147,7 +194,7 @@ else:
 '
     ;;
   *)
-    sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
     exit 1
     ;;
 esac

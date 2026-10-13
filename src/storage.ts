@@ -102,6 +102,17 @@ export interface CredentialRecord {
   expiresAt: number | null;
   revokedAt: number | null;
   lastUsedAt: number | null;
+  /**
+   * ADR-0008: the backend this credential *is* (backend and backend-access).
+   * null = legacy backend credential, identity derived from the hello's
+   * (namespace, instanceId, environment); always null for devices.
+   */
+  backendId: string | null;
+  /**
+   * ADR-0008: backends a device credential may reach. null = the whole
+   * namespace (including backends added later); always null for backends.
+   */
+  allowedBackends: string[] | null;
 }
 
 /** Public view of a credential — everything except the token hash. */
@@ -109,6 +120,23 @@ export type CredentialInfo = Omit<CredentialRecord, 'tokenHash'>;
 
 export function hashCredentialToken(token: string): string {
   return crypto.createHash('sha256').update(token).digest('hex');
+}
+
+const CREDENTIAL_COLUMNS = `id, type, namespace, name, parent_id as parentId,
+  created_at as createdAt, expires_at as expiresAt,
+  revoked_at as revokedAt, last_used_at as lastUsedAt,
+  backend_id as backendId, allowed_backends as allowedBackendsJson`;
+
+type CredentialRow = Omit<CredentialRecord, 'allowedBackends'> & { allowedBackendsJson: string | null };
+
+function credentialFromRow<T extends Partial<CredentialRow>>(row: T): Omit<T, 'allowedBackendsJson'> & { allowedBackends: string[] | null } {
+  const { allowedBackendsJson, ...rest } = row;
+  return { ...rest, allowedBackends: allowedBackendsJson ? JSON.parse(allowedBackendsJson) as string[] : null };
+}
+
+/** Identity key for a credential-bound backend; never collides with legacy keys, which start with the empty tenant. */
+function boundIdentityKey(backendId: string): string {
+  return `bound:${backendId}`;
 }
 
 function addColumnIfMissing(db: Database.Database, table: string, columnDef: string): void {
@@ -297,26 +325,62 @@ export class GatewayStorage {
     return backendId;
   }
 
+  /** Create the identity row for a credential-bound backend; returns its new backendId. */
+  private createBoundBackendIdentity(namespace: string, name: string): string {
+    const backendId = crypto.randomUUID();
+    const now = Date.now();
+    if (this.memoryState) {
+      this.memoryState.backendIdentities.set(boundIdentityKey(backendId), {
+        backendId, tenant: '', namespace, instanceId: '', environment: '', name,
+        createdAt: now, updatedAt: now, lastCredentialId: null, lastSeenAt: null,
+      });
+      return backendId;
+    }
+    this.sqlite.prepare(`
+      INSERT INTO backend_identities (identity_key, backend_id, tenant, namespace, instance_id, environment, name, created_at, updated_at)
+      VALUES (?, ?, '', ?, '', '', ?, ?, ?)
+    `).run(boundIdentityKey(backendId), backendId, namespace, name, now, now);
+    return backendId;
+  }
+
+  getBackendIdentity(backendId: string): BackendIdentity | undefined {
+    return this.listBackendIdentities().find((identity) => identity.backendId === backendId);
+  }
+
+  /** Forget a backend identity row (admin cleanup of drifted/unused identities). */
+  deleteBackendIdentity(backendId: string): boolean {
+    if (this.memoryState) {
+      for (const [key, identity] of this.memoryState.backendIdentities) {
+        if (identity.backendId === backendId) {
+          this.memoryState.backendIdentities.delete(key);
+          return true;
+        }
+      }
+      return false;
+    }
+    return this.sqlite.prepare('DELETE FROM backend_identities WHERE backend_id = ?').run(backendId).changes > 0;
+  }
+
   /**
    * Record that a backend identity was seen: on registration with the root
    * credential that registered it, on going offline with no credential.
    */
-  touchBackendIdentity(backendId: string, rootCredentialId?: string): void {
+  touchBackendIdentity(backendId: string, rootCredentialId?: string, name?: string): void {
     const now = Date.now();
     if (this.memoryState) {
       for (const identity of this.memoryState.backendIdentities.values()) {
         if (identity.backendId !== backendId) continue;
         identity.lastSeenAt = now;
         if (rootCredentialId) identity.lastCredentialId = rootCredentialId;
+        if (name) identity.name = name;
       }
       return;
     }
-    if (rootCredentialId) {
-      this.sqlite.prepare('UPDATE backend_identities SET last_seen_at = ?, last_credential_id = ? WHERE backend_id = ?')
-        .run(now, rootCredentialId, backendId);
-    } else {
-      this.sqlite.prepare('UPDATE backend_identities SET last_seen_at = ? WHERE backend_id = ?').run(now, backendId);
-    }
+    this.sqlite.prepare(`
+      UPDATE backend_identities
+      SET last_seen_at = ?, last_credential_id = COALESCE(?, last_credential_id), name = COALESCE(NULLIF(?, ''), name)
+      WHERE backend_id = ?
+    `).run(now, rootCredentialId ?? null, name ?? '', backendId);
   }
 
   /** All known backend identities, newest first. */
@@ -350,6 +414,10 @@ export class GatewayStorage {
     ttlMs?: number | null;
     /** Issuing credential id (backend-access only). */
     parentId?: string;
+    /** backend: inherit an existing identity (rotation/migration); omitted = a new one. backend-access: the parent's. */
+    backendId?: string | null;
+    /** device only: null/omitted = whole namespace. */
+    allowedBackends?: string[] | null;
   }): { credential: CredentialInfo; token: string } {
     const token = CREDENTIAL_TOKEN_PREFIXES[input.type] + crypto.randomBytes(32).toString('base64url');
     const now = Date.now();
@@ -357,6 +425,13 @@ export class GatewayStorage {
       ? (input.type === 'device' ? DEFAULT_DEVICE_TTL_MS
         : input.type === 'backend-access' ? DEFAULT_BACKEND_ACCESS_TTL_MS : null)
       : input.ttlMs;
+    let backendId: string | null = null;
+    if (input.type === 'backend') {
+      backendId = input.backendId ?? this.createBoundBackendIdentity(input.namespace, input.name ?? '');
+    } else if (input.type === 'backend-access') {
+      backendId = input.backendId ?? null;
+    }
+    const allowedBackends = input.type === 'device' ? input.allowedBackends ?? null : null;
     const record: CredentialRecord = {
       id: crypto.randomUUID(),
       type: input.type,
@@ -368,16 +443,20 @@ export class GatewayStorage {
       expiresAt: ttlMs === null ? null : now + ttlMs,
       revokedAt: null,
       lastUsedAt: null,
+      backendId,
+      allowedBackends,
     };
 
     if (this.memoryState) {
       this.memoryState.credentials.set(record.id, record);
     } else {
       this.sqlite.prepare(`
-        INSERT INTO credentials (id, type, token_hash, namespace, name, parent_id, created_at, expires_at, revoked_at, last_used_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO credentials (id, type, token_hash, namespace, name, parent_id, created_at, expires_at, revoked_at, last_used_at,
+                                 backend_id, allowed_backends)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(record.id, record.type, record.tokenHash, record.namespace, record.name,
-        record.parentId, record.createdAt, record.expiresAt, record.revokedAt, record.lastUsedAt);
+        record.parentId, record.createdAt, record.expiresAt, record.revokedAt, record.lastUsedAt,
+        record.backendId, record.allowedBackends ? JSON.stringify(record.allowedBackends) : null);
     }
     const { tokenHash: _tokenHash, ...credential } = record;
     return { credential, token };
@@ -416,24 +495,18 @@ export class GatewayStorage {
     if (this.memoryState) {
       return Array.from(this.memoryState.credentials.values()).find((c) => c.tokenHash === hash);
     }
-    return this.sqlite.prepare(`
-      SELECT id, type, token_hash as tokenHash, namespace, name, parent_id as parentId,
-             created_at as createdAt, expires_at as expiresAt,
-             revoked_at as revokedAt, last_used_at as lastUsedAt
-      FROM credentials WHERE token_hash = ?
-    `).get(hash) as CredentialRecord | undefined;
+    const row = this.sqlite.prepare(`SELECT ${CREDENTIAL_COLUMNS}, token_hash as tokenHash FROM credentials WHERE token_hash = ?`)
+      .get(hash) as CredentialRow | undefined;
+    return row && credentialFromRow(row);
   }
 
   private getCredentialById(id: string): CredentialRecord | undefined {
     if (this.memoryState) {
       return this.memoryState.credentials.get(id);
     }
-    return this.sqlite.prepare(`
-      SELECT id, type, token_hash as tokenHash, namespace, name, parent_id as parentId,
-             created_at as createdAt, expires_at as expiresAt,
-             revoked_at as revokedAt, last_used_at as lastUsedAt
-      FROM credentials WHERE id = ?
-    `).get(id) as CredentialRecord | undefined;
+    const row = this.sqlite.prepare(`SELECT ${CREDENTIAL_COLUMNS}, token_hash as tokenHash FROM credentials WHERE id = ?`)
+      .get(id) as CredentialRow | undefined;
+    return row && credentialFromRow(row);
   }
 
   /** List all credentials (revoked and expired included), newest first. */
@@ -446,12 +519,54 @@ export class GatewayStorage {
           return info;
         });
     }
+    const rows = this.sqlite.prepare(`SELECT ${CREDENTIAL_COLUMNS} FROM credentials ORDER BY created_at DESC`)
+      .all() as Array<Omit<CredentialRow, 'tokenHash'>>;
+    return rows.map(credentialFromRow);
+  }
+
+  /** Public view of one credential, or undefined. */
+  getCredential(id: string): CredentialInfo | undefined {
+    const record = this.getCredentialById(id);
+    if (!record) return undefined;
+    const { tokenHash: _tokenHash, ...info } = record;
+    return info;
+  }
+
+  /**
+   * Bind a legacy backend credential, and the access tokens exchanged from
+   * it, to an existing backend identity (ADR-0008 in-place migration).
+   * Returns false if the credential is not an unrevoked, unbound backend credential.
+   */
+  bindBackendCredential(id: string, backendId: string): boolean {
+    if (this.memoryState) {
+      const record = this.memoryState.credentials.get(id);
+      if (!record || record.type !== 'backend' || record.revokedAt !== null || record.backendId !== null) return false;
+      for (const c of this.memoryState.credentials.values()) {
+        if ((c.id === id || c.parentId === id) && c.revokedAt === null) c.backendId = backendId;
+      }
+      return true;
+    }
+    const bound = this.sqlite.prepare(`
+      UPDATE credentials SET backend_id = ?
+      WHERE id = ? AND type = 'backend' AND revoked_at IS NULL AND backend_id IS NULL
+    `).run(backendId, id);
+    if (bound.changes === 0) return false;
+    this.sqlite.prepare('UPDATE credentials SET backend_id = ? WHERE parent_id = ? AND revoked_at IS NULL')
+      .run(backendId, id);
+    return true;
+  }
+
+  /** Replace a device credential's backend scope (null = whole namespace). */
+  setAllowedBackends(id: string, allowedBackends: string[] | null): boolean {
+    if (this.memoryState) {
+      const record = this.memoryState.credentials.get(id);
+      if (!record || record.type !== 'device' || record.revokedAt !== null) return false;
+      record.allowedBackends = allowedBackends;
+      return true;
+    }
     return this.sqlite.prepare(`
-      SELECT id, type, namespace, name, parent_id as parentId,
-             created_at as createdAt, expires_at as expiresAt,
-             revoked_at as revokedAt, last_used_at as lastUsedAt
-      FROM credentials ORDER BY created_at DESC
-    `).all() as CredentialInfo[];
+      UPDATE credentials SET allowed_backends = ? WHERE id = ? AND type = 'device' AND revoked_at IS NULL
+    `).run(allowedBackends ? JSON.stringify(allowedBackends) : null, id).changes > 0;
   }
 
   /**

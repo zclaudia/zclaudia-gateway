@@ -64,10 +64,21 @@ export function OverviewPage({ onSessionLost }: { onSessionLost: (err: unknown) 
         </span>
       </div>
 
+      {overview.legacyBackendCredentials > 0 && (
+        <p className="notice">
+          <a href="#/credentials">{t('overview.legacyPending', { count: overview.legacyBackendCredentials })}</a>
+          <span className="muted">{t('overview.legacyPendingHint')}</span>
+        </p>
+      )}
+
       <div className="stat-grid">
         <div className="stat-card">
           <div className="stat-value">{overview.backends}</div>
           <div className="stat-label">{t('overview.backends')}</div>
+        </div>
+        <div className="stat-card">
+          <div className="stat-value">{overview.backendIdentities}</div>
+          <div className="stat-label">{t('overview.backendIdentities')}</div>
         </div>
         <div className="stat-card">
           <div className="stat-value">{onlinePeers.length}</div>

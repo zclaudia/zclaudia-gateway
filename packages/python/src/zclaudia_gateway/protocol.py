@@ -52,20 +52,20 @@ def normalize_identity(identity: dict[str, Any]) -> dict[str, str]:
     """Map an identity mapping to the wire (camelCase) form.
 
     Accepts both snake_case (``device_id``) and wire spelling (``deviceId``).
-    ``device_id`` and ``instance_id`` are required: they are the stable parts
-    of the v4 backend identity key ``(namespace, instanceId, environment)``.
+    Every field is optional and only the keys provided (not ``None``) are
+    emitted. With a bound backend credential (ADR-0008) the gateway takes the
+    ``backendId`` from the credential and these fields are descriptive only.
+    A legacy (unbound) backend credential still derives the ``backendId`` from
+    ``(namespace, instanceId, channel)``, so it needs a stable ``instance_id``;
+    the gateway rejects such a hello without one (``INVALID_MESSAGE``).
     """
-    device = identity.get("deviceId", identity.get("device_id"))
-    instance = identity.get("instanceId", identity.get("instance_id"))
-    if not device or not instance:
-        raise ValueError("identity requires 'device_id' and 'instance_id'")
-    out: dict[str, str] = {"deviceId": str(device), "instanceId": str(instance)}
-    name = identity.get("name")
-    if name is not None:
-        out["name"] = str(name)
-    channel = identity.get("channel")
-    if channel is not None:
-        out["channel"] = str(channel)
+    out: dict[str, str] = {}
+    for wire, snake in (("deviceId", "device_id"), ("instanceId", "instance_id"), ("name", None), ("channel", None)):
+        value = identity.get(wire)
+        if value is None and snake is not None:
+            value = identity.get(snake)
+        if value is not None:
+            out[wire] = str(value)
     return out
 
 

@@ -8,9 +8,19 @@ import net from 'node:net';
 import { createGatewayServer } from '../server.js';
 import { closeTestServer, listenTestServer, issueToken, TEST_ADMIN_TOKEN } from './test-server.js';
 
-// Issued zgb_ token, refreshed for every test server instance.
-let GATEWAY_SECRET = '';
 let WS_URL = '';
+// One backend credential per instanceId: a credential *is* one backend
+// (ADR-0008), so distinct test backends need distinct credentials.
+let backendTokens = new Map<string, string>();
+
+async function backendTokenFor(instanceId: string): Promise<string> {
+  let token = backendTokens.get(instanceId);
+  if (!token) {
+    token = await issueToken(WS_URL, 'backend', 'zclaudia');
+    backendTokens.set(instanceId, token);
+  }
+  return token;
+}
 
 async function canBindLoopback(): Promise<boolean> {
   return await new Promise((resolve) => {
@@ -86,7 +96,7 @@ async function registerBackendV2(ws: WebSocket, identity: { deviceId: string; in
     namespace: 'zclaudia',
     clientProtocolVersion: 1,
     peerType: 'client+backend',
-    gatewaySecret: GATEWAY_SECRET,
+    gatewaySecret: await backendTokenFor(identity.instanceId),
     identity,
     backend: { visible, capabilities: [], backendProtocolVersion: 1 }
   }));
@@ -105,7 +115,7 @@ describeIfLoopback('Gateway Backend Message Handling', () => {
   beforeEach(async () => {
     server = createGatewayServer({ adminToken: TEST_ADMIN_TOKEN });
     ({ wsUrl: WS_URL } = await listenTestServer(server));
-    GATEWAY_SECRET = await issueToken(WS_URL, 'backend', 'zclaudia');
+    backendTokens = new Map();
 
     // Register a backend
     backendWs = new WebSocket(WS_URL);

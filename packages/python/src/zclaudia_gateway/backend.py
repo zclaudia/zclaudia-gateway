@@ -150,8 +150,7 @@ class GatewayBackend:
 
     Typical use::
 
-        backend = GatewayBackend(url=..., credential="zgb_...", namespace=...,
-                                 identity={"device_id": "srv-1", "instance_id": "i-1"})
+        backend = GatewayBackend(url=..., credential="zgb_...", namespace=...)
         backend.on_channel("rpc", handler)
         backend.serve_http(http_handler)
         backend_id, epoch = await backend.connect()
@@ -171,6 +170,14 @@ class GatewayBackend:
 
     Because :meth:`start` does not raise, failed attempts are reported through
     :attr:`last_error` instead (see there for its lifecycle).
+
+    ``identity`` is optional and descriptive: a bound backend credential
+    (ADR-0008) fixes the ``backendId`` when it is issued, so ``name`` is only
+    shown in the registry. Pass ``identity={"name": "My server"}`` to set it;
+    omit it to send no identity. A legacy (unbound) backend credential still
+    derives the ``backendId`` from ``(namespace, instance_id, channel)`` and
+    must keep passing a stable ``instance_id`` (never a hostname, pod name or
+    random value); the gateway rejects its hello without one.
     """
 
     def __init__(
@@ -178,7 +185,7 @@ class GatewayBackend:
         url: str,
         credential: str,
         namespace: str,
-        identity: dict[str, Any],
+        identity: dict[str, Any] | None = None,
         *,
         visible: bool = True,
         capabilities: list[str] | None = None,
@@ -193,7 +200,7 @@ class GatewayBackend:
     ) -> None:
         self._credential = credential
         self._namespace = namespace
-        self._identity = normalize_identity(identity)
+        self._identity = normalize_identity(identity) if identity is not None else None
         self._visible = visible
         self._capabilities = list(capabilities or [])
         self._backend_protocol_version = backend_protocol_version
@@ -511,25 +518,23 @@ class GatewayBackend:
             open_timeout=self._open_timeout,
         )
         self._ws = ws
+        hello: dict[str, Any] = {
+            "type": "peer_hello",
+            "protocolVersion": GATEWAY_PROTOCOL_V4,
+            "namespace": self._namespace,
+            "clientProtocolVersion": self._backend_protocol_version,
+            "peerType": PEER_TYPE_CLIENT_BACKEND,
+            "gatewaySecret": credential,
+            "backend": {
+                "visible": self._visible,
+                "capabilities": self._capabilities,
+                "backendProtocolVersion": self._backend_protocol_version,
+            },
+        }
+        if self._identity is not None:
+            hello["identity"] = self._identity
         try:
-            await ws.send(
-                json.dumps(
-                    {
-                        "type": "peer_hello",
-                        "protocolVersion": GATEWAY_PROTOCOL_V4,
-                        "namespace": self._namespace,
-                        "clientProtocolVersion": self._backend_protocol_version,
-                        "peerType": PEER_TYPE_CLIENT_BACKEND,
-                        "gatewaySecret": credential,
-                        "identity": self._identity,
-                        "backend": {
-                            "visible": self._visible,
-                            "capabilities": self._capabilities,
-                            "backendProtocolVersion": self._backend_protocol_version,
-                        },
-                    }
-                )
-            )
+            await ws.send(json.dumps(hello))
             ready = await self._await_peer_ready(ws)
         except BaseException:
             self._ws = None

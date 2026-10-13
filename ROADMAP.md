@@ -432,7 +432,7 @@ Phase 4 Hermes   Phase 5 ComfyUI
 3. ✅ 前置反向代理终止 TLS（[ADR-0001](docs/adr/0001-deployment-and-tls-termination.md)；实际部署备注：origin 带端口、Caddy 容器化）；
 4. ✅ Gateway 提供最小认证服务，不接 IdP（[ADR-0002](docs/adr/0002-identity-issuance.md)）；
 5. ✅ Device/Backend/Backend-access 凭证签发与级联撤销已实现（ADR-0002）；管理面 Cookie 会话已随 Web 管理控制台落地（[ADR-0005](docs/adr/0005-admin-web-ui.md)）；peer 隧道浏览器 Session 仍留待 Phase 5；
-6. ✅ Backend 唯一键 =（tenant 预留, namespace, instanceId, environment），UUID 标识（docs/protocol-v4.md §2）；
+6. ✅ Backend 身份由后端凭证授予，签发即确定 UUID；旧版凭证仍按（tenant 预留, namespace, instanceId, environment）映射直至迁移（[ADR-0008](docs/adr/0008-credential-bound-backend-identity.md)，docs/protocol-v4.md §2）；
 7. ✅ 不需要：选择了每 Channel 一连接，无自研 framing/flow-control window；
 8. ✅ 已作废：v3 兼容层曾内置于 Gateway，随 v3 删除一并移除；
 9. ✅ 同仓 pnpm workspace、`@zclaudia/gateway-*` 已发 npm（[ADR-0004](docs/adr/0004-sdk-packaging.md)）；Go SDK 推迟；

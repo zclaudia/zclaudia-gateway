@@ -14,7 +14,7 @@ const client = new GatewayClient({
   url: 'https://gateway.example.com',
   credential: 'zgd_...',
   namespace: 'myapp',
-  identity: { deviceId: 'dev-1', instanceId: 'inst-1' },
+  identity: { name: 'My laptop' }, // optional, display only
 });
 await client.connect();
 await client.subscribeTopic(backendId, 'resources', (payload) => { /* ... */ });

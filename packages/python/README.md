@@ -28,7 +28,7 @@ async def main():
         url="https://gateway.example.com",
         credential="zgb_...",                     # issued by the Admin API
         namespace="myapp",
-        identity={"device_id": "server-1", "instance_id": "inst-1"},
+        identity={"name": "My server"},           # optional, display only
     )
 
     # Serve application channels (kind is application-defined; the gateway
@@ -66,6 +66,22 @@ sends `channel_closed`). Enrollment credentials (`zgb_`) are exchanged for
 short-lived access credentials (`zga_`) before each connect unless
 `exchange_enrollment=False`.
 
+### Backend identity
+
+The backend's identity comes from its credential: a `zgb_` credential is
+bound to a `backend_id` when it is issued, so `url`, `credential` and
+`namespace` are all a backend needs. `identity` is optional and descriptive
+(`name` is shown in the registry). Run several backends by issuing one
+credential per backend — backends sharing a credential replace each other.
+
+**Legacy (unbound) backend credentials** — issued before credential binding
+and not yet migrated — still derive the `backend_id` from
+`(namespace, instance_id, channel)`. Such a backend must keep passing a stable
+`identity={"instance_id": ...}`: never a hostname, pod name or random value,
+or every restart gets a new `backend_id`. The gateway rejects a legacy backend
+hello without `instance_id` (`INVALID_MESSAGE`). See
+[ADR-0008](../../docs/adr/0008-credential-bound-backend-identity.md).
+
 ## Streaming HTTP
 
 `serve_http_stream(handler)` serves the same proxy in streaming mode: the
@@ -79,7 +95,7 @@ import asyncio
 from zclaudia_gateway import GatewayBackend, HttpExchange
 
 backend = GatewayBackend(url="https://gateway.example.com", credential="zgb_...",
-                         namespace="myapp", identity={"device_id": "server-1", "instance_id": "inst-1"})
+                         namespace="myapp")
 
 async def handler(exchange: HttpExchange) -> None:
     print(exchange.request.method, exchange.request.path, exchange.request.headers)
@@ -122,7 +138,7 @@ async def events():
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 backend = GatewayBackend(url="https://gateway.example.com", credential="zgb_...",
-                         namespace="myapp", identity={"device_id": "server-1", "instance_id": "inst-1"})
+                         namespace="myapp")
 backend.serve_http_stream(asgi_http_handler(app, extra_headers={"X-API-Key": "backend-secret"}))
 await backend.connect()
 ```
@@ -168,7 +184,7 @@ from zclaudia_gateway import GatewayBackend
 
 async def main():
     backend = GatewayBackend(url="https://gateway.example.com", credential="zgb_...",
-                             namespace="myapp", identity={"device_id": "server-1", "instance_id": "inst-1"})
+                             namespace="myapp")
     backend.on_state(lambda state: print("gateway:", state))
 
     await backend.start()             # returns now, connects in the background
@@ -229,8 +245,9 @@ Lifecycle:
 
 ## API sketch
 
-- `GatewayBackend(url, credential, namespace, identity, ...)` — `identity`
-  accepts `device_id`/`instance_id` (mapped to the wire's camelCase keys).
+- `GatewayBackend(url, credential, namespace, identity=None, ...)` — `identity`
+  is optional and descriptive; it accepts `name`, `channel`, `device_id`/`instance_id`
+  (snake_case or the wire's camelCase keys) and sends only the keys given.
 - `await connect() -> (backend_id, epoch)` · `await start()` ·
   `await wait_connected()` · `await close()` · `await wait_closed()` ·
   `async with` supported.
