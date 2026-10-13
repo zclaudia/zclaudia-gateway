@@ -68,7 +68,7 @@ function DeleteBackendDialog({
 }
 
 /**
- * Known backend identities (ADR-0008). Bound identities get their backendId
+ * Known backend identities (ADR-0009). Bound identities get their backendId
  * from backend credentials; legacy ones are still reached only by unbound
  * credentials, whose "last credential" is the evidence for migrating them.
  */

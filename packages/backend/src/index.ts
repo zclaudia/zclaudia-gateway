@@ -36,7 +36,7 @@ export interface GatewayBackendOptions {
   namespace: string;
   /**
    * Descriptive identity reported in `peer_hello`. Optional: with a bound
-   * backend credential (ADR-0008) the gateway assigns the `backendId` from
+   * backend credential (ADR-0009) the gateway assigns the `backendId` from
    * the credential, and these fields are display-only (`name` is shown in
    * the registry). A legacy (unbound) backend credential still derives the
    * backendId from `(namespace, instanceId, channel)`, so it needs a stable

@@ -50,7 +50,7 @@ function IdentitySummary({ backend }: { backend: BackendIdentity }) {
 }
 
 /**
- * ADR-0008 step 3 for one legacy backend credential: bind it in place to the
+ * ADR-0009 step 3 for one legacy backend credential: bind it in place to the
  * identity it was observed registering, split a shared credential, or pick an
  * identity by hand when nothing was observed.
  */

@@ -42,7 +42,7 @@ export function identityLabel(b: BackendIdentity): string {
 
 /**
  * Whether some usable backend credential can still reach this identity
- * (ADR-0008: device scopes should only list such identities). Bound
+ * (ADR-0009: device scopes should only list such identities). Bound
  * credentials or a live connection settle it; otherwise the last observed
  * credential must still be an active, unbound (legacy) one. Identities not
  * observed since tracking began get the benefit of the doubt — the server's

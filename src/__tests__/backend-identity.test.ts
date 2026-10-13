@@ -1,5 +1,5 @@
 /**
- * ADR-0008 step 2: backend identity granted by the backend credential
+ * ADR-0009 step 2: backend identity granted by the backend credential
  * (incl. legacy credentials and in-place binding), device backend scope,
  * and admin cleanup of backend identities.
  */
@@ -52,7 +52,7 @@ function closeWs(ws: WebSocket): Promise<void> {
   });
 }
 
-describeIfLoopback('ADR-0008: credential-bound backend identity and device scope', () => {
+describeIfLoopback('ADR-0009: credential-bound backend identity and device scope', () => {
   const servers: Server[] = [];
   const sockets: WebSocket[] = [];
 
@@ -120,12 +120,12 @@ describeIfLoopback('ADR-0008: credential-bound backend identity and device scope
     return { ws, ready };
   }
 
-  /** A gateway on its own database plus a raw handle to fake pre-ADR-0008 (legacy) rows. */
+  /** A gateway on its own database plus a raw handle to fake pre-ADR-0009 (legacy) rows. */
   async function startWithDb() {
     const dbPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'gw-adr8-')), 'gateway.db');
     const urls = await startServer(new GatewayStorage(dbPath));
     const raw = new Database(dbPath);
-    /** Issue a backend credential, then strip its binding as if issued before ADR-0008. */
+    /** Issue a backend credential, then strip its binding as if issued before ADR-0009. */
     const issueLegacy = async (namespace: string, name: string) => {
       const credential = await issue(urls.httpUrl, { type: 'backend', namespace, name });
       raw.prepare('DELETE FROM backend_identities WHERE backend_id = ?').run(credential.backendId);

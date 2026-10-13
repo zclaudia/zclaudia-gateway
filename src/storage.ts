@@ -52,7 +52,7 @@ export interface BackendIdentity {
   updatedAt: number;
   /**
    * Root credential (zgb_; a zga_ resolves to its parent) last seen
-   * registering this identity — migration evidence for ADR-0008.
+   * registering this identity — migration evidence for ADR-0009.
    */
   lastCredentialId: string | null;
   /** Last registration or offline transition. */
@@ -103,13 +103,13 @@ export interface CredentialRecord {
   revokedAt: number | null;
   lastUsedAt: number | null;
   /**
-   * ADR-0008: the backend this credential *is* (backend and backend-access).
+   * ADR-0009: the backend this credential *is* (backend and backend-access).
    * null = legacy backend credential, identity derived from the hello's
    * (namespace, instanceId, environment); always null for devices.
    */
   backendId: string | null;
   /**
-   * ADR-0008: backends a device credential may reach. null = the whole
+   * ADR-0009: backends a device credential may reach. null = the whole
    * namespace (including backends added later); always null for backends.
    */
   allowedBackends: string[] | null;
@@ -194,7 +194,7 @@ export function initDatabase(dbPath: string = getDbPath()): Database.Database {
 
   // Additive migrations for pre-existing databases.
   addColumnIfMissing(db, 'credentials', 'parent_id TEXT');
-  // ADR-0008: credential-bound backend identity and device backend scope.
+  // ADR-0009: credential-bound backend identity and device backend scope.
   // NULL = legacy backend credential / whole-namespace device credential.
   addColumnIfMissing(db, 'credentials', 'backend_id TEXT');
   addColumnIfMissing(db, 'credentials', 'allowed_backends TEXT');
@@ -534,7 +534,7 @@ export class GatewayStorage {
 
   /**
    * Bind a legacy backend credential, and the access tokens exchanged from
-   * it, to an existing backend identity (ADR-0008 in-place migration).
+   * it, to an existing backend identity (ADR-0009 in-place migration).
    * Returns false if the credential is not an unrevoked, unbound backend credential.
    */
   bindBackendCredential(id: string, backendId: string): boolean {

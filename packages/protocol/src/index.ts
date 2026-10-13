@@ -29,7 +29,7 @@ export type Epoch = number;
 
 /**
  * Self-reported peer description. Only `name` matters to a backend whose
- * credential is bound to a backend identity (ADR-0008); the other fields are
+ * credential is bound to a backend identity (ADR-0009); the other fields are
  * descriptive. Legacy (unbound) backend credentials still derive identity
  * from (namespace, instanceId, channel) and therefore require `instanceId`.
  */

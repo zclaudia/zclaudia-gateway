@@ -32,7 +32,7 @@ export interface PeerSession {
   /** Id of the issued credential this peer authenticated with. */
   credentialId?: string;
   /**
-   * Device credential backend scope (ADR-0008), snapshotted at the handshake;
+   * Device credential backend scope (ADR-0009), snapshotted at the handshake;
    * null = the whole namespace. Changing it disconnects the peer.
    */
   allowedBackends: string[] | null;

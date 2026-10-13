@@ -355,7 +355,7 @@ describeIfLoopback('Phase 1: Credential System', () => {
       expect(ready.backend.backendId).toBeDefined();
     });
 
-    test('records which enrollment credential registers each backend identity (ADR-0008)', async () => {
+    test('records which enrollment credential registers each backend identity (ADR-0009)', async () => {
       const { wsUrl, httpUrl } = await startServer();
       const listBackends = async () => {
         const res = await fetch(`${httpUrl}/api/admin/backends`, { headers: { Authorization: `Bearer ${ADMIN_TOKEN}` } });

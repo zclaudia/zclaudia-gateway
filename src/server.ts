@@ -110,7 +110,7 @@ function validatePeerHelloV4(message: unknown): string | null {
     return 'peer_hello.peerType must be client-only or client+backend';
   }
   // identity is descriptive except for legacy backend credentials, whose
-  // instanceId is enforced after authentication (ADR-0008).
+  // instanceId is enforced after authentication (ADR-0009).
   if (msg.identity !== undefined) {
     if (!msg.identity || typeof msg.identity !== 'object') return 'peer_hello.identity must be an object';
     const identity = msg.identity as Record<string, unknown>;
@@ -270,7 +270,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
   }
 
   // ==========================================================================
-  // Backend identity & device scope (ADR-0008)
+  // Backend identity & device scope (ADR-0009)
   // ==========================================================================
 
   /**
@@ -619,7 +619,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
     res.status(201).json({ success: true, data: { ...credential, token } });
   });
 
-  // Known backend identities with online state (read-only; ADR-0008 step 1).
+  // Known backend identities with online state (read-only; ADR-0009 step 1).
   app.get('/api/admin/backends', requireAdmin, (_req: Request, res: Response) => {
     const bound = boundCredentialCounts();
     const data = storage.listBackendIdentities().map((identity) => {
@@ -673,7 +673,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
     res.json({ success: true, data: storage.listCredentials() });
   });
 
-  // ADR-0008 in-place migration: bind a legacy backend credential (and its
+  // ADR-0009 in-place migration: bind a legacy backend credential (and its
   // live access tokens) to the identity it is known to register. Token unchanged.
   app.post('/api/admin/credentials/:id/bind', requireAdmin, (req: Request, res: Response) => {
     const credential = storage.getCredential(req.params.id);
@@ -1524,7 +1524,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
     const identity = message.identity ?? {};
     const isBackend = peerType === 'client+backend' && !!message.backend;
     // Legacy (unbound) backend credentials still derive identity from the
-    // hello, so they keep needing an instanceId (ADR-0008).
+    // hello, so they keep needing an instanceId (ADR-0009).
     if (isBackend && !auth.credential.backendId && identity.instanceId === undefined) {
       sendToWs(ws, { type: 'gateway_error', code: 'INVALID_MESSAGE', message: 'peer_hello.identity.instanceId is required for legacy (unbound) backend credentials' } satisfies GatewayErrorV4); ws.close(); return null;
     }
@@ -1554,14 +1554,14 @@ export function createGatewayServer(config: GatewayConfig): Server {
       const epoch = storage.allocateEpoch();
       peer.backendId = backendId; peer.epoch = epoch;
       if (previousLease && (previousLease.peerSessionId !== peerSessionId || previousLease.epoch !== epoch)) {
-        // Newest connection wins (ADR-0008): a restarted backend must not
+        // Newest connection wins (ADR-0009): a restarted backend must not
         // wait for its stale predecessor's lease to time out.
         noteOwnerReplaced(backendId, auth.credential.id);
         handleBackendOwnerReplaced(backendId, previousLease.epoch, epoch, previousLease.peerSessionId);
       }
       state.addLease({ backendId, epoch, peerSessionId, leaseTtlMs: state.config.defaultLeaseTtlMs, lastHeartbeatAt: Date.now(), leaseTimer: null });
       // Which enrollment credential registers which identity (an exchanged
-      // zga_ counts as its parent zgb_) — ADR-0008 migration evidence.
+      // zga_ counts as its parent zgb_) — ADR-0009 migration evidence.
       storage.touchBackendIdentity(backendId, auth.credential.parentId ?? auth.credential.id, identity.name);
       // gatewayProtocolVersion lets clients feature-detect from presence.
       const presence: BackendPresenceV4 = { namespace: message.namespace, backendId, instanceId: peer.instanceId, deviceId: peer.deviceId, name: peer.name, channel, visible: message.backend.visible, capabilities: message.backend.capabilities, backendProtocolVersion: message.backend.backendProtocolVersion, minClientProtocolVersion: message.backend.minClientProtocolVersion, epoch, connectedAt: Date.now(), lastSeenAt: Date.now(), gatewayProtocolVersion: peer.protocolVersion };

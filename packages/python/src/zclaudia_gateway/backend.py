@@ -172,7 +172,7 @@ class GatewayBackend:
     :attr:`last_error` instead (see there for its lifecycle).
 
     ``identity`` is optional and descriptive: a bound backend credential
-    (ADR-0008) fixes the ``backendId`` when it is issued, so ``name`` is only
+    (ADR-0009) fixes the ``backendId`` when it is issued, so ``name`` is only
     shown in the registry. Pass ``identity={"name": "My server"}`` to set it;
     omit it to send no identity. A legacy (unbound) backend credential still
     derives the ``backendId`` from ``(namespace, instance_id, channel)`` and

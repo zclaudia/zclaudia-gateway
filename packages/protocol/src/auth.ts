@@ -32,13 +32,13 @@ export interface GatewayCredentialInfo {
   revokedAt: number | null;
   lastUsedAt: number | null;
   /**
-   * ADR-0008: the backend this credential is (backend and backend-access).
+   * ADR-0009: the backend this credential is (backend and backend-access).
    * null = legacy backend credential whose identity is still derived from
    * the hello's (namespace, instanceId, environment); always null for devices.
    */
   backendId: string | null;
   /**
-   * ADR-0008: backends a device credential may reach. null = the whole
+   * ADR-0009: backends a device credential may reach. null = the whole
    * namespace, including backends added later; always null for backends.
    */
   allowedBackends: string[] | null;

@@ -46,9 +46,9 @@ export interface AdminCredentialCounters {
 export interface AdminOverview {
   /** Online backends. */
   backends: number;
-  /** Known backend identities, online or not (ADR-0008). */
+  /** Known backend identities, online or not (ADR-0009). */
   backendIdentities: number;
-  /** Unrevoked backend credentials not yet bound to a backend identity (ADR-0008 migration progress). */
+  /** Unrevoked backend credentials not yet bound to a backend identity (ADR-0009 migration progress). */
   legacyBackendCredentials: number;
   peers: AdminOverviewPeer[];
   credentials: AdminCredentialCounters;
@@ -124,7 +124,7 @@ export interface PurgeCredentialsResponse {
 }
 
 // ============================================================================
-// Backend identities (ADR-0008)
+// Backend identities (ADR-0009)
 // ============================================================================
 
 /** One item of the GET /api/admin/backends data array. */

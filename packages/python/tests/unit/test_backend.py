@@ -92,7 +92,7 @@ async def test_connect_options_are_carried(gateway, backends):
 
 
 async def test_identity_omitted_sends_no_identity(gateway, backends):
-    # Bound credential (ADR-0008): the credential grants the backendId, so
+    # Bound credential (ADR-0009): the credential grants the backendId, so
     # url/credential/namespace are enough and the hello carries no identity.
     backend = backends(gateway.url, identity=None)
     backend_id, _ = await backend.connect()

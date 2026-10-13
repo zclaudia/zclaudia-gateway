@@ -27,7 +27,7 @@ v4 沿用 `peer_hello`/`peer_ready` 消息形态，`protocolVersion` 必须为 4
 `gatewaySecret` 字段承载 Gateway 签发的凭证（zgd_/zgb_/zga_；字段名为 wire
 兼容保留，共享密钥已移除）。namespace 与注册权限由服务端凭证记录决定。
 
-**Backend 身份**（[ADR-0008](adr/0008-credential-bound-backend-identity.md)）：
+**Backend 身份**（[ADR-0009](adr/0009-credential-bound-backend-identity.md)）：
 由后端凭证授予。`zgb_` 签发时即确定 backendId（128-bit UUID），持该凭证（或其换发的
 `zga_`）连接者即该 Backend，`identity.instanceId`/`channel` 只作描述。同一 backendId
 多处连接时新连接顶替旧连接。尚未绑定的旧版凭证仍按 `(tenant, namespace, instanceId,

@@ -31,7 +31,7 @@ and not yet migrated — still derive the `backendId` from
 passing a stable `instanceId`: never a hostname, pod name or random value, or
 every restart gets a new `backendId`. The gateway rejects a legacy backend
 hello without `instanceId` (`INVALID_MESSAGE`). See
-[ADR-0008](https://github.com/zclaudia/zclaudia-gateway/blob/main/docs/adr/0008-credential-bound-backend-identity.md).
+[ADR-0009](https://github.com/zclaudia/zclaudia-gateway/blob/main/docs/adr/0009-credential-bound-backend-identity.md).
 
 ## Why is it not connecting? `lastError`
 

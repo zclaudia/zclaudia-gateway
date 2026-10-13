@@ -12,7 +12,7 @@ import { closeTestServer, listenTestServer, issueToken, TEST_ADMIN_TOKEN } from 
 let GATEWAY_SECRET = '';
 let WS_URL = '';
 // One backend credential per instanceId: a credential *is* one backend
-// (ADR-0008), so distinct test backends need distinct credentials.
+// (ADR-0009), so distinct test backends need distinct credentials.
 let backendTokens = new Map<string, string>();
 
 async function backendTokenFor(instanceId: string): Promise<string> {

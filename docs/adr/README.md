@@ -14,7 +14,7 @@
 | [0006](0006-python-backend-sdk.md) | Python Backend SDK：原生实现、打包与发布 | Accepted |
 | [0007](0007-python-streaming-http-and-asgi.md) | Python SDK：流式 HTTP、ASGI 适配与后台首连 | Accepted |
 | [0008](0008-python-backend-last-error.md) | Backend SDK：`last_error` / `lastError`（Python + TS） | Accepted |
-| [0008](0008-credential-bound-backend-identity.md) | 后端身份由凭证授予，设备凭证可限定后端范围 | Accepted |
+| [0009](0009-credential-bound-backend-identity.md) | 后端身份由凭证授予，设备凭证可限定后端范围 | Accepted |
 
 ## 待定决策
 

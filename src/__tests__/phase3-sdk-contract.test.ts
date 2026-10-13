@@ -56,7 +56,7 @@ describeIfLoopback('Phase 3: SDK contract', () => {
     return { httpUrl };
   }
 
-  // A backend credential *is* one backend (ADR-0008): a second backend in
+  // A backend credential *is* one backend (ADR-0009): a second backend in
   // the same test needs its own credential, or it replaces the first.
   function makeBackend(url: string, instanceId: string, credential = GATEWAY_SECRET) {
     const backend = new GatewayBackend({

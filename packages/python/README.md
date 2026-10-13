@@ -80,7 +80,7 @@ and not yet migrated — still derive the `backend_id` from
 `identity={"instance_id": ...}`: never a hostname, pod name or random value,
 or every restart gets a new `backend_id`. The gateway rejects a legacy backend
 hello without `instance_id` (`INVALID_MESSAGE`). See
-[ADR-0008](../../docs/adr/0008-credential-bound-backend-identity.md).
+[ADR-0009](../../docs/adr/0009-credential-bound-backend-identity.md).
 
 ## Streaming HTTP
 

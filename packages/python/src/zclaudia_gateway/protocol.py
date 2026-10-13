@@ -53,7 +53,7 @@ def normalize_identity(identity: dict[str, Any]) -> dict[str, str]:
 
     Accepts both snake_case (``device_id``) and wire spelling (``deviceId``).
     Every field is optional and only the keys provided (not ``None``) are
-    emitted. With a bound backend credential (ADR-0008) the gateway takes the
+    emitted. With a bound backend credential (ADR-0009) the gateway takes the
     ``backendId`` from the credential and these fields are descriptive only.
     A legacy (unbound) backend credential still derives the ``backendId`` from
     ``(namespace, instanceId, channel)``, so it needs a stable ``instance_id``;

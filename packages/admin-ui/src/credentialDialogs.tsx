@@ -1,6 +1,6 @@
 /**
  * Credential dialogs shared by the Credentials and Backends pages: issuing
- * (with ADR-0008 backend identity / device scope options), the one-time
+ * (with ADR-0009 backend identity / device scope options), the one-time
  * token view, and the device scope picker.
  */
 
