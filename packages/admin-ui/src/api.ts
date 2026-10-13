@@ -1,4 +1,4 @@
-import type { CredentialRecord, IssueCredentialRequest, IssuedCredential, Overview } from './types.js';
+import type { BackendIdentity, CredentialRecord, IssueCredentialRequest, IssuedCredential, Overview } from './types.js';
 import { formatMessage, getActiveLocale, type MsgKey } from './i18n.js';
 
 export class ApiError extends Error {
@@ -91,6 +91,10 @@ export const api = {
 
   async overview(): Promise<Overview> {
     return request<Overview>('/api/admin/overview');
+  },
+
+  async listBackends(): Promise<BackendIdentity[]> {
+    return request<BackendIdentity[]>('/api/admin/backends');
   },
 
   async listCredentials(): Promise<CredentialRecord[]> {

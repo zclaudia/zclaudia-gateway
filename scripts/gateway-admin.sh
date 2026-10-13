@@ -11,6 +11,7 @@
 #   gateway-admin.sh issue-backend <namespace> <name>
 #   gateway-admin.sh issue-device  <namespace> <name> [ttl-days]
 #   gateway-admin.sh list
+#   gateway-admin.sh backends                # known backend identities + last credential
 #   gateway-admin.sh revoke <credential-id>
 #   gateway-admin.sh purge [credential-id]   # delete revoked credentials (all if no id)
 set -euo pipefail
@@ -95,6 +96,31 @@ for c in rows:
                      ts(c.get("expiresAt")), status))
 '
     ;;
+  backends)
+    api GET /api/admin/backends | python3 -c '
+import json, sys
+from datetime import datetime, timezone
+def ts(v):
+    if not v: return "-"
+    return datetime.fromtimestamp(v / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+r = json.load(sys.stdin)
+if not r.get("success"):
+    print("Error:", json.dumps(r.get("error"), ensure_ascii=False), file=sys.stderr)
+    sys.exit(1)
+rows = r["data"]
+if not rows:
+    print("(no backends)")
+    sys.exit(0)
+fmt = "{:<36}  {:<12}  {:<20}  {:<16}  {:<7}  {:<20}  {}"
+print(fmt.format("backendId", "namespace", "name", "instanceId", "status", "last seen", "last credential"))
+for b in rows:
+    status = "online" if b.get("online") else "offline"
+    seen = b["online"]["connectedAt"] if b.get("online") else b.get("lastSeenAt")
+    print(fmt.format(b["backendId"], b["namespace"], (b.get("name") or "-")[:20],
+                     ("%s/%s" % (b["instanceId"], b["environment"]))[:16], status, ts(seen),
+                     b.get("lastCredentialId") or "-"))
+'
+    ;;
   revoke)
     id="${2:?usage: revoke <credential-id>}"
     api DELETE "/api/admin/credentials/$id" | python3 -c '
@@ -121,7 +147,7 @@ else:
 '
     ;;
   *)
-    sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
     exit 1
     ;;
 esac

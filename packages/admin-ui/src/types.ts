@@ -9,6 +9,7 @@ export type {
   AdminCredentialCounters,
   AdminOverview,
   AdminOverviewPeer,
+  AdminBackendIdentity as BackendIdentity,
   AdminSessionInfo,
   IssueCredentialRequest,
   IssuedGatewayCredential as IssuedCredential,

@@ -50,6 +50,13 @@ export interface BackendIdentity {
   name: string;
   createdAt: number;
   updatedAt: number;
+  /**
+   * Root credential (zgb_; a zga_ resolves to its parent) last seen
+   * registering this identity — migration evidence for ADR-0008.
+   */
+  lastCredentialId: string | null;
+  /** Last registration or offline transition. */
+  lastSeenAt: number | null;
 }
 
 export function backendIdentityKey(namespace: string, instanceId: string, environment: string, tenant = ''): string {
@@ -104,6 +111,14 @@ export function hashCredentialToken(token: string): string {
   return crypto.createHash('sha256').update(token).digest('hex');
 }
 
+function addColumnIfMissing(db: Database.Database, table: string, columnDef: string): void {
+  try {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${columnDef}`);
+  } catch {
+    // Column already exists.
+  }
+}
+
 export function initDatabase(dbPath: string = getDbPath()): Database.Database {
   const db = new Database(dbPath);
 
@@ -149,12 +164,14 @@ export function initDatabase(dbPath: string = getDbPath()): Database.Database {
 
   `);
 
-  // Additive migration for pre-existing databases.
-  try {
-    db.exec('ALTER TABLE credentials ADD COLUMN parent_id TEXT');
-  } catch {
-    // Column already exists.
-  }
+  // Additive migrations for pre-existing databases.
+  addColumnIfMissing(db, 'credentials', 'parent_id TEXT');
+  // ADR-0008: credential-bound backend identity and device backend scope.
+  // NULL = legacy backend credential / whole-namespace device credential.
+  addColumnIfMissing(db, 'credentials', 'backend_id TEXT');
+  addColumnIfMissing(db, 'credentials', 'allowed_backends TEXT');
+  addColumnIfMissing(db, 'backend_identities', 'last_credential_id TEXT');
+  addColumnIfMissing(db, 'backend_identities', 'last_seen_at INTEGER');
 
   return db;
 }
@@ -255,6 +272,8 @@ export class GatewayStorage {
         name: input.name ?? '',
         createdAt: now,
         updatedAt: now,
+        lastCredentialId: null,
+        lastSeenAt: null,
       };
       this.memoryState.backendIdentities.set(key, identity);
       return identity.backendId;
@@ -276,6 +295,43 @@ export class GatewayStorage {
       VALUES (?, ?, '', ?, ?, ?, ?, ?, ?)
     `).run(key, backendId, input.namespace, input.instanceId, input.environment, input.name ?? '', now, now);
     return backendId;
+  }
+
+  /**
+   * Record that a backend identity was seen: on registration with the root
+   * credential that registered it, on going offline with no credential.
+   */
+  touchBackendIdentity(backendId: string, rootCredentialId?: string): void {
+    const now = Date.now();
+    if (this.memoryState) {
+      for (const identity of this.memoryState.backendIdentities.values()) {
+        if (identity.backendId !== backendId) continue;
+        identity.lastSeenAt = now;
+        if (rootCredentialId) identity.lastCredentialId = rootCredentialId;
+      }
+      return;
+    }
+    if (rootCredentialId) {
+      this.sqlite.prepare('UPDATE backend_identities SET last_seen_at = ?, last_credential_id = ? WHERE backend_id = ?')
+        .run(now, rootCredentialId, backendId);
+    } else {
+      this.sqlite.prepare('UPDATE backend_identities SET last_seen_at = ? WHERE backend_id = ?').run(now, backendId);
+    }
+  }
+
+  /** All known backend identities, newest first. */
+  listBackendIdentities(): BackendIdentity[] {
+    if (this.memoryState) {
+      return Array.from(this.memoryState.backendIdentities.values())
+        .sort((a, b) => b.createdAt - a.createdAt)
+        .map((identity) => ({ ...identity }));
+    }
+    return this.sqlite.prepare(`
+      SELECT backend_id as backendId, tenant, namespace, instance_id as instanceId,
+             environment, name, created_at as createdAt, updated_at as updatedAt,
+             last_credential_id as lastCredentialId, last_seen_at as lastSeenAt
+      FROM backend_identities ORDER BY created_at DESC
+    `).all() as BackendIdentity[];
   }
 
   // =========================================================================

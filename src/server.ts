@@ -499,6 +499,25 @@ export function createGatewayServer(config: GatewayConfig): Server {
     res.status(201).json({ success: true, data: { ...credential, token } });
   });
 
+  // Known backend identities with online state (read-only; ADR-0008 step 1).
+  app.get('/api/admin/backends', requireAdmin, (_req: Request, res: Response) => {
+    const data = storage.listBackendIdentities().map((identity) => {
+      const presence = state.registry.items.get(identity.backendId);
+      return {
+        backendId: identity.backendId,
+        namespace: identity.namespace,
+        name: identity.name,
+        instanceId: identity.instanceId,
+        environment: identity.environment,
+        createdAt: identity.createdAt,
+        lastSeenAt: identity.lastSeenAt,
+        lastCredentialId: identity.lastCredentialId,
+        online: presence ? { epoch: presence.epoch, connectedAt: presence.connectedAt } : null,
+      };
+    });
+    res.json({ success: true, data });
+  });
+
   app.get('/api/admin/credentials', requireAdmin, (_req: Request, res: Response) => {
     res.json({ success: true, data: storage.listCredentials() });
   });
@@ -1307,6 +1326,9 @@ export function createGatewayServer(config: GatewayConfig): Server {
         handleBackendOwnerReplaced(backendId, previousLease.epoch, epoch, previousLease.peerSessionId);
       }
       state.addLease({ backendId, epoch, peerSessionId, leaseTtlMs: state.config.defaultLeaseTtlMs, lastHeartbeatAt: Date.now(), leaseTimer: null });
+      // ADR-0008 migration evidence: which enrollment credential registers
+      // which identity (an exchanged zga_ counts as its parent zgb_).
+      storage.touchBackendIdentity(backendId, auth.credential.parentId ?? auth.credential.id);
       // gatewayProtocolVersion lets clients feature-detect from presence.
       const presence: BackendPresenceV4 = { namespace: message.namespace, backendId, instanceId: identity.instanceId, deviceId: identity.deviceId, name: identity.name || '', channel, visible: message.backend.visible, capabilities: message.backend.capabilities, backendProtocolVersion: message.backend.backendProtocolVersion, minClientProtocolVersion: message.backend.minClientProtocolVersion, epoch, connectedAt: Date.now(), lastSeenAt: Date.now(), gatewayProtocolVersion: peer.protocolVersion };
       state.registryUpsert(presence);
@@ -1430,6 +1452,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
     state.registryRemove(backendId);
     broadcastRegistrySnapshot();
     state.removeBackend(backendId);
+    storage.touchBackendIdentity(backendId);
     if (peer) {
       peer.backendId = undefined;
       peer.epoch = undefined;
@@ -1450,6 +1473,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
       state.registryRemove(peer.backendId);
       broadcastRegistrySnapshot(peerSessionId);
       state.removeBackend(peer.backendId);
+      storage.touchBackendIdentity(peer.backendId);
     }
     // Close any remaining channels where this peer is the client end
     closeChannelsForPeer(peerSessionId);

@@ -1,6 +1,7 @@
 /**
  * Gateway admin API contracts — public request/response DTOs for
- * /api/admin/session, /api/admin/overview and /api/admin/credentials.
+ * /api/admin/session, /api/admin/overview, /api/admin/credentials and
+ * /api/admin/backends.
  *
  * Authentication is the admin token (Bearer) or an admin session cookie
  * issued by POST /api/admin/session. The admin token is an administrative
@@ -82,4 +83,28 @@ export interface PurgeCredentialsRequest {
 /** POST /api/admin/credentials/purge response: ids actually deleted. */
 export interface PurgeCredentialsResponse {
   deleted: string[];
+}
+
+// ============================================================================
+// Backend identities (ADR-0008)
+// ============================================================================
+
+/** One item of the GET /api/admin/backends data array. */
+export interface AdminBackendIdentity {
+  backendId: string;
+  namespace: string;
+  name: string;
+  /** Legacy identity key components, self-reported by the backend. */
+  instanceId: string;
+  environment: string;
+  createdAt: number;
+  /** Last registration or offline transition; null if not seen since tracking began. */
+  lastSeenAt: number | null;
+  /**
+   * Root backend credential (zgb_) last seen registering this identity;
+   * null if not seen since tracking began. Migration evidence for binding.
+   */
+  lastCredentialId: string | null;
+  /** null when offline. */
+  online: { epoch: number; connectedAt: number } | null;
 }

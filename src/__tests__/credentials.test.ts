@@ -308,6 +308,46 @@ describeIfLoopback('Phase 1: Credential System', () => {
       expect(ready.backend.backendId).toBeDefined();
     });
 
+    test('records which enrollment credential registers each backend identity (ADR-0008)', async () => {
+      const { wsUrl, httpUrl } = await startServer();
+      const listBackends = async () => {
+        const res = await fetch(`${httpUrl}/api/admin/backends`, { headers: { Authorization: `Bearer ${ADMIN_TOKEN}` } });
+        expect(res.status).toBe(200);
+        return (await res.json()).data as Array<Record<string, any>>;
+      };
+      const enrollment = await issueCredential(httpUrl, { type: 'backend', namespace: 'observe-ns', name: 'host-obs' });
+      const access = await exchange(httpUrl, enrollment.body.data.token);
+
+      // Registered through an exchanged zga_: evidence points at its parent zgb_
+      const ws = await connect(wsUrl);
+      sendHello(ws, access.body.data.token, 'observe-ns', 'client+backend', 'observe-backend');
+      const ready = await waitForMessage(ws, 'peer_ready');
+      const backendId = ready.backend.backendId;
+
+      const online = (await listBackends()).find((b) => b.backendId === backendId);
+      expect(online).toMatchObject({
+        namespace: 'observe-ns',
+        instanceId: 'observe-backend',
+        environment: 'prod',
+        lastCredentialId: enrollment.body.data.id,
+        online: { epoch: ready.backend.epoch },
+      });
+      const registeredAt = online!.lastSeenAt;
+      expect(registeredAt).toBeGreaterThan(0);
+
+      // Going offline clears online state but keeps the evidence
+      await closeWs(ws);
+      let offline: Record<string, any> | undefined;
+      for (let i = 0; i < 50 && !(offline && offline.online === null); i++) {
+        await new Promise((r) => setTimeout(r, 20));
+        offline = (await listBackends()).find((b) => b.backendId === backendId);
+      }
+      expect(offline).toMatchObject({ online: null, lastCredentialId: enrollment.body.data.id });
+      expect(offline!.lastSeenAt).toBeGreaterThanOrEqual(registeredAt);
+
+      expect((await fetch(`${httpUrl}/api/admin/backends`)).status).toBe(401);
+    });
+
     test('device tokens, access tokens, and the legacy secret cannot exchange', async () => {
       const { httpUrl } = await startServer();
       const device = await issueCredential(httpUrl, { type: 'device', namespace: 'hermes' });

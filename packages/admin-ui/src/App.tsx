@@ -5,13 +5,17 @@ import { LangSwitch } from './LangSwitch.js';
 import { LoginPage } from './pages/LoginPage.js';
 import { OverviewPage } from './pages/OverviewPage.js';
 import { CredentialsPage } from './pages/CredentialsPage.js';
+import { BackendsPage } from './pages/BackendsPage.js';
 
 type AuthState = 'checking' | 'login' | 'ready';
 
-type View = 'overview' | 'credentials';
+type View = 'overview' | 'credentials' | 'backends';
+
+const VIEWS: View[] = ['overview', 'credentials', 'backends'];
 
 function currentView(): View {
-  return window.location.hash === '#/credentials' ? 'credentials' : 'overview';
+  const fromHash = window.location.hash.replace(/^#\//, '') as View;
+  return VIEWS.includes(fromHash) ? fromHash : 'overview';
 }
 
 function AppInner() {
@@ -83,6 +87,13 @@ function AppInner() {
           >
             {t('nav.credentials')}
           </button>
+          <button
+            type="button"
+            className={view === 'backends' ? 'nav-item active' : 'nav-item'}
+            onClick={() => { window.location.hash = '#/backends'; setView('backends'); }}
+          >
+            {t('nav.backends')}
+          </button>
         </nav>
         <LangSwitch />
         <button type="button" className="btn btn-ghost" onClick={handleLogout}>
@@ -90,9 +101,9 @@ function AppInner() {
         </button>
       </header>
       <main className="content">
-        {view === 'overview'
-          ? <OverviewPage onSessionLost={handleSessionLost} />
-          : <CredentialsPage onSessionLost={handleSessionLost} />}
+        {view === 'overview' && <OverviewPage onSessionLost={handleSessionLost} />}
+        {view === 'credentials' && <CredentialsPage onSessionLost={handleSessionLost} />}
+        {view === 'backends' && <BackendsPage onSessionLost={handleSessionLost} />}
       </main>
     </div>
   );
