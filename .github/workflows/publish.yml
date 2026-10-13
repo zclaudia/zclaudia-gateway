@@ -7,8 +7,9 @@
 #       (0.2.0-rc.1 → rc)。npm 默认会给预发布版本打 latest,这里刻意不沿用该默认。
 # 前置:在 npmjs.com 对应包的 Trusted Publisher 配置信任 zclaudia/zclaudia-gateway
 # 和本文件(gateway-client / gateway-backend 需各自单独配置)。
-# client/backend 的 workspace:^ 依赖会在发布前改写为实际版本范围(npm publish 不改写);
-# 用 version 覆盖发布 client/backend 时,其依赖的兄弟包必须已在 npm 上存在同名版本。
+# client/backend 的 workspace:^ 依赖会在发布前改写为兄弟包 package.json 的实际版本范围
+# (npm publish 不改写),并校验该范围在 npm 上已有可用版本——所以须按 protocol → client →
+# backend 的顺序发布。
 name: Publish
 
 on:
@@ -139,28 +140,51 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "Publishing version $version with dist-tag $tag"
 
+      # workspace:^ → ^<sibling version>, taken from the sibling's own manifest
+      # (not this package's version: the packages are versioned independently),
+      # and each resulting range must already resolve on npm.
       - name: Rewrite workspace ranges for npm publish
         working-directory: ${{ steps.meta.outputs.dir }}
         run: |
           node -e '
             const fs = require("fs");
+            const path = require("path");
+            const { execFileSync } = require("child_process");
+            const siblings = {};
+            for (const dir of fs.readdirSync("..")) {
+              const manifest = path.join("..", dir, "package.json");
+              if (!fs.existsSync(manifest)) continue;
+              const m = JSON.parse(fs.readFileSync(manifest, "utf8"));
+              siblings[m.name] = m.version;
+            }
             const p = JSON.parse(fs.readFileSync("package.json", "utf8"));
-            let touched = false;
             for (const section of ["dependencies", "devDependencies", "peerDependencies"]) {
               const deps = p[section];
               if (!deps) continue;
               for (const [name, range] of Object.entries(deps)) {
                 const spec = String(range);
                 if (!spec.startsWith("workspace:")) continue;
+                const version = siblings[name];
+                if (!version) throw new Error("no workspace package named " + name);
                 const base = spec.slice("workspace:".length);
-                deps[name] = base.includes("*") ? base.replace("*", p.version) : base + p.version;
-                touched = true;
+                const resolved = base === "*" ? version : base.includes("*") ? base.replace("*", version) : base + version;
+                deps[name] = resolved;
+                if (section !== "devDependencies") {
+                  let found = "";
+                  try {
+                    found = execFileSync("npm", ["view", name + "@" + resolved, "version", "--json"], { encoding: "utf8" }).trim();
+                  } catch {}
+                  if (!found) throw new Error(name + "@" + resolved + " is not on npm yet: publish it first");
+                }
+                console.log("rewrote " + name + " -> " + resolved);
               }
             }
             fs.writeFileSync("package.json", JSON.stringify(p, null, 2) + "\n");
-            console.log(touched ? "rewrote workspace ranges to " + p.version : "no workspace ranges");
           '
 
       - name: Publish
         working-directory: ${{ steps.meta.outputs.dir }}
-        run: npm publish --access public --tag "${{ steps.dist_tag.outputs.tag }}"
+        # --ignore-scripts: already built and tested above; prepublishOnly would
+        # rebuild through pnpm, which refuses the rewritten manifest against the
+        # frozen lockfile (ERR_PNPM_OUTDATED_LOCKFILE).
+        run: npm publish --access public --ignore-scripts --tag "${{ steps.dist_tag.outputs.tag }}"
