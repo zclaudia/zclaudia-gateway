@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "zclaudia-gateway"
-version = "0.3.0"
+version = "0.4.0"
 description = "Python Backend SDK for the zclaudia gateway (Gateway Protocol v4): registration, lease heartbeats, channels, topics, and HTTP-over-channel serving."
 readme = "README.md"
 requires-python = ">=3.11"

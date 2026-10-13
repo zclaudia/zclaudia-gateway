@@ -1,6 +1,6 @@
 {
   "name": "@zclaudia/gateway-backend",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Backend SDK for the zclaudia gateway: registration, heartbeats, channel serving (dial-is-accept), topic publishing, HTTP-over-channel.",
   "keywords": [
     "gateway",

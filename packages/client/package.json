@@ -1,6 +1,6 @@
 {
   "name": "@zclaudia/gateway-client",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Client SDK for the zclaudia gateway: control connection, channels, topics with retained payloads, reconnect. WHATWG WebSocket, injectable socket factory.",
   "keywords": [
     "gateway",

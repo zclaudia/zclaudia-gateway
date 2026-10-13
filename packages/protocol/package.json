@@ -1,6 +1,6 @@
 {
   "name": "@zclaudia/gateway-protocol",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Canonical wire types and constants for Gateway Protocol v4: handshake, registry, heartbeat, control plane, channels, topics, streaming HTTP, plus auth/admin/notification service DTOs. Zero dependencies.",
   "keywords": [
     "gateway",
