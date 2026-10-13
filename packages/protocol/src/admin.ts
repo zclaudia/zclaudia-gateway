@@ -96,6 +96,19 @@ export interface RevokeCredentialResponse {
   revoked: string[];
 }
 
+/** POST /api/admin/credentials/revoke request body: revoke several credentials at once. */
+export interface RevokeCredentialsRequest {
+  ids: string[];
+}
+
+/** POST /api/admin/credentials/revoke response. */
+export interface RevokeCredentialsResponse {
+  /** Every id revoked, including access tokens revoked by cascade. */
+  revoked: string[];
+  /** Requested ids that were unknown or already revoked. */
+  skipped: string[];
+}
+
 /**
  * POST /api/admin/credentials/purge request body. Permanently deletes revoked
  * credentials; ids that are not revoked (or unknown) are ignored.

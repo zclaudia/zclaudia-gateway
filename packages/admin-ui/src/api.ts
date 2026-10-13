@@ -5,6 +5,8 @@ import type {
   IssueCredentialRequest,
   IssuedCredential,
   Overview,
+  RevokeCredentialsRequest,
+  RevokeCredentialsResponse,
   UpdateCredentialRequest,
 } from './types.js';
 import { formatMessage, getActiveLocale, type MsgKey } from './i18n.js';
@@ -116,12 +118,6 @@ export const api = {
     });
   },
 
-  async revokeCredential(id: string): Promise<{ revoked: string[] }> {
-    return request<{ revoked: string[] }>(`/api/admin/credentials/${encodeURIComponent(id)}`, {
-      method: 'DELETE',
-    });
-  },
-
   /** Bind a legacy (unbound, unrevoked) backend credential to an identity in place; the token is unchanged. */
   async bindCredential(id: string, backendId: string): Promise<CredentialRecord> {
     const body: BindBackendCredentialRequest = { backendId };
@@ -143,6 +139,15 @@ export const api = {
   /** Delete an offline backend identity with no bound credentials (409 CONFLICT otherwise). */
   async deleteBackend(backendId: string): Promise<void> {
     await request<null>(`/api/admin/backends/${encodeURIComponent(backendId)}`, { method: 'DELETE' });
+  },
+
+  /** Revoke several credentials at once; unknown or already-revoked ids come back as `skipped`. */
+  async revokeCredentials(ids: string[]): Promise<RevokeCredentialsResponse> {
+    const body: RevokeCredentialsRequest = { ids };
+    return request<RevokeCredentialsResponse>('/api/admin/credentials/revoke', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
   },
 
   /** Permanently delete revoked credentials: the given ids, or all revoked when omitted. */

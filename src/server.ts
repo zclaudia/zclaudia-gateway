@@ -725,14 +725,10 @@ export function createGatewayServer(config: GatewayConfig): Server {
     res.json({ success: true, data: storage.getCredential(credential.id) });
   });
 
-  app.delete('/api/admin/credentials/:id', requireAdmin, (req: Request, res: Response) => {
-    const revokedIds = storage.revokeCredential(req.params.id);
-    if (revokedIds.length === 0) {
-      res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Credential not found or already revoked' } });
-      return;
-    }
+  /** Audit and disconnect live peers on the revoked credentials (incl. cascaded access tokens). */
+  function afterRevoke(revokedIds: string[]): void {
+    if (revokedIds.length === 0) return;
     audit('credential.revoked', { ids: revokedIds.join(',') });
-    // Disconnect live peers on the credential or anything exchanged from it
     const revokedSet = new Set(revokedIds);
     for (const peer of state.peers.values()) {
       if (peer.credentialId && revokedSet.has(peer.credentialId)) {
@@ -740,7 +736,31 @@ export function createGatewayServer(config: GatewayConfig): Server {
         peer.ws.close(1008, 'Credential revoked');
       }
     }
+  }
+
+  app.delete('/api/admin/credentials/:id', requireAdmin, (req: Request, res: Response) => {
+    const revokedIds = storage.revokeCredential(req.params.id);
+    if (revokedIds.length === 0) {
+      res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Credential not found or already revoked' } });
+      return;
+    }
+    afterRevoke(revokedIds);
     res.json({ success: true, data: { revoked: revokedIds } });
+  });
+
+  // Bulk revoke. Unknown or already-revoked ids are reported, not an error,
+  // so a stale selection still revokes everything it can.
+  app.post('/api/admin/credentials/revoke', requireAdmin, (req: Request, res: Response) => {
+    const { ids } = (req.body ?? {}) as { ids?: unknown };
+    if (!Array.isArray(ids) || ids.length === 0 || !ids.every((id) => typeof id === 'string')) {
+      res.status(400).json({ success: false, error: { code: 'INVALID_REQUEST', message: 'ids must be a non-empty array of strings' } });
+      return;
+    }
+    const requested = [...new Set(ids as string[])];
+    const revokedIds = storage.revokeCredentials(requested);
+    afterRevoke(revokedIds);
+    const revokedSet = new Set(revokedIds);
+    res.json({ success: true, data: { revoked: revokedIds, skipped: requested.filter((id) => !revokedSet.has(id)) } });
   });
 
   // Permanently delete revoked credentials: the given ids, or all of them when

@@ -15,7 +15,7 @@
 #   gateway-admin.sh bind <credential-id> <backend-id>    # migrate a legacy backend credential in place
 #   gateway-admin.sh scope <credential-id> all|<backend-id,...>   # device backend scope
 #   gateway-admin.sh forget-backend <backend-id>          # delete an unused backend identity
-#   gateway-admin.sh revoke <credential-id>
+#   gateway-admin.sh revoke <credential-id> [credential-id ...]
 #   gateway-admin.sh purge [credential-id]   # delete revoked credentials (all if no id)
 set -euo pipefail
 
@@ -169,15 +169,20 @@ for b in rows:
     api DELETE "/api/admin/backends/$backend" | check_ok "backend identity deleted"
     ;;
   revoke)
-    id="${2:?usage: revoke <credential-id>}"
-    api DELETE "/api/admin/credentials/$id" | python3 -c '
+    [ -n "${2:-}" ] || { echo "usage: revoke <credential-id> [credential-id ...]" >&2; exit 1; }
+    shift
+    api POST /api/admin/credentials/revoke "{\"ids\":$(json_ids "$(IFS=,; echo "$*")")}" | python3 -c '
 import json, sys
 r = json.load(sys.stdin)
-if r.get("success"):
-    print("revoked (live connections on it were closed)")
-else:
+if not r.get("success"):
     print("Error:", json.dumps(r.get("error"), ensure_ascii=False), file=sys.stderr)
     sys.exit(1)
+d = r["data"]
+print("revoked %d credential(s) (live connections on them were closed)" % len(d["revoked"]))
+for i in d["revoked"]:
+    print("  ", i)
+if d["skipped"]:
+    print("skipped (not found or already revoked):", ", ".join(d["skipped"]))
 '
     ;;
   purge)

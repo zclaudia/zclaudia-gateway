@@ -14,6 +14,8 @@ export type {
   BindBackendCredentialRequest,
   IssueCredentialRequest,
   IssuedGatewayCredential as IssuedCredential,
+  RevokeCredentialsRequest,
+  RevokeCredentialsResponse,
   UpdateCredentialRequest,
 } from '@zclaudia/gateway-protocol/admin';
 export type { AdminOverview as Overview } from '@zclaudia/gateway-protocol/admin';

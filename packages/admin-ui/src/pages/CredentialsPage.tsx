@@ -21,6 +21,7 @@ import {
   type CredentialStatus,
   type CredentialType,
   type IssuedCredential,
+  type RevokeCredentialsResponse,
 } from '../types.js';
 
 type TypeFilter = 'all' | CredentialType;
@@ -258,26 +259,29 @@ function ScopeDialog({
     </div>
   );
 }
+const REVOKE_LIST_LIMIT = 8;
+
 function RevokeDialog({
-  credential,
+  targets,
   onClose,
   onRevoked,
   onError,
 }: {
-  credential: CredentialRecord;
+  /** One credential (row action) or several (bulk selection). */
+  targets: CredentialRecord[];
   onClose: () => void;
-  onRevoked: (revokedIds: string[]) => void;
+  onRevoked: (result: RevokeCredentialsResponse) => void;
   onError: (err: unknown) => void;
 }) {
   const { t } = useI18n();
   const [busy, setBusy] = useState(false);
+  const single = targets.length === 1 ? targets[0] : null;
 
   async function handleConfirm() {
     if (busy) return;
     setBusy(true);
     try {
-      const { revoked } = await api.revokeCredential(credential.id);
-      onRevoked(revoked);
+      onRevoked(await api.revokeCredentials(targets.map((c) => c.id)));
     } catch (err) {
       onError(err);
     } finally {
@@ -289,14 +293,31 @@ function RevokeDialog({
     <div className="modal-backdrop">
       <div className="modal">
         <h3>{t('revoke.title')}</h3>
-        <p>
-          {t('revoke.confirmPrefix')}
-          <strong>{credential.name || credential.id}</strong>
-          {t('revoke.confirmSuffix', {
-            type: t(TYPE_KEYS[credential.type]),
-            namespace: credential.namespace,
-          })}
-        </p>
+        {single ? (
+          <p>
+            {t('revoke.confirmPrefix')}
+            <strong>{single.name || single.id}</strong>
+            {t('revoke.confirmSuffix', {
+              type: t(TYPE_KEYS[single.type]),
+              namespace: single.namespace,
+            })}
+          </p>
+        ) : (
+          <>
+            <p>{t('revoke.confirmMany', { count: targets.length })}</p>
+            <ul className="revoked-ids">
+              {targets.slice(0, REVOKE_LIST_LIMIT).map((c) => (
+                <li key={c.id}>
+                  <strong>{c.name || t('creds.unnamed')}</strong>
+                  <span className="muted"> · {t(TYPE_KEYS[c.type])} · <code>{c.namespace}</code></span>
+                </li>
+              ))}
+              {targets.length > REVOKE_LIST_LIMIT && (
+                <li className="muted">{t('revoke.andMore', { count: targets.length - REVOKE_LIST_LIMIT })}</li>
+              )}
+            </ul>
+          </>
+        )}
         <p className="token-warning">{t('revoke.warning')}</p>
         <div className="modal-actions">
           <button type="button" className="btn btn-ghost" onClick={onClose}>{t('common.cancel')}</button>
@@ -364,16 +385,27 @@ function PurgeDialog({
   );
 }
 
-function RevokedResultModal({ ids, onClose }: { ids: string[]; onClose: () => void }) {
+function RevokedResultModal({
+  result,
+  requested,
+  onClose,
+}: {
+  result: RevokeCredentialsResponse;
+  /** How many credentials were selected; more revoked than that means cascades. */
+  requested: number;
+  onClose: () => void;
+}) {
   const { t } = useI18n();
+  const ids = result.revoked;
   return (
     <div className="modal-backdrop">
       <div className="modal">
         <h3>{t('revoked.title', { count: ids.length })}</h3>
-        {ids.length > 1 && <p className="muted">{t('revoked.cascadeHint')}</p>}
+        {ids.length > requested - result.skipped.length && <p className="muted">{t('revoked.cascadeHint')}</p>}
         <ul className="revoked-ids">
           {ids.map((id) => <li key={id}><code>{id}</code></li>)}
         </ul>
+        {result.skipped.length > 0 && <p className="muted">{t('revoked.skipped', { count: result.skipped.length })}</p>}
         <div className="modal-actions">
           <button type="button" className="btn btn-primary" onClick={onClose}>{t('common.close')}</button>
         </div>
@@ -395,8 +427,9 @@ export function CredentialsPage({ onSessionLost }: { onSessionLost: (err: unknow
   const [search, setSearch] = useState('');
   const [issuing, setIssuing] = useState<{ initial?: IssueDialogInitial } | null>(null);
   const [issued, setIssued] = useState<IssuedCredential | null>(null);
-  const [revoking, setRevoking] = useState<CredentialRecord | null>(null);
-  const [revokedIds, setRevokedIds] = useState<string[] | null>(null);
+  const [revoking, setRevoking] = useState<CredentialRecord[] | null>(null);
+  const [revokeResult, setRevokeResult] = useState<{ result: RevokeCredentialsResponse; requested: number } | null>(null);
+  const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
   const [purging, setPurging] = useState<{ ids: string[]; single: CredentialRecord | null } | null>(null);
   const [migrating, setMigrating] = useState<CredentialRecord | null>(null);
   const [editingScope, setEditingScope] = useState<CredentialRecord | null>(null);
@@ -443,6 +476,24 @@ export function CredentialsPage({ onSessionLost }: { onSessionLost: (err: unknow
     () => (credentials ?? []).filter((c) => credentialStatus(c) === 'revoked'),
     [credentials],
   );
+
+  // Bulk selection acts only on rows that are visible and still revocable,
+  // so a filter change or a reload never revokes something off-screen.
+  const selectable = useMemo(() => filtered.filter((c) => credentialStatus(c) !== 'revoked'), [filtered]);
+  const selectedRows = useMemo(() => selectable.filter((c) => selected.has(c.id)), [selectable, selected]);
+  const allSelected = selectable.length > 0 && selectedRows.length === selectable.length;
+
+  function toggleSelected(id: string) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }
+
+  function toggleAll() {
+    setSelected(allSelected ? new Set() : new Set(selectable.map((c) => c.id)));
+  }
 
   function showActionError(err: unknown) {
     setActionError(err);
@@ -539,10 +590,32 @@ export function CredentialsPage({ onSessionLost }: { onSessionLost: (err: unknow
         />
       </div>
 
+      {selectedRows.length > 0 && (
+        <div className="bulk-bar">
+          <span>{t('bulk.selected', { count: selectedRows.length })}</span>
+          <button type="button" className="btn btn-small btn-danger" onClick={() => setRevoking(selectedRows)}>
+            {t('bulk.revoke')}
+          </button>
+          <button type="button" className="btn btn-small btn-ghost" onClick={() => setSelected(new Set())}>
+            {t('bulk.clear')}
+          </button>
+        </div>
+      )}
+
       <div className="panel">
         <table className="table">
           <thead>
             <tr>
+              <th className="cell-check">
+                <input
+                  type="checkbox"
+                  aria-label={t('bulk.selectAll')}
+                  checked={allSelected}
+                  disabled={selectable.length === 0}
+                  ref={(el) => { if (el) el.indeterminate = selectedRows.length > 0 && !allSelected; }}
+                  onChange={toggleAll}
+                />
+              </th>
               <th>{t('col.name')}</th>
               <th>{t('col.type')}</th>
               <th>{t('col.namespace')}</th>
@@ -556,12 +629,22 @@ export function CredentialsPage({ onSessionLost }: { onSessionLost: (err: unknow
           </thead>
           <tbody>
             {filtered.length === 0 && (
-              <tr><td colSpan={9} className="muted table-empty">{t('creds.noMatch')}</td></tr>
+              <tr><td colSpan={10} className="muted table-empty">{t('creds.noMatch')}</td></tr>
             )}
             {filtered.map((c) => {
               const status = credentialStatus(c);
               return (
                 <tr key={c.id} className={status === 'revoked' || status === 'expired' ? 'row-inactive' : ''}>
+                  <td className="cell-check">
+                    {status !== 'revoked' && (
+                      <input
+                        type="checkbox"
+                        aria-label={t('bulk.selectRow', { name: c.name || c.id })}
+                        checked={selected.has(c.id)}
+                        onChange={() => toggleSelected(c.id)}
+                      />
+                    )}
+                  </td>
                   <td>
                     <div className="cell-name">{c.name || <span className="muted">{t('creds.unnamed')}</span>}</div>
                     <div className="cell-id"><code>{c.id.slice(0, 8)}…</code></div>
@@ -589,8 +672,8 @@ export function CredentialsPage({ onSessionLost }: { onSessionLost: (err: unknow
                           {t('creds.editScope')}
                         </button>
                       )}
-                      {status === 'active' && (
-                        <button type="button" className="btn btn-small btn-danger" onClick={() => setRevoking(c)}>
+                      {status !== 'revoked' && (
+                        <button type="button" className="btn btn-small btn-danger" onClick={() => setRevoking([c])}>
                           {t('creds.revoke')}
                         </button>
                       )}
@@ -623,10 +706,15 @@ export function CredentialsPage({ onSessionLost }: { onSessionLost: (err: unknow
       {issued && <TokenOnceModal issued={issued} onClose={() => setIssued(null)} />}
       {revoking && (
         <RevokeDialog
-          credential={revoking}
+          targets={revoking}
           onClose={() => setRevoking(null)}
-          onRevoked={(ids) => { setRevoking(null); setRevokedIds(ids); load(); }}
-          onError={showActionError}
+          onRevoked={(result) => {
+            setRevokeResult({ result, requested: revoking.length });
+            setRevoking(null);
+            setSelected(new Set());
+            load();
+          }}
+          onError={(err) => { setRevoking(null); showActionError(err); }}
         />
       )}
       {purging && (
@@ -661,7 +749,9 @@ export function CredentialsPage({ onSessionLost }: { onSessionLost: (err: unknow
           onSessionLost={onSessionLost}
         />
       )}
-      {revokedIds && <RevokedResultModal ids={revokedIds} onClose={() => setRevokedIds(null)} />}
+      {revokeResult && (
+        <RevokedResultModal result={revokeResult.result} requested={revokeResult.requested} onClose={() => setRevokeResult(null)} />
+      )}
     </div>
   );
 }

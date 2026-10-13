@@ -142,6 +142,53 @@ describeIfLoopback('Phase 1: Credential System', () => {
       expect(revokeAgain.status).toBe(404);
     });
 
+    test('bulk revoke cascades, disconnects live peers and skips unknown ids', async () => {
+      const { wsUrl, httpUrl } = await startServer();
+      const admin = { Authorization: `Bearer ${ADMIN_TOKEN}`, 'Content-Type': 'application/json' };
+      const bulkRevoke = async (body: unknown) => {
+        const res = await fetch(`${httpUrl}/api/admin/credentials/revoke`, { method: 'POST', headers: admin, body: JSON.stringify(body) });
+        return { status: res.status, body: await res.json() };
+      };
+
+      const deviceA = (await issueCredential(httpUrl, { type: 'device', namespace: 'bulk-ns' })).body.data;
+      const deviceB = (await issueCredential(httpUrl, { type: 'device', namespace: 'bulk-ns' })).body.data;
+      const keep = (await issueCredential(httpUrl, { type: 'device', namespace: 'bulk-ns' })).body.data;
+      const enrollment = (await issueCredential(httpUrl, { type: 'backend', namespace: 'bulk-ns' })).body.data;
+      const exchanged = await fetch(`${httpUrl}/api/backend/token`, { method: 'POST', headers: { Authorization: `Bearer ${enrollment.token}` } });
+      const access = (await exchanged.json()).data;
+
+      const ws = await connect(wsUrl);
+      sendHello(ws, deviceA.token, 'bulk-ns', 'client-only', 'bulk-a');
+      await waitForMessage(ws, 'peer_ready');
+      const closed = new Promise<number>((resolve) => ws.on('close', (code) => resolve(code)));
+
+      const result = await bulkRevoke({ ids: [deviceA.id, deviceB.id, enrollment.id, 'unknown-id', deviceA.id] });
+      expect(result.status).toBe(200);
+      // 3 requested credentials + the cascaded access token; duplicates collapse
+      expect(result.body.data.revoked).toHaveLength(4);
+      expect(result.body.data.revoked).toEqual(expect.arrayContaining([deviceA.id, deviceB.id, enrollment.id]));
+      expect(result.body.data.skipped).toEqual(['unknown-id']);
+      expect(await closed).toBe(1008);
+
+      // Revoked tokens are dead; the untouched credential still works
+      const accessHello = await connect(wsUrl);
+      sendHello(accessHello, access.token, 'bulk-ns', 'client+backend', 'bulk-backend');
+      expect((await waitForMessage(accessHello, 'gateway_error')).code).toBe('UNAUTHORIZED');
+      const ok = await connect(wsUrl);
+      sendHello(ok, keep.token, 'bulk-ns', 'client-only', 'bulk-keep');
+      await waitForMessage(ok, 'peer_ready');
+
+      // Already revoked → skipped, not an error
+      const again = await bulkRevoke({ ids: [deviceA.id] });
+      expect(again.body.data).toEqual({ revoked: [], skipped: [deviceA.id] });
+
+      for (const body of [{}, { ids: [] }, { ids: 'x' }, { ids: [1] }]) {
+        expect((await bulkRevoke(body)).status).toBe(400);
+      }
+      const anon = await fetch(`${httpUrl}/api/admin/credentials/revoke`, { method: 'POST', body: '{"ids":["x"]}', headers: { 'Content-Type': 'application/json' } });
+      expect(anon.status).toBe(401);
+    });
+
     test('purge deletes only revoked credentials', async () => {
       const { httpUrl } = await startServer();
       const admin = { Authorization: `Bearer ${ADMIN_TOKEN}`, 'Content-Type': 'application/json' };

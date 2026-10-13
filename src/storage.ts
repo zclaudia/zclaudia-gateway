@@ -602,6 +602,15 @@ export class GatewayStorage {
   }
 
   /**
+   * Revoke several credentials at once (each cascading like revokeCredential).
+   * Returns every id actually revoked; unknown or already-revoked ids are skipped.
+   */
+  revokeCredentials(ids: string[]): string[] {
+    const revokeAll = () => ids.flatMap((id) => this.revokeCredential(id));
+    return this.memoryState ? revokeAll() : this.sqlite.transaction(revokeAll)();
+  }
+
+  /**
    * Permanently delete revoked credentials — all of them, or only `ids`.
    * Credentials that are not revoked are never touched, whatever the ids say.
    * Safe for tokens: a revoked or missing row both fail authentication, and
