@@ -134,6 +134,10 @@ function credentialFromRow<T extends Partial<CredentialRow>>(row: T): Omit<T, 'a
   return { ...rest, allowedBackends: allowedBackendsJson ? JSON.parse(allowedBackendsJson) as string[] : null };
 }
 
+function accessCredentialName(parent: CredentialInfo): string {
+  return `access:${parent.name || parent.id}`;
+}
+
 /** Identity key for a credential-bound backend; never collides with legacy keys, which start with the empty tenant. */
 function boundIdentityKey(backendId: string): string {
   return `bound:${backendId}`;
@@ -200,6 +204,28 @@ export function initDatabase(dbPath: string = getDbPath()): Database.Database {
   addColumnIfMissing(db, 'credentials', 'allowed_backends TEXT');
   addColumnIfMissing(db, 'backend_identities', 'last_credential_id TEXT');
   addColumnIfMissing(db, 'backend_identities', 'last_seen_at INTEGER');
+
+  // ADR-0011: at most one backend-access row per enrollment, rotated in
+  // place. Collapse rows left by the old one-row-per-exchange behavior —
+  // keep the unrevoked, newest one — then let the index enforce it. A
+  // dropped token still in use is refused at its next handshake and the SDK
+  // exchanges afresh.
+  const collapsed = db.prepare(`
+    DELETE FROM credentials
+    WHERE type = 'backend-access' AND parent_id IS NOT NULL AND id NOT IN (
+      SELECT id FROM (
+        SELECT id, ROW_NUMBER() OVER (
+          PARTITION BY parent_id ORDER BY (revoked_at IS NULL) DESC, created_at DESC, id
+        ) AS rn
+        FROM credentials WHERE type = 'backend-access' AND parent_id IS NOT NULL
+      ) WHERE rn = 1
+    )
+  `).run();
+  if (collapsed.changes > 0) {
+    console.log(`[Gateway] Collapsed ${collapsed.changes} duplicate backend-access credential(s) into one per enrollment (ADR-0011)`);
+  }
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_credentials_access_per_parent
+    ON credentials(parent_id) WHERE type = 'backend-access'`);
 
   return db;
 }
@@ -599,6 +625,61 @@ export class GatewayStorage {
       'UPDATE credentials SET revoked_at = ? WHERE parent_id = ? AND revoked_at IS NULL',
     ).run(now, id);
     return [id, ...children.map((c) => c.id)];
+  }
+
+  /**
+   * Exchange an enrollment credential for its backend-access credential
+   * (ADR-0011): each enrollment has at most one access row, rotated in place —
+   * a new secret, digest and lifetime on the same id, so the previous secret
+   * stops working and the list never grows. Rotation also clears a previous
+   * revocation of that row: the revoked secret is gone either way, and
+   * stopping a backend from exchanging means revoking its enrollment.
+   */
+  exchangeAccessCredential(parent: CredentialInfo, ttlMs?: number | null): { credential: CredentialInfo; token: string; rotated: boolean } {
+    const existing = this.findAccessCredential(parent.id);
+    if (!existing) {
+      const created = this.createCredential({
+        type: 'backend-access',
+        namespace: parent.namespace,
+        name: accessCredentialName(parent),
+        parentId: parent.id,
+        ttlMs,
+        backendId: parent.backendId,
+      });
+      return { ...created, rotated: false };
+    }
+    const token = CREDENTIAL_TOKEN_PREFIXES['backend-access'] + crypto.randomBytes(32).toString('base64url');
+    const now = Date.now();
+    const lifetime = ttlMs === undefined ? DEFAULT_BACKEND_ACCESS_TTL_MS : ttlMs;
+    const update = {
+      tokenHash: hashCredentialToken(token),
+      namespace: parent.namespace,
+      name: accessCredentialName(parent),
+      createdAt: now,
+      expiresAt: lifetime === null ? null : now + lifetime,
+      revokedAt: null,
+      backendId: parent.backendId,
+    };
+    if (this.memoryState) {
+      Object.assign(this.memoryState.credentials.get(existing.id)!, update);
+    } else {
+      this.sqlite.prepare(`
+        UPDATE credentials
+        SET token_hash = ?, namespace = ?, name = ?, created_at = ?, expires_at = ?, revoked_at = NULL, backend_id = ?
+        WHERE id = ?
+      `).run(update.tokenHash, update.namespace, update.name, update.createdAt, update.expiresAt, update.backendId, existing.id);
+    }
+    return { credential: this.getCredential(existing.id)!, token, rotated: true };
+  }
+
+  private findAccessCredential(parentId: string): CredentialRecord | undefined {
+    if (this.memoryState) {
+      return Array.from(this.memoryState.credentials.values())
+        .find((c) => c.type === 'backend-access' && c.parentId === parentId);
+    }
+    const row = this.sqlite.prepare(`SELECT ${CREDENTIAL_COLUMNS}, token_hash as tokenHash FROM credentials WHERE type = 'backend-access' AND parent_id = ?`)
+      .get(parentId) as CredentialRow | undefined;
+    return row && credentialFromRow(row);
   }
 
   /**

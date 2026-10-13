@@ -243,10 +243,11 @@ class GatewayBackend:
         self._reconnect_attempt = 0
         # Access token exchanged from a zgb_ enrollment credential, reused
         # across reconnects until shortly before it expires: every exchange
-        # mints a new credential row on the gateway. Kept across close() —
-        # the token stays valid server-side either way, and a later connect()
-        # in the same process should not mint another one; a token the
-        # gateway no longer accepts is dropped on its first UNAUTHORIZED.
+        # rotates the enrollment's access credential on the gateway
+        # (ADR-0011), so needless exchanges only churn secrets. Kept across
+        # close() — the token stays valid server-side either way; a token the
+        # gateway no longer accepts (rotated by another exchange, revoked) is
+        # dropped on its first UNAUTHORIZED.
         self._access_token: str | None = None
         self._access_expires_at_ms: int | None = None
         self._used_connect = False
@@ -532,7 +533,7 @@ class GatewayBackend:
     async def _establish(self) -> None:
         self._set_state("connecting")
         # Resolved on every attempt, but an unexpired exchanged access token
-        # is reused rather than minting a new one (see _resolve_credential).
+        # is reused rather than exchanged again (see _resolve_credential).
         credential, cached = await self._resolve_credential()
         try:
             await self._handshake(credential)

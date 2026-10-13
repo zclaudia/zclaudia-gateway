@@ -259,9 +259,10 @@ describeIfLoopback('Phase 3: SDK contract', () => {
     await fetch(`${httpUrl}/api/admin/credentials/${access.id}`, { method: 'DELETE', headers: admin });
     await until(() => backend.connectionState === 'connected' && backend.currentEpoch > epoch);
     expect(backend.lastError).toBeNull();
+    // Re-exchanged by rotating the same row in place (ADR-0011)
     const after = await accessCredentials();
-    expect(after).toHaveLength(2);
-    expect(after.filter((c) => c.revokedAt === null)).toHaveLength(1);
+    expect(after).toHaveLength(1);
+    expect(after[0]).toMatchObject({ id: access.id, revokedAt: null });
   });
 
   test('client waits for a known backendId to come online', async () => {

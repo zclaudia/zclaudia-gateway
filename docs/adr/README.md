@@ -16,6 +16,7 @@
 | [0008](0008-python-backend-last-error.md) | Backend SDK：`last_error` / `lastError`（Python + TS） | Accepted |
 | [0009](0009-credential-bound-backend-identity.md) | 后端身份由凭证授予，设备凭证可限定后端范围 | Accepted |
 | [0010](0010-replaced-backend-stands-down.md) | 被顶替的后端主动退出，不再重连 | Accepted |
+| [0011](0011-rotate-backend-access-in-place.md) | 后端访问凭证原地轮换：每个注册凭证只有一行 | Accepted |
 
 ## 待定决策
 

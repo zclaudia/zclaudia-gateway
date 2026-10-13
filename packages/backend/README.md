@@ -5,9 +5,11 @@ heartbeats, channel offers (dial-is-accept), topic publishing with retain,
 and `serveHttp` for answering the gateway's streaming HTTP proxy over a
 channel. Reconnects with exponential backoff; supports enrollment-credential
 exchange (`zgb_` → short-lived access credential). The access token is cached
-and reused across reconnects until 60 s before it expires (each exchange
-mints a new credential on the gateway), and exchanged afresh at once if the
-gateway stops accepting it.
+and reused across reconnects until 60 s before it expires, and exchanged
+afresh at once if the gateway stops accepting it. Each enrollment credential
+has a single access credential on the gateway, rotated in place by every
+exchange — the previous secret stops working
+([ADR-0011](https://github.com/zclaudia/zclaudia-gateway/blob/main/docs/adr/0011-rotate-backend-access-in-place.md)).
 
 ```ts
 import { GatewayBackend } from '@zclaudia/gateway-backend';

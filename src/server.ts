@@ -803,15 +803,10 @@ export function createGatewayServer(config: GatewayConfig): Server {
       res.status(403).json({ success: false, error: { code: 'FORBIDDEN', message: 'Only backend enrollment credentials can be exchanged' } });
       return;
     }
-    const { credential, token: accessToken } = storage.createCredential({
-      type: 'backend-access',
-      namespace: auth.credential.namespace,
-      name: `access:${auth.credential.name || auth.credential.id}`,
-      parentId: auth.credential.id,
-      ttlMs: config.backendAccessTokenTtlMs,
-      backendId: auth.credential.backendId,
-    });
-    audit('credential.exchanged', { parent: auth.credential.id, id: credential.id });
+    // One access credential per enrollment, rotated in place (ADR-0011):
+    // always a new secret, and the previous one stops working.
+    const { credential, token: accessToken, rotated } = storage.exchangeAccessCredential(auth.credential, config.backendAccessTokenTtlMs);
+    audit('credential.exchanged', { parent: auth.credential.id, id: credential.id, rotated });
     res.status(201).json({ success: true, data: { token: accessToken, expiresAt: credential.expiresAt, namespace: credential.namespace } });
   });
 

@@ -192,10 +192,11 @@ export class GatewayBackend {
   private reconnectAttempt = 0;
   /**
    * Access token exchanged from a zgb_ enrollment credential, reused across
-   * reconnects until shortly before it expires: every exchange mints a new
-   * credential row on the gateway. Kept across close() — the token stays
-   * valid server-side either way, and a later connect() should not mint
-   * another; a token the gateway no longer accepts is dropped on its first
+   * reconnects until shortly before it expires: every exchange rotates the
+   * enrollment's access credential on the gateway (ADR-0011), so needless
+   * exchanges only churn secrets. Kept across close() — the token stays
+   * valid server-side either way; a token the gateway no longer accepts
+   * (rotated by another exchange, revoked) is dropped on its first
    * UNAUTHORIZED.
    */
   private accessToken: { token: string; expiresAt: number | null } | null = null;
@@ -331,7 +332,7 @@ export class GatewayBackend {
   private async establish(): Promise<{ backendId: string; epoch: number }> {
     this.setState('connecting');
     // Resolved on every attempt, but an unexpired exchanged access token is
-    // reused rather than minting a new one (see resolveCredential).
+    // reused rather than exchanged again (see resolveCredential).
     const { credential, cached } = await this.resolveCredential();
     try {
       return await this.attempt(credential);

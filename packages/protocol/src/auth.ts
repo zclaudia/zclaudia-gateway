@@ -48,7 +48,9 @@ export interface GatewayCredentialInfo {
  * POST /api/backend/token response: exchange a backend enrollment credential
  * (zgb_) for a short-lived backend-access credential (zga_). Authenticated
  * with `Authorization: Bearer <zgb_…>`; the namespace is inherited from the
- * enrollment credential.
+ * enrollment credential. Each enrollment has one access credential, rotated
+ * in place (ADR-0011): every exchange returns a new secret and the previous
+ * one stops working.
  */
 export interface BackendTokenExchangeResponse {
   token: string;

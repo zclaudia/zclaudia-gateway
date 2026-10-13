@@ -65,9 +65,11 @@ stays stable, and channels from the previous epoch are gone (the gateway
 sends `channel_closed`). Enrollment credentials (`zgb_`) are exchanged for
 short-lived access credentials (`zga_`) unless `exchange_enrollment=False`.
 The access token is cached and reused across reconnects (and a later
-`connect()` after `close()`) until 60 s before it expires — each exchange
-mints a new credential on the gateway — and is exchanged afresh at once if
-the gateway stops accepting it.
+`connect()` after `close()`) until 60 s before it expires, and is exchanged
+afresh at once if the gateway stops accepting it. Each enrollment credential
+has a single access credential on the gateway, rotated in place by every
+exchange — the previous secret stops working
+([ADR-0011](../../docs/adr/0011-rotate-backend-access-in-place.md)).
 
 ### Backend identity
 

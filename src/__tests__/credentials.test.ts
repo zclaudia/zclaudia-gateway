@@ -437,6 +437,50 @@ describeIfLoopback('Phase 1: Credential System', () => {
       expect(err.code).toBe('UNAUTHORIZED');
     });
 
+    test('each enrollment has one access credential, rotated in place (ADR-0011)', async () => {
+      const { wsUrl, httpUrl } = await startServer();
+      const admin = { Authorization: `Bearer ${ADMIN_TOKEN}` };
+      const accessRows = async (parentId: string) => {
+        const res = await fetch(`${httpUrl}/api/admin/credentials`, { headers: admin });
+        return ((await res.json()).data as Array<{ id: string; type: string; parentId: string | null; revokedAt: number | null }>)
+          .filter((c) => c.type === 'backend-access' && c.parentId === parentId);
+      };
+      const helloAs = async (token: string) => {
+        const ws = await connect(wsUrl);
+        sendHello(ws, token, 'rotate-ns', 'client+backend', 'rotate-backend');
+        return Promise.race([waitForMessage(ws, 'peer_ready'), waitForMessage(ws, 'gateway_error')]);
+      };
+      const enrollment = (await issueCredential(httpUrl, { type: 'backend', namespace: 'rotate-ns', name: 'sugaring-dev' })).body.data;
+      const other = (await issueCredential(httpUrl, { type: 'backend', namespace: 'rotate-ns', name: 'other' })).body.data;
+      await exchange(httpUrl, other.token);
+
+      // A process restarting over and over: still one row, always a new secret
+      const issued = [];
+      for (let i = 0; i < 4; i++) issued.push((await exchange(httpUrl, enrollment.token)).body.data);
+      expect(new Set(issued.map((a) => a.token)).size).toBe(4);
+      const rows = await accessRows(enrollment.id);
+      expect(rows).toHaveLength(1);
+      expect(await accessRows(other.id)).toHaveLength(1); // another enrollment keeps its own row
+
+      // Only the latest secret works
+      expect((await helloAs(issued[0].token)).type).toBe('gateway_error');
+      expect((await helloAs(issued[3].token)).type).toBe('peer_ready');
+
+      // A revoked access row comes back (with a new secret) on the next exchange
+      await fetch(`${httpUrl}/api/admin/credentials/${rows[0].id}`, { method: 'DELETE', headers: admin });
+      expect((await accessRows(enrollment.id))[0].revokedAt).not.toBeNull();
+      const revived = (await exchange(httpUrl, enrollment.token)).body.data;
+      const after = await accessRows(enrollment.id);
+      expect(after).toHaveLength(1);
+      expect(after[0]).toMatchObject({ id: rows[0].id, revokedAt: null });
+      expect((await helloAs(revived.token)).type).toBe('peer_ready');
+
+      // Revoking the enrollment cascades, and it can no longer exchange
+      const revoke = await fetch(`${httpUrl}/api/admin/credentials/${enrollment.id}`, { method: 'DELETE', headers: admin });
+      expect((await revoke.json()).data.revoked).toEqual(expect.arrayContaining([enrollment.id, rows[0].id]));
+      expect((await exchange(httpUrl, enrollment.token)).status).toBe(401);
+    });
+
     test('expired access tokens are rejected', async () => {
       const { wsUrl, httpUrl } = await startServer({ backendAccessTokenTtlMs: 50 });
       const enrollment = await issueCredential(httpUrl, { type: 'backend', namespace: 'hermes' });
