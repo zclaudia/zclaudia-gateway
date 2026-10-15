@@ -81,10 +81,22 @@ function parseNotificationConfigFromEnv(): Partial<GatewayNotificationConfig> {
     process.exit(1);
   }
 
+  const enabled = parseBooleanEnv(process.env.NTFY_ENABLED, DEFAULT_NOTIFICATION_CONFIG.enabled);
+  const ntfyTopic = process.env.NTFY_TOPIC?.trim() ?? DEFAULT_NOTIFICATION_CONFIG.ntfyTopic;
+  // Backend events publish to "<topic>-<backendId-uuid>"; ntfy caps topics at
+  // 64 chars, so the base topic must leave room for the 37-char suffix.
+  if (enabled && ntfyTopic && ntfyTopic.length > 27) {
+    console.error(
+      `Error: NTFY_TOPIC must be at most 27 characters when notifications are enabled ` +
+      `(got ${ntfyTopic.length}): per-backend topics append "-<uuid>" and ntfy caps topics at 64 characters.`
+    );
+    process.exit(1);
+  }
+
   return {
-    enabled: parseBooleanEnv(process.env.NTFY_ENABLED, DEFAULT_NOTIFICATION_CONFIG.enabled),
+    enabled,
     ntfyUrl: ntfyUrl ?? DEFAULT_NOTIFICATION_CONFIG.ntfyUrl,
-    ntfyTopic: process.env.NTFY_TOPIC?.trim() ?? DEFAULT_NOTIFICATION_CONFIG.ntfyTopic,
+    ntfyTopic,
     ntfyAuthMode,
     ntfyPublishToken,
     ntfySubscribeToken,

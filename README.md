@@ -66,7 +66,7 @@ docker compose up -d        # 容器部署（读取 .env）
 | `GATEWAY_ADMIN_UI_DIR` | | 无（容器镜像内默认 `/app/zclaudia/admin-ui`） | 管理控制台静态产物目录；未设置时网关为纯 API（见 [ADR-0005](docs/adr/0005-admin-web-ui.md)） |
 | `GATEWAY_ADMIN_SESSION_TTL_HOURS` | | `12` | 管理控制台会话时长（小时）；会话在内存中，重启即全部登出 |
 | `ZCLAUDIA_DATA_DIR` | | `~/.zclaudia` | SQLite 数据目录（实际路径 `<dir>/gateway/gateway.db`） |
-| `NTFY_*` | | 见 [.env.example](.env.example) 与 [src/index.ts](src/index.ts) | ntfy 推送通知配置 |
+| `NTFY_*` | | 见 [.env.example](.env.example) 与 [src/index.ts](src/index.ts) | ntfy 推送通知配置。backend 事件发布到 `${NTFY_TOPIC}-${backendId}`（per-backend 路由，app 按订阅的后端各自订阅派生 topic）；ntfy topic 上限 64 字符，`NTFY_TOPIC` 需 ≤27 字符（启用通知时启动校验）。`POST /api/notifications/test` 可带 body `{"backendId"}` 指定派生 topic |
 
 ## 显式约束（当前实现的已知边界）
 

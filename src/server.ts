@@ -406,9 +406,11 @@ export function createGatewayServer(config: GatewayConfig): Server {
     }
   });
 
-  app.post('/api/notifications/test', requireGatewayAuth, async (_req: Request, res: Response) => {
+  app.post('/api/notifications/test', requireGatewayAuth, async (req: Request, res: Response) => {
     try {
-      await pushNotificationService.sendTest();
+      const rawBackendId = req.body?.backendId;
+      const backendId = typeof rawBackendId === 'string' && rawBackendId.trim() ? rawBackendId.trim() : undefined;
+      await pushNotificationService.sendTest(backendId);
       res.json({ success: true, data: { message: 'Test notification sent' } });
     } catch (err) {
       res.status(400).json({ success: false, error: { code: 'NOTIFICATION_FAILED', message: err instanceof Error ? err.message : 'Failed to send test notification' } });
@@ -1669,7 +1671,10 @@ export function createGatewayServer(config: GatewayConfig): Server {
       } satisfies GatewayErrorV4);
       return;
     }
-    void pushNotificationService.notify(msg.event);
+    // peer.backendId is the server-authoritative identity from the
+    // credential store; per-backend topics are derived from it, never from
+    // client-supplied event fields.
+    void pushNotificationService.notify(msg.event, peer.backendId);
   }
 
   // ========================================================================

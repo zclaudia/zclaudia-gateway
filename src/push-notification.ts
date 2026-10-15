@@ -107,12 +107,25 @@ export class GatewayPushNotificationService {
     }
   }
 
-  async notify(event: NotifyEvent): Promise<void> {
+  /**
+   * Backends publish to `${ntfyTopic}-${backendId}` so each app subscribes
+   * only to the backends it cares about (topic = routing). Without a
+   * backendId (test pings) the base topic is used. ntfy caps topics at 64
+   * chars; a UUID suffix takes 37, so the base topic must stay ≤ 27
+   * (validated at startup in index.ts).
+   */
+  private topicUrl(backendId?: string): string {
+    const base = this.config.ntfyUrl.replace(/\/$/, '');
+    const topic = backendId ? `${this.config.ntfyTopic}-${backendId}` : this.config.ntfyTopic;
+    return `${base}/${topic}`;
+  }
+
+  async notify(event: NotifyEvent, backendId?: string): Promise<void> {
     const config = this.config;
     if (!config.enabled || !config.ntfyTopic) return;
     if (!this.shouldNotify(event)) return;
 
-    const url = `${config.ntfyUrl.replace(/\/$/, '')}/${config.ntfyTopic}`;
+    const url = this.topicUrl(backendId);
 
     const headers: Record<string, string> = {
       Title: event.title,
@@ -135,13 +148,13 @@ export class GatewayPushNotificationService {
     }
   }
 
-  async sendTest(): Promise<void> {
+  async sendTest(backendId?: string): Promise<void> {
     const config = this.config;
     if (!config.ntfyTopic) {
       throw new Error('ntfy topic is not configured');
     }
 
-    const url = `${config.ntfyUrl.replace(/\/$/, '')}/${config.ntfyTopic}`;
+    const url = this.topicUrl(backendId);
 
     const response = await fetch(url, {
       method: 'POST',

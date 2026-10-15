@@ -1,7 +1,7 @@
 /**
  * Tests for static notification config exposure and auth.
  */
-import { describe, test, expect, beforeEach, afterEach } from 'vitest';
+import { describe, test, expect, beforeEach, afterEach, vi } from 'vitest';
 import net from 'node:net';
 import type { Server } from 'http';
 import { createGatewayServer } from '../server.js';
@@ -43,14 +43,8 @@ describeIfLoopback('Notification Config', () => {
         ntfyAuthMode: 'bearer',
         ntfyPublishToken: 'publish-token',
         ntfySubscribeToken: 'subscribe-token',
-        events: {
-          permissionRequest: false,
-          promptRequest: true,
-          runCompleted: true,
-          runFailed: false,
-          backgroundPermission: true,
-          processLeak: true,
-        },
+        eventAllowlist: ['zclaudia.run'],
+        eventDenylist: ['zclaudia.run.failed'],
       },
     });
     const urls = await listenTestServer(server);
@@ -77,10 +71,9 @@ describeIfLoopback('Notification Config', () => {
         ntfyAuthMode: 'bearer',
         ntfyPublishToken: 'publish-token',
         ntfySubscribeToken: 'subscribe-token',
+        eventAllowlist: ['zclaudia.run'],
+        eventDenylist: ['zclaudia.run.failed'],
       });
-      expect(body.data.events.permissionRequest).toBe(false);
-      expect(body.data.events.runFailed).toBe(false);
-      expect(body.data.events.promptRequest).toBe(true);
     });
 
     test('requires auth', async () => {
@@ -104,6 +97,54 @@ describeIfLoopback('Notification Config', () => {
     test('requires auth', async () => {
       const res = await fetch(`${HTTP_URL}/api/notifications/test`, { method: 'POST' });
       expect(res.status).toBe(401);
+    });
+
+    test('publishes to the per-backend topic when backendId is provided', async () => {
+      // The test's own HTTP call must keep hitting the real server; only
+      // outbound ntfy publishes are intercepted.
+      const realFetch = globalThis.fetch.bind(globalThis);
+      const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) =>
+        String(input).startsWith('https://ntfy.sh')
+          ? Promise.resolve({ ok: true, status: 200, statusText: 'OK' })
+          : realFetch(input, init)
+      );
+      vi.stubGlobal('fetch', fetchMock);
+      try {
+        const res = await fetch(`${HTTP_URL}/api/notifications/test`, {
+          method: 'POST',
+          headers: authHeaders(),
+          body: JSON.stringify({ backendId: '550e8400-e29b-41d4-a716-446655440000' }),
+        });
+        expect(res.status).toBe(200);
+        const ntfyCalls = fetchMock.mock.calls.filter(([input]) => String(input).startsWith('https://ntfy.sh'));
+        expect(ntfyCalls).toHaveLength(1);
+        expect(ntfyCalls[0]?.[0]).toBe('https://ntfy.sh/static-topic-550e8400-e29b-41d4-a716-446655440000');
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
+
+    test('publishes to the base topic without backendId', async () => {
+      const realFetch = globalThis.fetch.bind(globalThis);
+      const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) =>
+        String(input).startsWith('https://ntfy.sh')
+          ? Promise.resolve({ ok: true, status: 200, statusText: 'OK' })
+          : realFetch(input, init)
+      );
+      vi.stubGlobal('fetch', fetchMock);
+      try {
+        const res = await fetch(`${HTTP_URL}/api/notifications/test`, {
+          method: 'POST',
+          headers: authHeaders(),
+          body: JSON.stringify({}),
+        });
+        expect(res.status).toBe(200);
+        const ntfyCalls = fetchMock.mock.calls.filter(([input]) => String(input).startsWith('https://ntfy.sh'));
+        expect(ntfyCalls).toHaveLength(1);
+        expect(ntfyCalls[0]?.[0]).toBe('https://ntfy.sh/static-topic');
+      } finally {
+        vi.unstubAllGlobals();
+      }
     });
   });
 });
