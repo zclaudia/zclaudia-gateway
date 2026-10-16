@@ -182,6 +182,9 @@ v4 规范类型见 `@zclaudia/gateway-protocol`。
 `backendProtocolVersion`、`minClientProtocolVersion?`、`epoch`、`connectedAt`、
 `lastSeenAt`、`gatewayProtocolVersion?`。
 
+`visible` 是 Backend 自报的描述性字段（预留）：Gateway 当前不据此过滤任何下发，
+在线判断以 Backend 是否出现在 registry 为准。
+
 **Backend 身份**：见 §2——由后端凭证授予，旧版凭证仍按 `(namespace, instanceId,
 environment)` 映射。`backendId` 跨重连与凭证轮换稳定；`epoch` 每次连接递增，旧代次的
 channel/topic 订阅/retained 状态全部失效。
@@ -189,7 +192,12 @@ channel/topic 订阅/retained 状态全部失效。
 **设备后端范围**：设备凭证可限定为若干 backendId（缺省为整个 namespace）。范围外的
 Backend 不出现在 registry 中，`channel_open`、`topic_subscribe` 与 HTTP 代理对其返回
 与"不存在/离线"相同的 `BACKEND_OFFLINE`；Backend 发往范围外设备的定向
-`backend_server_message` 被丢弃。
+`backend_server_message` 被丢弃。配对时设备可经 `GET /api/discovery/backends`（Bearer
+凭证）枚举**可寻址**的 Backend——含当前离线者（`online: false`，`lastSeenAt` 为最近在线
+时刻，从未连接的身份为 null），用于在不知道 `backendId` 的情况下选择目标；范围外
+Backend 同样不出现。该列表是授权范围视图（后端身份），不是在线视图——在线视图以 registry
+为准；范围内已删除的后端身份不再出现（无法寻址）。任一有效凭证均可调用，返回集合即该凭证
+可寻址的后端（设备凭证按范围收窄，后端凭证为整个 namespace）。
 
 ### 10.2 心跳与租约
 

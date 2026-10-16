@@ -47,3 +47,10 @@ export function toWsBase(url: string): string {
   const scheme = parsed.protocol === 'https:' || parsed.protocol === 'wss:' ? 'wss:' : 'ws:';
   return `${scheme}//${parsed.host}`;
 }
+
+/** Derive the http(s) base URL (no path) from a gateway URL of any scheme. */
+export function toHttpBase(url: string): string {
+  const parsed = new URL(url);
+  const scheme = parsed.protocol === 'https:' || parsed.protocol === 'wss:' ? 'https:' : 'http:';
+  return `${scheme}//${parsed.host}`;
+}

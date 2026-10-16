@@ -15,17 +15,32 @@ import {
 import {
   defaultSocketFactory,
   normalizeMessageData,
+  toHttpBase,
   toWsBase,
   waitForSocketOpen,
   type SocketFactory,
   type WebSocketLike,
 } from './socket.js';
+import { defaultFetch, type FetchLike } from './fetch.js';
 import { dialChannel, GatewayChannel } from './channel.js';
 
 export { GatewayChannel, dialChannel } from './channel.js';
 export type { ChannelMessage } from './channel.js';
-export { defaultSocketFactory, toWsBase } from './socket.js';
+export { defaultSocketFactory, toHttpBase, toWsBase } from './socket.js';
 export type { SocketFactory, WebSocketLike } from './socket.js';
+export { defaultFetch } from './fetch.js';
+export type { FetchLike, FetchResponseLike } from './fetch.js';
+
+/** One backend a credential can address (GET /api/discovery/backends). */
+export interface GatewayDiscoveryBackend {
+  backendId: string;
+  /** The credential's name until the backend first connects, then the backend's self-reported name. */
+  name: string;
+  /** Whether the backend currently holds a lease on the gateway. */
+  online: boolean;
+  /** Last heartbeat (online) or last registration/offline transition; null if it never connected. */
+  lastSeenAt: number | null;
+}
 
 export interface GatewayClientOptions {
   /** Gateway base URL (http(s):// or ws(s)://). */
@@ -37,6 +52,8 @@ export interface GatewayClientOptions {
   identity?: { deviceId?: string; instanceId?: string; name?: string };
   clientProtocolVersion?: number;
   socketFactory?: SocketFactory;
+  /** HTTP implementation for `discoverBackends`; defaults to the global fetch. */
+  fetchImpl?: FetchLike;
   /** Auto-reconnect with backoff after unexpected disconnects. Default true. */
   reconnect?: boolean;
   reconnectMinMs?: number;
@@ -50,7 +67,9 @@ type Pending = { resolve: (msg: never) => void; reject: (err: Error) => void };
 export class GatewayClient {
   private readonly opts: Required<Pick<GatewayClientOptions, 'reconnect' | 'reconnectMinMs' | 'reconnectMaxMs' | 'clientProtocolVersion'>> & GatewayClientOptions;
   private readonly factory: SocketFactory;
+  private readonly fetchImpl: FetchLike;
   private readonly wsBase: string;
+  private readonly httpBase: string;
   private socket: WebSocketLike | null = null;
   private state: GatewayClientState = 'idle';
   private peerSessionId = '';
@@ -81,7 +100,9 @@ export class GatewayClient {
       ...options,
     };
     this.factory = options.socketFactory ?? defaultSocketFactory;
+    this.fetchImpl = options.fetchImpl ?? defaultFetch;
     this.wsBase = toWsBase(options.url);
+    this.httpBase = toHttpBase(options.url);
   }
 
   get connectionState(): GatewayClientState { return this.state; }
@@ -107,7 +128,8 @@ export class GatewayClient {
    * Waits across reconnects. Rejects after `timeoutMs` (default: wait
    * indefinitely) or when `signal` aborts. A backend outside this
    * credential's namespace or backend scope never appears, exactly like an
-   * offline one — set a timeout if that is possible.
+   * offline one — set a timeout if that is possible (or use
+   * `discoverBackends` to tell the two apart).
    */
   waitForBackend(backendId: string, options: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<BackendPresenceV4> {
     const present = this.registryItems.find((item) => item.backendId === backendId);
@@ -134,6 +156,29 @@ export class GatewayClient {
       }
       signal?.addEventListener('abort', onAbort, { once: true });
     });
+  }
+
+  /**
+   * List the backends this credential can address, offline ones included
+   * (GET /api/discovery/backends). Made for pairing: show the list, persist
+   * the picked `backendId`, then use `waitForBackend` — ids are stable
+   * (ADR-0009), so discovery is a one-time step, not the steady state.
+   *
+   * Unlike the registry this is not a liveness view: an out-of-scope backend
+   * never appears (same as nonexistent), while an in-scope one that is merely
+   * offline is listed with `online: false`. Works before `connect()`.
+   */
+  async discoverBackends(): Promise<GatewayDiscoveryBackend[]> {
+    const res = await this.fetchImpl(`${this.httpBase}/api/discovery/backends`, {
+      headers: { Authorization: `Bearer ${this.opts.credential}` },
+    });
+    const body = await res.json().catch(() => null) as
+      { success?: boolean; error?: { code?: string; message?: string }; data?: { items?: GatewayDiscoveryBackend[] } } | null;
+    if (!res.ok || !body?.success) {
+      const err = body?.error;
+      throw new Error(`discoverBackends failed: ${err?.code ? `${err.code}: ${err.message}` : `HTTP ${res.status}`}`);
+    }
+    return body.data?.items ?? [];
   }
 
   private setState(state: GatewayClientState): void {

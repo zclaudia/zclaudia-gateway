@@ -396,19 +396,34 @@ export function createGatewayServer(config: GatewayConfig): Server {
     res.json({ items: visibleRegistry(peer) });
   });
 
-  // --- Backend Discovery (device pairing; ADR: backendId optional at connect) ---
-  // Device credentials may be namespace-scoped (no backend binding), so a
-  // pairing client needs to learn which backends its credential can reach.
-  // Projection only: no capabilities, no identity internals, no channels.
-  app.get('/api/discovery/backends', requireGatewayAuth, (req: Request, res: Response) => {
+  // --- Backend Discovery (device pairing) ---
+  // A device credential may be scoped to specific backends (ADR-0009), so a
+  // pairing client needs to learn which backends it can address without
+  // knowing a backendId up front. The list answers "what may I address" — the
+  // credential's scope over known backend identities — not "what is online
+  // right now": provisioned-but-offline backends stay listed with
+  // `online: false`, so a picker can tell "offline" from "not allowed"
+  // (out-of-scope ids never appear, same as nonexistent ones). A bound backend
+  // credential creates its identity row at issuance (ADR-0009), so a
+  // never-connected backend is discoverable too.
+  // Online backends first, then most recently seen; projection only — no
+  // capabilities, no identity internals, no channels.
+  app.get('/api/discovery/backends', requireGatewayAuth, (_req: Request, res: Response) => {
     const auth = res.locals.auth;
-    const items = visibleRegistry(auth.credential).map((item) => ({
-      backendId: item.backendId,
-      name: item.name,
-      online: item.visible,
-      lastSeenAt: item.lastSeenAt,
-    }));
-    audit('discovery.backends', { ip: req.ip || 'unknown', auth: auth.credential.id, count: items.length });
+    const items = storage.listBackendIdentities()
+      .filter((identity) => canReach(auth.credential, identity))
+      .map((identity) => {
+        const presence = state.registry.items.get(identity.backendId);
+        return {
+          backendId: identity.backendId,
+          name: identity.name,
+          online: presence !== undefined,
+          // Live heartbeats beat the last registration/offline transition
+          // already recorded on the identity row.
+          lastSeenAt: presence ? presence.lastSeenAt : identity.lastSeenAt,
+        };
+      })
+      .sort((a, b) => Number(b.online) - Number(a.online) || (b.lastSeenAt ?? 0) - (a.lastSeenAt ?? 0));
     res.json({ success: true, data: { items } });
   });
 

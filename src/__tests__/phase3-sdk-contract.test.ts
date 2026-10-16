@@ -94,6 +94,48 @@ describeIfLoopback('Phase 3: SDK contract', () => {
     expect(client.registry.find((b) => b.backendId === backendId)?.name).toBe('reg-backend');
   });
 
+  test('a pairing client discovers, picks and waits for its backend (offline included)', async () => {
+    const { httpUrl } = await startServer();
+    // Provisioned but not connected yet: discovery must still list it.
+    const res = await fetch(`${httpUrl}/api/admin/credentials`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${TEST_ADMIN_TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'backend', namespace: 'sdk-test', name: 'pairing-backend' }),
+    });
+    const credential = (await res.json()).data as { token: string; backendId: string };
+    const deviceRes = await fetch(`${httpUrl}/api/admin/credentials`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${TEST_ADMIN_TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'device', namespace: 'sdk-test', name: 'pairing-client', allowedBackends: [credential.backendId] }),
+    });
+    const device = (await deviceRes.json()).data as { token: string };
+
+    const client = new GatewayClient({
+      url: httpUrl,
+      credential: device.token,
+      namespace: 'sdk-test',
+      reconnectMinMs: 100,
+    });
+    cleanups.push(() => client.close());
+
+    // No connect() needed: discovery is a plain HTTP call with the credential.
+    const discovered = await client.discoverBackends();
+    expect(discovered).toEqual([
+      { backendId: credential.backendId, name: 'pairing-backend', online: false, lastSeenAt: null },
+    ]);
+
+    // Pick it, persist the id, then wait for it to come online.
+    const waiting = client.waitForBackend(credential.backendId, { timeoutMs: 5000 });
+    await client.connect();
+    const backend = makeBackend(httpUrl, 'pairing-backend', credential.token);
+    await backend.connect();
+    expect((await waiting).backendId).toBe(credential.backendId);
+
+    const online = await client.discoverBackends();
+    expect(online[0]).toMatchObject({ backendId: credential.backendId, online: true });
+    expect(typeof online[0].lastSeenAt).toBe('number');
+  });
+
   test('channel: SDK client to SDK backend, echo both text and binary', async () => {
     const { httpUrl } = await startServer();
     const backend = makeBackend(httpUrl, 'ch-backend');

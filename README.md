@@ -35,7 +35,7 @@ mobile ── HTTP /api/proxy ┘      │
 
 **签发凭证是唯一认证方式**（[ADR-0002](docs/adr/0002-identity-issuance.md)；共享 secret 体系已于 2026-09 整体移除）。由 Admin API 签发的可撤销凭证，namespace 与能力从服务端记录派生，不信任客户端声明：
 
-- `zgd_*` 设备凭证：仅可作为 client-only 连接与访问本 namespace 的 HTTP 代理；默认 180 天过期。可在签发时（或之后）限定只能访问指定的后端，缺省为整个 namespace（含以后新增的后端）。
+- `zgd_*` 设备凭证：仅可作为 client-only 连接与访问本 namespace 的 HTTP 代理；默认 180 天过期。可在签发时（或之后）限定只能访问指定的后端，缺省为整个 namespace（含以后新增的后端）。设备可用 `GET /api/discovery/backends`（`Bearer <token>`）列出其**可寻址**的后端用于配对：返回 `{backendId, name, online, lastSeenAt}`，含当前离线的后端（`online: false`；`lastSeenAt` 为最近在线时刻，从未连接为 null），在线者排在前面。该列表是"凭证范围内的后端身份"，不是在线列表；范围外的后端不出现，与不存在不可区分。客户端 SDK 的 `discoverBackends()` 即此接口，与 `waitForBackend` 配合可省去把 UUID 抄进 app 配置（配对时选一次并持久化，之后按配置的 id 走）。
 - `zgb_*` Backend 凭证：一张凭证就是一个后端——签发时即确定 `backendId`，客户端可直接配置；同一凭证多处连接时新连接顶替旧连接，因此每个后端各签一张。默认不过期；可经 `/api/backend/token` 交换为短期 `zga_*` 访问凭证（Backend SDK 默认行为；每张注册凭证只有一行访问凭证，每次交换原地轮换出新 secret、旧 secret 立即失效，见 [ADR-0011](docs/adr/0011-rotate-backend-access-in-place.md)），轮换时签发继承同一 `backendId` 的新凭证再吊销旧的（[ADR-0009](docs/adr/0009-credential-bound-backend-identity.md)）。ADR-0009 之前签发的旧版凭证仍按 `instanceId` 推导身份，可在管理控制台按观测结果原地绑定（token 不变）。
 - 撤销立即生效：在线连接被断开（close 1008），后续认证被拒；撤销 `zgb_*` 级联撤销其交换出的 `zga_*`。
 - 凭证在 WS（`peer_hello.gatewaySecret` 字段，名称保留以稳定 wire）与 HTTP（`Bearer <token>`）两侧通用。
@@ -119,7 +119,7 @@ docker compose up -d        # 容器部署（读取 .env）
 | 包 | 内容 |
 | --- | --- |
 | `@zclaudia/gateway-protocol` | v4 wire 类型与常量，零依赖 |
-| `@zclaudia/gateway-client` | 控制连接、Channel、Topic、指数退避重连（快速重开模型）；面向 WHATWG WebSocket，可注入 socketFactory |
+| `@zclaudia/gateway-client` | 控制连接、Channel、Topic、指数退避重连（快速重开模型）、配对发现（`discoverBackends`）；面向 WHATWG WebSocket，可注入 socketFactory |
 | `@zclaudia/gateway-backend` | Backend 注册与心跳、channel offer 处理（拨号即接受）、Topic 发布、`serveHttp` HTTP channel 服务 |
 
 Python 后端可用官方 Python SDK（[packages/python](packages/python)，[ADR-0006](docs/adr/0006-python-backend-sdk.md)，PyPI 名 `zclaudia-gateway`）：`GatewayBackend` 等价实现注册/心跳/Channel/Topic/`serve_http`，asyncio + `websockets`，需 Python ≥ 3.11。
