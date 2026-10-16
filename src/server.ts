@@ -396,6 +396,22 @@ export function createGatewayServer(config: GatewayConfig): Server {
     res.json({ items: visibleRegistry(peer) });
   });
 
+  // --- Backend Discovery (device pairing; ADR: backendId optional at connect) ---
+  // Device credentials may be namespace-scoped (no backend binding), so a
+  // pairing client needs to learn which backends its credential can reach.
+  // Projection only: no capabilities, no identity internals, no channels.
+  app.get('/api/discovery/backends', requireGatewayAuth, (req: Request, res: Response) => {
+    const auth = res.locals.auth;
+    const items = visibleRegistry(auth.credential).map((item) => ({
+      backendId: item.backendId,
+      name: item.name,
+      online: item.visible,
+      lastSeenAt: item.lastSeenAt,
+    }));
+    audit('discovery.backends', { ip: req.ip || 'unknown', auth: auth.credential.id, count: items.length });
+    res.json({ success: true, data: { items } });
+  });
+
   // --- Notification Config ---
   app.get('/api/notifications/config', requireGatewayAuth, (_req: Request, res: Response) => {
     try {
