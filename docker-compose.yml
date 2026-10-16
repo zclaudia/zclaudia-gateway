@@ -14,6 +14,11 @@ services:
       - GATEWAY_ADMIN_TOKEN=${GATEWAY_ADMIN_TOKEN:?Please set GATEWAY_ADMIN_TOKEN in .env}
       - GATEWAY_PORT=${GATEWAY_PORT:-3200}
       - GATEWAY_TRUST_PROXY=${GATEWAY_TRUST_PROXY:-false}
+      # Rate limits: per-tenant proxy quota, optional per-IP ceiling over all
+      # credentials from one source, and the shared unauthenticated-failure quota.
+      - GATEWAY_PROXY_RATE_LIMIT=${GATEWAY_PROXY_RATE_LIMIT:-}
+      - GATEWAY_PROXY_IP_RATE_LIMIT=${GATEWAY_PROXY_IP_RATE_LIMIT:-}
+      - GATEWAY_AUTH_FAIL_RATE_LIMIT=${GATEWAY_AUTH_FAIL_RATE_LIMIT:-}
       - GATEWAY_ALLOWED_ORIGINS=${GATEWAY_ALLOWED_ORIGINS:-}
       # Admin web UI (ADR-0005): the image ships the bundle and defaults
       # GATEWAY_ADMIN_UI_DIR=/app/zclaudia/admin-ui. For an API-only gateway,

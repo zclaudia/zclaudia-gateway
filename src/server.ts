@@ -63,12 +63,24 @@ interface GatewayConfig {
    */
   channelByteRateLimit?: number;
   /**
-   * Max authenticated proxied requests per client IP per 60s window. The
-   * mobile embedded console spends ~15 requests per page navigation (static
-   * assets included) plus ~0.5Hz polling, so the default is set above bursts
-   * of normal multi-device usage.
+   * Max authenticated proxied requests per tenant (credential) per 60s window.
+   * The mobile embedded console spends ~15 requests per page navigation (static
+   * assets included) plus ~0.5Hz polling, so the default sits above bursts of
+   * normal multi-device usage. A tenant's devices share one budget whatever IP
+   * they sit behind, and one tenant never spends another's.
    */
   proxyRateLimit?: number;
+  /**
+   * Optional coarse ceiling on authenticated proxied requests per client IP
+   * per 60s window, summed over every credential that IP presents: bounds a
+   * single source holding many tenants, nothing finer. Unset (or 0) disables.
+   */
+  proxyIpRateLimit?: number;
+  /**
+   * Max unauthenticated attempts per client IP per 60s window before every
+   * route answers 429 instead of 401 (brute-force protection). Default 10.
+   */
+  authFailRateLimit?: number;
   /** Trust X-Forwarded-For header for IP extraction. Only enable behind a trusted reverse proxy. */
   trustProxy?: boolean;
   /**
@@ -164,18 +176,43 @@ export function createGatewayServer(config: GatewayConfig): Server {
   app.disable('x-powered-by');
 
   // --- Rate limiting ---
-  // Strict limit for failed auth attempts (brute-force protection)
-  const authFailures = new Map<string, { count: number; resetAt: number }>();
-  const AUTH_FAIL_LIMIT = 10;
+  type RateEntry = { count: number; resetAt: number };
+
+  /**
+   * Client address every bucket is keyed on, HTTP and WS alike. With
+   * trustProxy set the first X-Forwarded-For hop wins, so buckets follow the
+   * real client instead of collapsing onto the proxy's own address; only
+   * enable it behind a proxy that overwrites the header (ADR-0001).
+   */
+  function extractIp(req: IncomingMessage): string {
+    if (trustProxy) {
+      const forwarded = req.headers['x-forwarded-for']?.toString().split(',')[0].trim();
+      if (forwarded) return forwarded;
+    }
+    return req.socket.remoteAddress || 'unknown';
+  }
+
+  // Strict limit for unauthenticated attempts (brute-force protection). Every
+  // route that answers 401 feeds this one bucket, so probing cannot be moved
+  // to whichever endpoint happens not to be counted.
+  const authFailures = new Map<string, RateEntry>();
+  const AUTH_FAIL_LIMIT = config.authFailRateLimit ?? 10;
   const AUTH_FAIL_WINDOW = 60_000;
 
-  // Generous limit for authenticated proxy requests (normal app usage)
-  const proxyRequests = new Map<string, { count: number; resetAt: number }>();
-  const PROXY_RATE_LIMIT = config.proxyRateLimit ?? 600;
+  // Generous limit for authenticated proxy requests, keyed by tenant
+  // (credential) rather than IP: devices behind one NAT share a budget with
+  // their own tenant instead of with strangers, and a single credential cannot
+  // multiply its allowance by rotating source IPs.
+  const proxyRequests = new Map<string, RateEntry>();
+  const PROXY_RATE_LIMIT = config.proxyRateLimit ?? 1200;
   const PROXY_RATE_WINDOW = 60_000;
 
+  // Optional ceiling across all tenants from one IP (0 = off).
+  const proxyIpRequests = new Map<string, RateEntry>();
+  const PROXY_IP_RATE_LIMIT = config.proxyIpRateLimit ?? 0;
+
   function checkLimit(
-    map: Map<string, { count: number; resetAt: number }>,
+    map: Map<string, RateEntry>,
     key: string,
     limit: number,
     window: number,
@@ -191,27 +228,53 @@ export function createGatewayServer(config: GatewayConfig): Server {
   }
 
   /** 429 whose Retry-After carries the fixed window's remaining seconds. */
-  function rateLimited(res: Response, map: Map<string, { count: number; resetAt: number }>, key: string, windowMs: number): void {
+  function rateLimited(res: Response, map: Map<string, RateEntry>, key: string, windowMs: number): void {
     const resetAt = map.get(key)?.resetAt;
     const retryAfter = resetAt ? Math.max(1, Math.ceil((resetAt - Date.now()) / 1000)) : Math.ceil(windowMs / 1000);
     res.status(429).set('Retry-After', String(retryAfter)).json({ success: false, error: { code: 'RATE_LIMITED', message: 'Too many requests' } });
   }
 
-  function checkAuthFailLimit(ip: string): boolean {
+  /** Count an unauthenticated attempt against the client IP; false once spent. */
+  function recordAuthFailure(ip: string): boolean {
     return checkLimit(authFailures, ip, AUTH_FAIL_LIMIT, AUTH_FAIL_WINDOW);
   }
 
-  function checkProxyRateLimit(ip: string): boolean {
-    return checkLimit(proxyRequests, ip, PROXY_RATE_LIMIT, PROXY_RATE_WINDOW);
+  /**
+   * Answer an unauthenticated request: 429 once the IP's failure quota is
+   * spent, otherwise the given 401. Every unauthenticated rejection goes
+   * through here so the strict bucket cannot be sidestepped by picking a route
+   * that happens not to count.
+   */
+  function denyUnauthorized(res: Response, ip: string, message: string): void {
+    if (!recordAuthFailure(ip)) {
+      rateLimited(res, authFailures, ip, AUTH_FAIL_WINDOW);
+      return;
+    }
+    res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message } });
+  }
+
+  /**
+   * The bucket that refused an authenticated proxy request, so the caller can
+   * report that bucket's window. null = admitted. The tenant bucket is the
+   * real limit; the IP ceiling only stops one source from spending many
+   * tenants' budgets at once.
+   */
+  function refuseProxyRequest(credentialId: string, ip: string): { map: Map<string, RateEntry>; key: string } | null {
+    if (PROXY_IP_RATE_LIMIT > 0 && !checkLimit(proxyIpRequests, ip, PROXY_IP_RATE_LIMIT, PROXY_RATE_WINDOW)) {
+      return { map: proxyIpRequests, key: ip };
+    }
+    if (!checkLimit(proxyRequests, credentialId, PROXY_RATE_LIMIT, PROXY_RATE_WINDOW)) {
+      return { map: proxyRequests, key: credentialId };
+    }
+    return null;
   }
 
   const rateLimitCleanup = setInterval(() => {
     const now = Date.now();
-    for (const [ip, entry] of authFailures) {
-      if (now > entry.resetAt) authFailures.delete(ip);
-    }
-    for (const [ip, entry] of proxyRequests) {
-      if (now > entry.resetAt) proxyRequests.delete(ip);
+    for (const map of [authFailures, proxyRequests, proxyIpRequests]) {
+      for (const [key, entry] of map) {
+        if (now > entry.resetAt) map.delete(key);
+      }
     }
     for (const [token, ticket] of channelTickets) {
       if (now > ticket.expiresAt) channelTickets.delete(token);
@@ -373,14 +436,15 @@ export function createGatewayServer(config: GatewayConfig): Server {
   }
 
   function requireGatewayAuth(req: Request, res: Response, next: () => void): void {
+    const clientIp = extractIp(req);
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Authorization required' } });
+      denyUnauthorized(res, clientIp, 'Authorization required');
       return;
     }
     const auth = resolveToken(authHeader.slice(7));
     if (!auth) {
-      res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Invalid credentials' } });
+      denyUnauthorized(res, clientIp, 'Invalid credentials');
       return;
     }
     res.locals.auth = auth;
@@ -388,16 +452,17 @@ export function createGatewayServer(config: GatewayConfig): Server {
   }
 
   function requireRecoveryToken(req: Request, res: Response, next: () => void): void {
+    const clientIp = extractIp(req);
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Authorization required' } });
+      denyUnauthorized(res, clientIp, 'Authorization required');
       return;
     }
     const token = authHeader.slice(7);
     const peerSessionId = recoveryTokens.get(token);
     const peer = peerSessionId ? state.peers.get(peerSessionId) : undefined;
     if (!peer) {
-      res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Invalid recovery token' } });
+      denyUnauthorized(res, clientIp, 'Invalid recovery token');
       return;
     }
     res.locals.peer = peer;
@@ -496,7 +561,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
   }
 
   function requireAdmin(req: Request, res: Response, next: () => void): void {
-    const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
+    const clientIp = extractIp(req);
     const authHeader = req.headers.authorization;
     const bearerOk = !!authHeader
       && authHeader.startsWith('Bearer ')
@@ -516,29 +581,21 @@ export function createGatewayServer(config: GatewayConfig): Server {
       next();
       return;
     }
-    if (!checkAuthFailLimit(clientIp)) {
-      rateLimited(res, authFailures, clientIp, AUTH_FAIL_WINDOW);
-      return;
-    }
     audit('admin.auth_failed', { ip: clientIp });
-    res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Invalid admin token' } });
+    denyUnauthorized(res, clientIp, 'Invalid admin token');
     return;
   }
 
   // Login: exchange the admin token (shown once in the form) for a session
   // cookie, so the long-lived token never persists in the browser.
   app.post('/api/admin/session', (req: Request, res: Response) => {
-    const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
+    const clientIp = extractIp(req);
     const token = typeof (req.body as { token?: unknown } | undefined)?.token === 'string'
       ? (req.body as { token: string }).token
       : '';
     if (!token || !safeCompare(token, config.adminToken)) {
-      if (!checkAuthFailLimit(clientIp)) {
-        rateLimited(res, authFailures, clientIp, AUTH_FAIL_WINDOW);
-        return;
-      }
       audit('admin.session_login_failed', { ip: clientIp });
-      res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Invalid admin token' } });
+      denyUnauthorized(res, clientIp, 'Invalid admin token');
       return;
     }
     const session = adminSessions.create();
@@ -566,7 +623,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
   app.delete('/api/admin/session', (req: Request, res: Response) => {
     const sessionId = readSessionCookie(req, ADMIN_SESSION_COOKIE);
     if (sessionId && adminSessions.validate(sessionId)) {
-      audit('admin.session_destroyed', { ip: req.ip || req.socket.remoteAddress || 'unknown' });
+      audit('admin.session_destroyed', { ip: extractIp(req) });
       adminSessions.destroy(sessionId);
     }
     res.clearCookie(ADMIN_SESSION_COOKIE, { path: '/' });
@@ -832,16 +889,12 @@ export function createGatewayServer(config: GatewayConfig): Server {
 
   // --- Backend enrollment -> short-lived access credential (ADR-0002) ---
   app.post('/api/backend/token', (req: Request, res: Response) => {
-    const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
+    const clientIp = extractIp(req);
     const authHeader = req.headers.authorization;
     const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : '';
     const auth = token ? resolveToken(token) : null;
     if (!auth) {
-      if (!checkAuthFailLimit(clientIp)) {
-        rateLimited(res, authFailures, clientIp, AUTH_FAIL_WINDOW);
-        return;
-      }
-      res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Invalid credentials' } });
+      denyUnauthorized(res, clientIp, 'Invalid credentials');
       return;
     }
     // Only enrollment credentials may be exchanged — not device tokens, not
@@ -861,31 +914,24 @@ export function createGatewayServer(config: GatewayConfig): Server {
   app.all('/api/proxy/:backendId/*', async (req: Request, res: Response) => {
     try {
       const { backendId } = req.params;
-      const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
+      const clientIp = extractIp(req);
 
       // Check auth first, then apply appropriate rate limit
       const authHeader = req.headers.authorization;
       if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        if (!checkAuthFailLimit(clientIp)) {
-          rateLimited(res, authFailures, clientIp, AUTH_FAIL_WINDOW);
-          return;
-        }
-        res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Authorization required' } });
+        denyUnauthorized(res, clientIp, 'Authorization required');
         return;
       }
       const auth = resolveToken(authHeader.slice(7));
       if (!auth) {
-        if (!checkAuthFailLimit(clientIp)) {
-          rateLimited(res, authFailures, clientIp, AUTH_FAIL_WINDOW);
-          return;
-        }
-        res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Invalid credentials' } });
+        denyUnauthorized(res, clientIp, 'Invalid credentials');
         return;
       }
 
-      // Authenticated — apply generous proxy rate limit
-      if (!checkProxyRateLimit(clientIp)) {
-        rateLimited(res, proxyRequests, clientIp, PROXY_RATE_WINDOW);
+      // Authenticated — generous per-tenant limit, plus the optional IP ceiling
+      const refused = refuseProxyRequest(auth.credential.id, clientIp);
+      if (refused) {
+        rateLimited(res, refused.map, refused.key, PROXY_RATE_WINDOW);
         return;
       }
       const lease = state.leases.get(backendId);
@@ -1427,14 +1473,6 @@ export function createGatewayServer(config: GatewayConfig): Server {
     }
   }, 30_000);
 
-  function extractIp(req: IncomingMessage): string {
-    if (trustProxy) {
-      const forwarded = req.headers['x-forwarded-for']?.toString().split(',')[0].trim();
-      if (forwarded) return forwarded;
-    }
-    return req.socket.remoteAddress || 'unknown';
-  }
-
   wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
     const ip = extractIp(req);
     const currentCount = wsConnectionsPerIp.get(ip) || 0;
@@ -1455,7 +1493,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
             return;
           }
           clearTimeout(authTimeout);
-          peerSessionId = handlePeerHello(ws, message as PeerHelloV4);
+          peerSessionId = handlePeerHello(ws, message as PeerHelloV4, ip);
           return;
         }
         handlePeerMessage(peerSessionId, message);
@@ -1544,13 +1582,23 @@ export function createGatewayServer(config: GatewayConfig): Server {
   // Peer Hello
   // ========================================================================
 
-  function handlePeerHello(ws: WebSocket, message: PeerHelloV4): string | null {
+  function handlePeerHello(ws: WebSocket, message: PeerHelloV4, ip: string): string | null {
     // The gatewaySecret field carries an issued credential token
     // (zgd_/zgb_/zga_ prefix); the field name is kept for wire stability.
     const auth = resolveToken(message.gatewaySecret);
     if (!auth) {
       audit('peer.auth_failed', { namespace: message.namespace, peerType: message.peerType });
-      sendToWs(ws, { type: 'gateway_error', code: 'UNAUTHORIZED', message: 'Invalid gateway secret' } satisfies GatewayErrorV4); ws.close(); return null;
+      // The same per-IP bucket as the HTTP 401s: a rejected handshake costs a
+      // connection attempt, so reconnect loops hammering a bad credential are
+      // bounded by the strict limit rather than by the concurrent-connection cap.
+      const spent = !recordAuthFailure(ip);
+      sendToWs(ws, {
+        type: 'gateway_error',
+        code: spent ? 'RATE_LIMITED' : 'UNAUTHORIZED',
+        message: spent ? 'Too many failed attempts' : 'Invalid gateway secret',
+      } satisfies GatewayErrorV4);
+      ws.close();
+      return null;
     }
     // Namespace derives from the server-side credential record; a declared
     // namespace that disagrees is an error, never a grant.

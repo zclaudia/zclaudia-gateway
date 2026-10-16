@@ -227,7 +227,9 @@ Backend 同样不出现。该列表是授权范围视图（后端身份），不
 | WS maxPayload（控制面与数据面） | 50 MB | `server.ts` |
 | JSON 请求体上限 | 15 MB | `server.ts` |
 | 每 IP WS 连接数 | 10 | `server.ts` |
-| 认证失败限流 / 代理限流 | 10 次/min/IP / 200 次/min/IP | `server.ts` |
+| 未认证失败限流 | 10 次/min/IP（HTTP 各路由 401 与 WS 握手失败共用一个桶） | `server.ts` |
+| 代理请求限流 | 1200 次/min/凭证（租户维度，`proxyRateLimit` 可配） | `server.ts` |
+| 代理请求 IP 兜底上限 | 默认关闭（`proxyIpRateLimit` 可选） | `server.ts` |
 | retained topic 上限 | 64 个/Backend | `server.ts` |
 | per-channel 字节速率 | 默认不限（`channelByteRateLimit` 可配） | `server.ts` |
 

@@ -62,7 +62,9 @@ docker compose up -d        # 容器部署（读取 .env）
 | `GATEWAY_ADMIN_TOKEN` | ✅ | — | 凭证管理 API 的管理员 token（凭证体系的信任根） |
 | `GATEWAY_PORT` | | `3200` | 监听端口 |
 | `GATEWAY_TRUST_PROXY` | | `false` | 信任 `X-Forwarded-For`（仅置于可信反代之后时开启，见 ADR-0001） |
-| `GATEWAY_PROXY_RATE_LIMIT` | | `600` | 已认证代理请求按客户端 IP 的每 60s 限额（旧版默认 200，移动端内嵌研究台一次导航即 ~15 请求，故上调）；429 响应带 `Retry-After` |
+| `GATEWAY_PROXY_RATE_LIMIT` | | `1200` | 已认证代理请求按**凭证（租户）**的每 60s 限额：同一租户的设备共享额度，互相不占用（旧版默认 200 且按客户端 IP 计，NAT 后多设备共用出口 IP 时极易误伤，故上调并改按租户）；429 响应带 `Retry-After` |
+| `GATEWAY_PROXY_IP_RATE_LIMIT` | | 无（关闭） | 可选的每客户端 IP 代理请求上限（每 60s，跨该 IP 上所有凭证求和）：只用于压制单一来源持有很多凭证的情况，不用于限制正常用量 |
+| `GATEWAY_AUTH_FAIL_RATE_LIMIT` | | `10` | 未认证请求（任何路由返回 401 的尝试）每客户端 IP 每 60s 的额度，超过后所有路由一律回 429（暴力破解保护） |
 | `GATEWAY_ALLOWED_ORIGINS` | | 无（通配符） | 逗号分隔的 CORS Origin allowlist，设置后仅列表内 Origin 可跨域（带 credentials） |
 | `GATEWAY_ADMIN_UI_DIR` | | 无（容器镜像内默认 `/app/zclaudia/admin-ui`） | 管理控制台静态产物目录；未设置时网关为纯 API（见 [ADR-0005](docs/adr/0005-admin-web-ui.md)） |
 | `GATEWAY_ADMIN_SESSION_TTL_HOURS` | | `12` | 管理控制台会话时长（小时）；会话在内存中，重启即全部登出 |
@@ -93,8 +95,9 @@ docker compose up -d        # 容器部署（读取 .env）
 | WS 最大消息 | 50 MB | `server.ts` maxPayload |
 | JSON 请求体 | 15 MB | `express.json` |
 | 每 IP WS 连接数 | 10 | `MAX_WS_CONNECTIONS_PER_IP` |
-| 认证失败限流 | 10 次/分钟/IP | `AUTH_FAIL_LIMIT` |
-| 代理请求限流 | 200 次/分钟/IP | `PROXY_RATE_LIMIT` |
+| 未认证失败限流 | 10 次/分钟/IP（共享一个桶，含 WS 握手失败；`authFailRateLimit` 可配） | `AUTH_FAIL_LIMIT` |
+| 代理请求限流 | 1200 次/分钟/凭证（租户维度；`proxyRateLimit` 可配） | `PROXY_RATE_LIMIT` |
+| 代理请求 IP 兜底上限 | 默认关闭（`proxyIpRateLimit` 可选） | `PROXY_IP_RATE_LIMIT` |
 
 ### 超时与周期
 

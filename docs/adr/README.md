@@ -17,6 +17,7 @@
 | [0009](0009-credential-bound-backend-identity.md) | 后端身份由凭证授予，设备凭证可限定后端范围 | Accepted |
 | [0010](0010-replaced-backend-stands-down.md) | 被顶替的后端主动退出，不再重连 | Accepted |
 | [0011](0011-rotate-backend-access-in-place.md) | 后端访问凭证原地轮换：每个注册凭证只有一行 | Accepted |
+| [0012](0012-rate-limit-tenancy-and-fail-bucket.md) | 限流：合法请求按租户计额，未认证失败按 IP 单桶 | Accepted |
 
 ## 待定决策
 

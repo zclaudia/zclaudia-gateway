@@ -316,34 +316,133 @@ describe('Proxy rate limit', () => {
     await closeTestServer(server);
   });
 
-  test('limits authenticated proxy requests per IP within the window', async () => {
+  const proxyGet = (token: string) => fetch(`${httpUrl}/api/proxy/no-such-backend/healthz`, {
+    headers: { 'Authorization': `Bearer ${token}` }
+  });
+
+  test('limits authenticated proxy requests per tenant within the window', async () => {
     // Allowed requests still fail downstream (no backend online → 502), but
     // they consume the bucket; the 4th request inside the window is limited.
     const statuses: number[] = [];
     for (let i = 0; i < 4; i++) {
-      const response = await fetch(`${httpUrl}/api/proxy/no-such-backend/healthz`, {
-        headers: { 'Authorization': `Bearer ${deviceToken}` }
-      });
-      statuses.push(response.status);
+      statuses.push((await proxyGet(deviceToken)).status);
     }
     expect(statuses).toEqual([502, 502, 502, 429]);
   });
 
+  test('each credential keeps its own budget, whatever IP it appears from', async () => {
+    const otherToken = await issueToken(httpUrl, 'device', 'zclaudia');
+    for (let i = 0; i < 3; i++) {
+      expect((await proxyGet(deviceToken)).status).toBe(502);
+    }
+    // The first tenant is spent; the second is untouched, not starved.
+    expect((await proxyGet(deviceToken)).status).toBe(429);
+    expect((await proxyGet(otherToken)).status).toBe(502);
+    expect((await proxyGet(deviceToken)).status).toBe(429);
+  });
+
   test('429 responses carry Retry-After with the remaining window seconds', async () => {
     for (let i = 0; i < 3; i++) {
-      await fetch(`${httpUrl}/api/proxy/no-such-backend/healthz`, {
-        headers: { 'Authorization': `Bearer ${deviceToken}` }
-      });
+      await proxyGet(deviceToken);
     }
-    const limited = await fetch(`${httpUrl}/api/proxy/no-such-backend/healthz`, {
-      headers: { 'Authorization': `Bearer ${deviceToken}` }
-    });
+    const limited = await proxyGet(deviceToken);
     expect(limited.status).toBe(429);
     const retryAfter = Number(limited.headers.get('retry-after'));
     expect(retryAfter).toBeGreaterThan(0);
     expect(retryAfter).toBeLessThanOrEqual(60);
     const body = await limited.json();
     expect(body.error.code).toBe('RATE_LIMITED');
+  });
+});
+
+describe('Proxy IP ceiling', () => {
+  let server: Server;
+  let httpUrl: string;
+
+  beforeEach(async () => {
+    server = createGatewayServer({ adminToken: TEST_ADMIN_TOKEN, proxyRateLimit: 100, proxyIpRateLimit: 2 });
+    ({ httpUrl } = await listenTestServer(server));
+  });
+
+  afterEach(async () => {
+    await closeTestServer(server);
+  });
+
+  test('bounds one source across tenants without touching their own budgets', async () => {
+    const first = await issueToken(httpUrl, 'device', 'zclaudia');
+    const second = await issueToken(httpUrl, 'device', 'zclaudia');
+    const proxyGet = (token: string) => fetch(`${httpUrl}/api/proxy/no-such-backend/healthz`, {
+      headers: { 'Authorization': `Bearer ${token}` }
+    });
+    expect((await proxyGet(first)).status).toBe(502);
+    expect((await proxyGet(first)).status).toBe(502);
+    // Third request from this IP, from a credential that has spent nothing.
+    expect((await proxyGet(second)).status).toBe(429);
+  });
+});
+
+describe('Unauthenticated failure budget', () => {
+  let server: Server;
+  let httpUrl: string;
+  let wsUrl: string;
+
+  beforeEach(async () => {
+    server = createGatewayServer({ adminToken: TEST_ADMIN_TOKEN, authFailRateLimit: 3 });
+    ({ httpUrl, wsUrl } = await listenTestServer(server));
+  });
+
+  afterEach(async () => {
+    await closeTestServer(server);
+  });
+
+  const badGet = (path: string) => fetch(`${httpUrl}${path}`, {
+    headers: { 'Authorization': 'Bearer zgd_not-a-credential' }
+  });
+
+  test('spends one budget across routes, so no endpoint is a free place to probe', async () => {
+    // None of these is the proxy: every 401 has to count, or a prober would
+    // simply move to whichever route is not counted.
+    expect((await badGet('/api/discovery/backends')).status).toBe(401);
+    expect((await badGet('/api/notifications/config')).status).toBe(401);
+    expect((await badGet('/api/proxy/no-such-backend/healthz')).status).toBe(401);
+    expect((await badGet('/api/discovery/backends')).status).toBe(429);
+  });
+
+  test('counts a rejected handshake against the same IP budget', async () => {
+    const codes: string[] = [];
+    for (let i = 0; i < 4; i++) {
+      const ws = new WebSocket(wsUrl);
+      await waitForOpen(ws);
+      sendBackendHello(ws, 'zgd_not-a-credential', { deviceId: 'probe', instanceId: 'probe-inst' });
+      codes.push((await waitForMessage(ws, 'gateway_error')).code);
+      await closeWs(ws);
+    }
+    expect(codes).toEqual(['UNAUTHORIZED', 'UNAUTHORIZED', 'UNAUTHORIZED', 'RATE_LIMITED']);
+  });
+
+  test('authFailRateLimit moves the threshold', async () => {
+    await closeTestServer(server);
+    server = createGatewayServer({ adminToken: TEST_ADMIN_TOKEN, authFailRateLimit: 1 });
+    ({ httpUrl } = await listenTestServer(server));
+    expect((await badGet('/api/discovery/backends')).status).toBe(401);
+    expect((await badGet('/api/discovery/backends')).status).toBe(429);
+  });
+
+  test('a spent failure budget never gates the recovery path', async () => {
+    const enrollment = await issueToken(httpUrl, 'backend', 'zclaudia');
+    // Spend this source's whole failure budget (authFailRateLimit: 3).
+    for (let i = 0; i < 3; i++) {
+      expect((await badGet('/api/discovery/backends')).status).toBe(401);
+    }
+    expect((await badGet('/api/discovery/backends')).status).toBe(429);
+    // Only failed attempts are counted: a valid credential still exchanges for
+    // a fresh access token, so a client with a stale token recovers at once
+    // instead of waiting out the window.
+    const exchange = await fetch(`${httpUrl}/api/backend/token`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${enrollment}` }
+    });
+    expect(exchange.status).toBe(201);
   });
 });
 
