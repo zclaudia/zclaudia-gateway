@@ -62,6 +62,13 @@ interface GatewayConfig {
    * by pausing the sending socket. Unset = unlimited.
    */
   channelByteRateLimit?: number;
+  /**
+   * Max authenticated proxied requests per client IP per 60s window. The
+   * mobile embedded console spends ~15 requests per page navigation (static
+   * assets included) plus ~0.5Hz polling, so the default is set above bursts
+   * of normal multi-device usage.
+   */
+  proxyRateLimit?: number;
   /** Trust X-Forwarded-For header for IP extraction. Only enable behind a trusted reverse proxy. */
   trustProxy?: boolean;
   /**
@@ -164,7 +171,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
 
   // Generous limit for authenticated proxy requests (normal app usage)
   const proxyRequests = new Map<string, { count: number; resetAt: number }>();
-  const PROXY_RATE_LIMIT = 200;
+  const PROXY_RATE_LIMIT = config.proxyRateLimit ?? 600;
   const PROXY_RATE_WINDOW = 60_000;
 
   function checkLimit(
@@ -181,6 +188,13 @@ export function createGatewayServer(config: GatewayConfig): Server {
     }
     if (++entry.count > limit) return false;
     return true;
+  }
+
+  /** 429 whose Retry-After carries the fixed window's remaining seconds. */
+  function rateLimited(res: Response, map: Map<string, { count: number; resetAt: number }>, key: string, windowMs: number): void {
+    const resetAt = map.get(key)?.resetAt;
+    const retryAfter = resetAt ? Math.max(1, Math.ceil((resetAt - Date.now()) / 1000)) : Math.ceil(windowMs / 1000);
+    res.status(429).set('Retry-After', String(retryAfter)).json({ success: false, error: { code: 'RATE_LIMITED', message: 'Too many requests' } });
   }
 
   function checkAuthFailLimit(ip: string): boolean {
@@ -503,7 +517,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
       return;
     }
     if (!checkAuthFailLimit(clientIp)) {
-      res.status(429).json({ success: false, error: { code: 'RATE_LIMITED', message: 'Too many requests' } });
+      rateLimited(res, authFailures, clientIp, AUTH_FAIL_WINDOW);
       return;
     }
     audit('admin.auth_failed', { ip: clientIp });
@@ -520,7 +534,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
       : '';
     if (!token || !safeCompare(token, config.adminToken)) {
       if (!checkAuthFailLimit(clientIp)) {
-        res.status(429).json({ success: false, error: { code: 'RATE_LIMITED', message: 'Too many requests' } });
+        rateLimited(res, authFailures, clientIp, AUTH_FAIL_WINDOW);
         return;
       }
       audit('admin.session_login_failed', { ip: clientIp });
@@ -824,7 +838,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
     const auth = token ? resolveToken(token) : null;
     if (!auth) {
       if (!checkAuthFailLimit(clientIp)) {
-        res.status(429).json({ success: false, error: { code: 'RATE_LIMITED', message: 'Too many requests' } });
+        rateLimited(res, authFailures, clientIp, AUTH_FAIL_WINDOW);
         return;
       }
       res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Invalid credentials' } });
@@ -853,7 +867,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
       const authHeader = req.headers.authorization;
       if (!authHeader || !authHeader.startsWith('Bearer ')) {
         if (!checkAuthFailLimit(clientIp)) {
-          res.status(429).json({ success: false, error: { code: 'RATE_LIMITED', message: 'Too many requests' } });
+          rateLimited(res, authFailures, clientIp, AUTH_FAIL_WINDOW);
           return;
         }
         res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Authorization required' } });
@@ -862,7 +876,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
       const auth = resolveToken(authHeader.slice(7));
       if (!auth) {
         if (!checkAuthFailLimit(clientIp)) {
-          res.status(429).json({ success: false, error: { code: 'RATE_LIMITED', message: 'Too many requests' } });
+          rateLimited(res, authFailures, clientIp, AUTH_FAIL_WINDOW);
           return;
         }
         res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Invalid credentials' } });
@@ -871,7 +885,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
 
       // Authenticated — apply generous proxy rate limit
       if (!checkProxyRateLimit(clientIp)) {
-        res.status(429).json({ success: false, error: { code: 'RATE_LIMITED', message: 'Too many requests' } });
+        rateLimited(res, proxyRequests, clientIp, PROXY_RATE_WINDOW);
         return;
       }
       const lease = state.leases.get(backendId);

@@ -301,6 +301,52 @@ describe('Gateway Rate Limiting', () => {
   });
 });
 
+describe('Proxy rate limit', () => {
+  let server: Server;
+  let httpUrl: string;
+  let deviceToken: string;
+
+  beforeEach(async () => {
+    server = createGatewayServer({ adminToken: TEST_ADMIN_TOKEN, proxyRateLimit: 3 });
+    ({ httpUrl } = await listenTestServer(server));
+    deviceToken = await issueToken(httpUrl, 'device', 'zclaudia');
+  });
+
+  afterEach(async () => {
+    await closeTestServer(server);
+  });
+
+  test('limits authenticated proxy requests per IP within the window', async () => {
+    // Allowed requests still fail downstream (no backend online → 502), but
+    // they consume the bucket; the 4th request inside the window is limited.
+    const statuses: number[] = [];
+    for (let i = 0; i < 4; i++) {
+      const response = await fetch(`${httpUrl}/api/proxy/no-such-backend/healthz`, {
+        headers: { 'Authorization': `Bearer ${deviceToken}` }
+      });
+      statuses.push(response.status);
+    }
+    expect(statuses).toEqual([502, 502, 502, 429]);
+  });
+
+  test('429 responses carry Retry-After with the remaining window seconds', async () => {
+    for (let i = 0; i < 3; i++) {
+      await fetch(`${httpUrl}/api/proxy/no-such-backend/healthz`, {
+        headers: { 'Authorization': `Bearer ${deviceToken}` }
+      });
+    }
+    const limited = await fetch(`${httpUrl}/api/proxy/no-such-backend/healthz`, {
+      headers: { 'Authorization': `Bearer ${deviceToken}` }
+    });
+    expect(limited.status).toBe(429);
+    const retryAfter = Number(limited.headers.get('retry-after'));
+    expect(retryAfter).toBeGreaterThan(0);
+    expect(retryAfter).toBeLessThanOrEqual(60);
+    const body = await limited.json();
+    expect(body.error.code).toBe('RATE_LIMITED');
+  });
+});
+
 describe('Invalid First Messages', () => {
   let server: Server;
   let wsUrl: string;

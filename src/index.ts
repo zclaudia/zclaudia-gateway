@@ -110,6 +110,16 @@ function parseNotificationConfigFromEnv(): Partial<GatewayNotificationConfig> {
 
 const allowedOrigins = parseListEnv(process.env.GATEWAY_ALLOWED_ORIGINS);
 
+let proxyRateLimit: number | undefined;
+if (process.env.GATEWAY_PROXY_RATE_LIMIT?.trim()) {
+  const parsed = parseInt(process.env.GATEWAY_PROXY_RATE_LIMIT, 10);
+  if (isNaN(parsed) || parsed <= 0) {
+    console.error(`Error: GATEWAY_PROXY_RATE_LIMIT must be a positive integer, got: ${process.env.GATEWAY_PROXY_RATE_LIMIT}`);
+    process.exit(1);
+  }
+  proxyRateLimit = parsed;
+}
+
 // Admin web UI (ADR-0005): unset dir keeps the gateway API-only.
 const ADMIN_UI_DIR = process.env.GATEWAY_ADMIN_UI_DIR?.trim() || undefined;
 
@@ -130,6 +140,7 @@ const server = createGatewayServer({
   allowedOrigins: allowedOrigins.length > 0 ? allowedOrigins : undefined,
   adminStaticDir: ADMIN_UI_DIR,
   adminSessionTtlMs,
+  proxyRateLimit,
 });
 
 server.listen(PORT, () => {

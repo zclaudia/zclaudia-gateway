@@ -62,6 +62,7 @@ docker compose up -d        # 容器部署（读取 .env）
 | `GATEWAY_ADMIN_TOKEN` | ✅ | — | 凭证管理 API 的管理员 token（凭证体系的信任根） |
 | `GATEWAY_PORT` | | `3200` | 监听端口 |
 | `GATEWAY_TRUST_PROXY` | | `false` | 信任 `X-Forwarded-For`（仅置于可信反代之后时开启，见 ADR-0001） |
+| `GATEWAY_PROXY_RATE_LIMIT` | | `600` | 已认证代理请求按客户端 IP 的每 60s 限额（旧版默认 200，移动端内嵌研究台一次导航即 ~15 请求，故上调）；429 响应带 `Retry-After` |
 | `GATEWAY_ALLOWED_ORIGINS` | | 无（通配符） | 逗号分隔的 CORS Origin allowlist，设置后仅列表内 Origin 可跨域（带 credentials） |
 | `GATEWAY_ADMIN_UI_DIR` | | 无（容器镜像内默认 `/app/zclaudia/admin-ui`） | 管理控制台静态产物目录；未设置时网关为纯 API（见 [ADR-0005](docs/adr/0005-admin-web-ui.md)） |
 | `GATEWAY_ADMIN_SESSION_TTL_HOURS` | | `12` | 管理控制台会话时长（小时）；会话在内存中，重启即全部登出 |
