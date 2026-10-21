@@ -299,6 +299,9 @@ export function createGatewayServer(config: GatewayConfig): Server {
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Request-Id');
     if (req.method === 'OPTIONS') {
+      // Reuse successful preflights; authorization is still checked on every
+      // actual proxy request, including after a credential has been revoked.
+      res.setHeader('Access-Control-Max-Age', '600');
       res.status(204).end();
       return;
     }
