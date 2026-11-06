@@ -509,11 +509,66 @@ export function createGatewayServer(config: GatewayConfig): Server {
     res.json({ success: true, data: { items } });
   });
 
+  // Only active stream handles are retained; application notification state stays in the backend.
+  const notificationStreams = new Map<AbortController, { credentialId: string; close: () => void }>();
+  function closeNotificationStreams(ids?: Set<string>): void {
+    for (const [controller, stream] of notificationStreams) {
+      if (!ids || ids.has(stream.credentialId)) { controller.abort(); stream.close(); notificationStreams.delete(controller); }
+    }
+  }
+  function canSubscribeNotification(req: Request, res: Response): boolean {
+    const identity = storage.getBackendIdentity(req.params.backendId);
+    return Boolean(identity && canReach(res.locals.auth.credential, identity));
+  }
+  app.get('/api/notifications/subscription/:backendId', requireGatewayAuth, (req: Request, res: Response) => {
+    if (!canSubscribeNotification(req, res)) { res.sendStatus(404); return; }
+    const cfg = pushNotificationService.getConfig();
+    res.json({ success: true, data: { version: 1, enabled: cfg.enabled && Boolean(cfg.ntfyTopic), transportBasePath: '', topic: `push-${req.params.backendId}`, authMode: 'bearer' } });
+  });
+  app.post('/api/notifications/test/:backendId', requireGatewayAuth, async (req: Request, res: Response) => {
+    if (!canSubscribeNotification(req, res)) { res.sendStatus(404); return; }
+    const backendId = req.params.backendId;
+    const receipt = await pushNotificationService.notify({
+      name: 'zody.notification.test', title: 'Zody',
+      body: JSON.stringify({ version: 1, backendId, notificationId: crypto.randomUUID(), kind: 'test', expiresAt: Date.now() + 60_000 }),
+    }, backendId);
+    res.json({ success: true, data: receipt });
+  });
+  app.get(['/api/notifications/stream/:backendId/:format', '/push-:backendId/:format'], requireGatewayAuth, async (req: Request, res: Response) => {
+    if (!canSubscribeNotification(req, res)) { res.sendStatus(404); return; }
+    const format = req.params.format;
+    const since = typeof req.query.since === 'string' ? req.query.since : undefined;
+    if ((format !== 'json' && format !== 'sse') || (since && since.length > 64)) { res.sendStatus(400); return; }
+    if (!pushNotificationService.getConfig().enabled) { res.sendStatus(503); return; }
+    const credentialId = res.locals.auth.credential.id;
+    if ([...notificationStreams.values()].filter(s => s.credentialId === credentialId).length >= 8) { res.sendStatus(429); return; }
+    const abort = new AbortController();
+    notificationStreams.set(abort, { credentialId, close: () => res.end() });
+    res.on('close', () => abort.abort());
+    // Expiring credentials cannot keep an idle stream forever; revoke/scope updates abort immediately below.
+    const expiry = res.locals.auth.credential.expiresAt;
+    const expiryTimer = typeof expiry === 'number' ? setTimeout(() => { abort.abort(); res.end(); }, Math.min(2_147_483_647, Math.max(0, expiry - Date.now()))) : undefined;
+    try {
+      const upstream = await pushNotificationService.subscribe(req.params.backendId, format, since, abort.signal);
+      if (!upstream.ok || !upstream.body) { res.sendStatus(502); return; }
+      res.setHeader('Content-Type', format === 'sse' ? 'text/event-stream' : 'application/x-ndjson');
+      res.setHeader('Cache-Control', 'no-store');
+      for await (const chunk of upstream.body) {
+        const auth = resolveToken(req.headers.authorization!.slice(7));
+        const identity = storage.getBackendIdentity(req.params.backendId);
+        if (!auth || !identity || !canReach(auth.credential, identity)) break;
+        if (!res.write(chunk)) await new Promise<void>(resolve => { const done = () => { res.off('drain', done); res.off('close', done); resolve(); }; res.once('drain', done); res.once('close', done); });
+        if (abort.signal.aborted) break;
+      }
+    } catch { if (!res.headersSent && !abort.signal.aborted) res.status(502); }
+    finally { abort.abort(); if (expiryTimer) clearTimeout(expiryTimer); notificationStreams.delete(abort); res.end(); }
+  });
+
   // --- Notification Config ---
   app.get('/api/notifications/config', requireGatewayAuth, (_req: Request, res: Response) => {
     try {
       const cfg = pushNotificationService.getConfig();
-      res.json({ success: true, data: cfg });
+      res.json({ success: true, data: res.locals.auth.credential.type === 'device' ? { enabled: cfg.enabled, version: 1 } : cfg });
     } catch (err) {
       res.status(500).json({ success: false, error: { code: 'INTERNAL_ERROR', message: err instanceof Error ? err.message : 'Unknown error' } });
     }
@@ -523,6 +578,11 @@ export function createGatewayServer(config: GatewayConfig): Server {
     try {
       const rawBackendId = req.body?.backendId;
       const backendId = typeof rawBackendId === 'string' && rawBackendId.trim() ? rawBackendId.trim() : undefined;
+      if (res.locals.auth.credential.type === 'device' && !backendId) { res.sendStatus(400); return; }
+      if (backendId) {
+        const identity = storage.getBackendIdentity(backendId);
+        if (!identity || !canReach(res.locals.auth.credential, identity)) { res.sendStatus(404); return; }
+      }
       await pushNotificationService.sendTest(backendId);
       res.json({ success: true, data: { message: 'Test notification sent' } });
     } catch (err) {
@@ -829,6 +889,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
       return;
     }
     storage.setAllowedBackends(credential.id, scope);
+    closeNotificationStreams(new Set([credential.id]));
     audit('credential.scope_changed', { id: credential.id, scope: scope ? scope.join(',') : 'namespace' });
     for (const peer of state.peers.values()) {
       if (peer.credentialId === credential.id) peer.ws.close(1008, 'Credential scope changed');
@@ -841,6 +902,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
     if (revokedIds.length === 0) return;
     audit('credential.revoked', { ids: revokedIds.join(',') });
     const revokedSet = new Set(revokedIds);
+    closeNotificationStreams(revokedSet);
     for (const peer of state.peers.values()) {
       if (peer.credentialId && revokedSet.has(peer.credentialId)) {
         audit('credential.peer_disconnected', { id: peer.credentialId, peerSessionId: peer.peerSessionId });
@@ -871,6 +933,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
     const revokedIds = storage.revokeCredentials(requested);
     afterRevoke(revokedIds);
     const revokedSet = new Set(revokedIds);
+    closeNotificationStreams(revokedSet);
     res.json({ success: true, data: { revoked: revokedIds, skipped: requested.filter((id) => !revokedSet.has(id)) } });
   });
 
@@ -1234,7 +1297,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
     };
     channels.set(channelId, ch);
     const dataPath = `/channel/${channelId}`;
-    sendToWs(backendPeer.ws, { type: 'channel_offer', channelId, kind: msg.kind, sourcePeerSessionId: peer.peerSessionId, ticket: backendTicket, dataPath });
+    sendToWs(backendPeer.ws, { type: 'channel_offer', channelId, kind: msg.kind, sourcePeerSessionId: peer.peerSessionId, sourceCredentialId: peer.credentialId, ticket: backendTicket, dataPath });
     sendToWs(peer.ws, { type: 'channel_ready', channelId, ticket: clientTicket, dataPath });
   }
 
@@ -1448,6 +1511,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
     clearInterval(leaseCheckInterval);
     clearInterval(registryPollInterval);
     clearInterval(rateLimitCleanup);
+    closeNotificationStreams();
     adminSessions.dispose();
     for (const ch of [...channels.values()]) teardownChannel(ch.channelId, 'closed');
     channelWss.close();
@@ -1770,7 +1834,22 @@ export function createGatewayServer(config: GatewayConfig): Server {
     // peer.backendId is the server-authoritative identity from the
     // credential store; per-backend topics are derived from it, never from
     // client-supplied event fields.
-    void pushNotificationService.notify(msg.event, peer.backendId);
+    if (!isCurrentBackendOwner(peer)) return;
+    const event = msg.event;
+    const valid = event && typeof event.name === 'string' && event.name.length <= 128 &&
+      typeof event.title === 'string' && event.title.length <= 256 &&
+      typeof event.body === 'string' && event.body.length <= 4096 &&
+      (event.severity === undefined || ['info', 'success', 'warning', 'error'].includes(event.severity)) &&
+      (event.clickUrl === undefined || (typeof event.clickUrl === 'string' && event.clickUrl.length <= 2048)) &&
+      (event.tags === undefined || (Array.isArray(event.tags) && event.tags.length <= 10 && event.tags.every(t => typeof t === 'string' && t.length <= 64)));
+    const requestId = typeof msg.requestId === 'string' && msg.requestId.length <= 256 ? msg.requestId : undefined;
+    if (!valid) {
+      if (requestId) sendToWs(peer.ws, { type: 'push_notification_result', version: 1, requestId, status: 'terminal', code: 'invalid-event' });
+      return;
+    }
+    void pushNotificationService.notify(event, peer.backendId).then(receipt => {
+      if (requestId) sendToWs(peer.ws, { type: 'push_notification_result', version: 1, requestId, ...receipt });
+    });
   }
 
   // ========================================================================

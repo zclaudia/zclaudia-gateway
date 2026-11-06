@@ -37,7 +37,8 @@ const MESSAGE_SPECS: Record<string, MessageSpec> = {
     targetPeerSessionId: { kind: 'string', optional: true },
   },
   push_notification_request: {
-    event: { kind: 'present' },
+    requestId: { kind: 'non-empty-string', optional: true },
+    event: { kind: 'object' },
   },
   ping: {
     ts: { kind: 'number', optional: true },

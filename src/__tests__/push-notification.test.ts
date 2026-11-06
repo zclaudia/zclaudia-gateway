@@ -115,3 +115,18 @@ describe('GatewayPushNotificationService', () => {
     });
   });
 });
+
+describe('delivery receipt v1', () => {
+  afterEach(() => vi.unstubAllGlobals());
+  const event = { name: 'zody.turn.completed', title: 'Task update', body: 'Open Zody to view.' };
+  it.each([[200, 'accepted'], [429, 'retryable'], [500, 'retryable'], [401, 'terminal'], [400, 'terminal']])('classifies HTTP %s', async (status, expected) => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: status === 200, status }));
+    const service = new GatewayPushNotificationService({ enabled: true, ntfyTopic: 'tasks' });
+    expect(await service.notify(event, BACKEND_ID)).toMatchObject({ status: expected });
+  });
+  it('returns network failure and filtered without leaking fetch error', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('secret-address')));
+    expect(await new GatewayPushNotificationService({ enabled: true, ntfyTopic: 'tasks' }).notify(event, BACKEND_ID)).toEqual({ status: 'retryable', code: 'network' });
+    expect(await new GatewayPushNotificationService().notify(event, BACKEND_ID)).toEqual({ status: 'filtered', code: 'disabled' });
+  });
+});

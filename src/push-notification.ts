@@ -1,4 +1,4 @@
-import type { PushNotificationRequestMessage } from '@zclaudia/gateway-protocol/notifications';
+import type { GatewayPushNotificationReceipt, PushNotificationRequestMessage } from '@zclaudia/gateway-protocol/notifications';
 import type {
   GatewayNotificationAuthMode as NotificationAuthMode,
   GatewayNotificationConfig as NotificationConfig,
@@ -120,10 +120,10 @@ export class GatewayPushNotificationService {
     return `${base}/${topic}`;
   }
 
-  async notify(event: NotifyEvent, backendId?: string): Promise<void> {
+  async notify(event: NotifyEvent, backendId?: string): Promise<GatewayPushNotificationReceipt> {
     const config = this.config;
-    if (!config.enabled || !config.ntfyTopic) return;
-    if (!this.shouldNotify(event)) return;
+    if (!config.enabled || !config.ntfyTopic) return { status: 'filtered', code: 'disabled' };
+    if (!this.shouldNotify(event)) return { status: 'filtered', code: 'policy' };
 
     const url = this.topicUrl(backendId);
 
@@ -142,10 +142,25 @@ export class GatewayPushNotificationService {
     this.applyPublishAuth(headers);
 
     try {
-      await fetch(url, { method: 'POST', headers, body: event.body });
-    } catch (err) {
-      console.error('[Gateway/Notification] Failed to send ntfy notification:', err);
+      const response = await fetch(url, { method: 'POST', headers, body: event.body, signal: AbortSignal.timeout(10_000) });
+      if (response.ok) return { status: 'accepted' };
+      return { status: response.status === 429 || response.status >= 500 ? 'retryable' : 'terminal', code: `http-${response.status}` };
+    } catch {
+      // 网络失败不能冒充成功，也不输出含凭据或私有地址的 fetch 异常。
+      return { status: 'retryable', code: 'network' };
     }
+  }
+
+  async subscribe(backendId: string, format: 'json' | 'sse', since: string | undefined, signal: AbortSignal): Promise<Response> {
+    const headers: Record<string, string> = {};
+    if (this.config.ntfyAuthMode === 'bearer' && this.config.ntfySubscribeToken) {
+      headers.Authorization = `Bearer ${this.config.ntfySubscribeToken}`;
+    } else if (this.config.ntfyAuthMode === 'basic') {
+      headers.Authorization = `Basic ${Buffer.from(`${this.config.ntfyUsername}:${this.config.ntfyPassword}`).toString('base64')}`;
+    }
+    const url = new URL(`${this.topicUrl(backendId)}/${format}`);
+    if (since) url.searchParams.set('since', since);
+    return fetch(url, { headers, signal });
   }
 
   async sendTest(backendId?: string): Promise<void> {

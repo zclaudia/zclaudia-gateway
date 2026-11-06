@@ -30,6 +30,7 @@ export interface GatewayPushNotificationEvent {
 /** Backend → gateway control message requesting a push delivery. */
 export interface PushNotificationRequestMessage {
   type: 'push_notification_request';
+  requestId?: string;
   namespace?: string;
   event: GatewayPushNotificationEvent;
 }
@@ -55,3 +56,21 @@ export interface GatewayNotificationConfig {
 }
 
 export type GatewayNotificationAuthMode = 'none' | 'bearer' | 'basic';
+
+/** v1 optional notification extension; acceptance is not device delivery. */
+export interface GatewayPushNotificationReceipt {
+  status: 'accepted' | 'filtered' | 'retryable' | 'terminal';
+  code?: string;
+}
+export interface PushNotificationResultMessage extends GatewayPushNotificationReceipt {
+  type: 'push_notification_result';
+  version: 1;
+  requestId: string;
+}
+export interface GatewayNotificationSubscription {
+  version: 1;
+  enabled: boolean;
+  transportBasePath: '';
+  topic: string;
+  authMode: 'bearer';
+}

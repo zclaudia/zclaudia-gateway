@@ -100,6 +100,8 @@ describeIfLoopback('Notification Config', () => {
     });
 
     test('publishes to the per-backend topic when backendId is provided', async () => {
+      const discovery = await (await fetch(`${HTTP_URL}/api/discovery/backends`, { headers: authHeaders() })).json();
+      const backendId = discovery.data.items[0].backendId;
       // The test's own HTTP call must keep hitting the real server; only
       // outbound ntfy publishes are intercepted.
       const realFetch = globalThis.fetch.bind(globalThis);
@@ -113,12 +115,12 @@ describeIfLoopback('Notification Config', () => {
         const res = await fetch(`${HTTP_URL}/api/notifications/test`, {
           method: 'POST',
           headers: authHeaders(),
-          body: JSON.stringify({ backendId: '550e8400-e29b-41d4-a716-446655440000' }),
+          body: JSON.stringify({ backendId }),
         });
         expect(res.status).toBe(200);
         const ntfyCalls = fetchMock.mock.calls.filter(([input]) => String(input).startsWith('https://ntfy.sh'));
         expect(ntfyCalls).toHaveLength(1);
-        expect(ntfyCalls[0]?.[0]).toBe('https://ntfy.sh/static-topic-550e8400-e29b-41d4-a716-446655440000');
+        expect(ntfyCalls[0]?.[0]).toBe(`https://ntfy.sh/static-topic-${backendId}`);
       } finally {
         vi.unstubAllGlobals();
       }
