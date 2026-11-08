@@ -190,6 +190,13 @@ h2, h3 { margin: 0 0 12px; }
 .badge-status-expired { color: var(--warn); border-color: #55421a; }
 .badge-legacy { color: var(--warn); border-color: #55421a; border-style: dashed; }
 
+/* Backend disconnect reasons (overview diagnostics) */
+.badge-disc-closed { color: var(--text-muted); }
+.badge-disc-replaced { color: var(--warn); border-color: #55421a; }
+.badge-disc-lease_expired { color: var(--warn); border-color: #55421a; }
+.badge-disc-ping_timeout { color: var(--warn); border-color: #55421a; }
+.badge-disc-credential_revoked { color: var(--danger); border-color: #5c2a27; }
+
 /* --- Buttons & inputs --- */
 
 .btn {

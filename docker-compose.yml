@@ -4,6 +4,12 @@ services:
       context: .
       dockerfile: Dockerfile
       network: host
+      args:
+        # Build identity, baked into the image at build time (README §构建信息
+        # 与连接诊断). Empty values show as 'unknown' in the admin overview.
+        - GATEWAY_BUILD_VERSION=${GATEWAY_BUILD_VERSION:-}
+        - GATEWAY_BUILD_COMMIT=${GATEWAY_BUILD_COMMIT:-}
+        - GATEWAY_BUILD_TIME=${GATEWAY_BUILD_TIME:-}
     restart: unless-stopped
     ports:
       # Loopback by default: TLS terminates at the front proxy (ADR-0001) and

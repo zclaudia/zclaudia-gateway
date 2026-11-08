@@ -1,4 +1,5 @@
 import { createGatewayServer } from './server.js';
+import { readBuildInfoFromEnv } from './build-info.js';
 import { DEFAULT_NOTIFICATION_CONFIG } from './push-notification.js';
 import type {
   GatewayNotificationAuthMode,
@@ -122,6 +123,21 @@ function parsePositiveIntEnv(name: string): number | undefined {
   return parsed;
 }
 
+/**
+ * Non-negative-integer env var (0 allowed, usually meaning "off"), undefined
+ * when unset; invalid values are fatal. Same validation style as
+ * parsePositiveIntEnv.
+ */
+function parseNonNegativeIntEnv(name: string): number | undefined {
+  const raw = process.env[name]?.trim();
+  if (!raw) return undefined;
+  if (!/^\d+$/.test(raw)) {
+    console.error(`Error: ${name} must be a non-negative integer, got: ${raw}`);
+    process.exit(1);
+  }
+  return parseInt(raw, 10);
+}
+
 // Admin web UI (ADR-0005): unset dir keeps the gateway API-only.
 const ADMIN_UI_DIR = process.env.GATEWAY_ADMIN_UI_DIR?.trim() || undefined;
 
@@ -135,8 +151,12 @@ if (process.env.GATEWAY_ADMIN_SESSION_TTL_HOURS?.trim()) {
   adminSessionTtlMs = hours * 60 * 60 * 1000;
 }
 
+// Read once so the startup log and the admin overview report the same build.
+const buildInfo = readBuildInfoFromEnv();
+
 const server = createGatewayServer({
   adminToken: ADMIN_TOKEN,
+  buildInfo,
   notificationConfig: parseNotificationConfigFromEnv(),
   trustProxy: process.env.GATEWAY_TRUST_PROXY === 'true',
   allowedOrigins: allowedOrigins.length > 0 ? allowedOrigins : undefined,
@@ -145,10 +165,12 @@ const server = createGatewayServer({
   proxyRateLimit: parsePositiveIntEnv('GATEWAY_PROXY_RATE_LIMIT'),
   proxyIpRateLimit: parsePositiveIntEnv('GATEWAY_PROXY_IP_RATE_LIMIT'),
   authFailRateLimit: parsePositiveIntEnv('GATEWAY_AUTH_FAIL_RATE_LIMIT'),
+  maxWsConnectionsPerIp: parseNonNegativeIntEnv('GATEWAY_MAX_WS_CONNECTIONS_PER_IP'),
 });
 
 server.listen(PORT, () => {
   console.log(`Gateway server listening on port ${PORT}`);
+  console.log(`Build: version=${buildInfo.version} commit=${buildInfo.commit} built=${buildInfo.buildTime} protocol=v${buildInfo.protocolVersion}`);
   console.log(`WebSocket endpoint: ws://localhost:${PORT}/ws`);
   if (ADMIN_UI_DIR) {
     console.log(`Admin web UI: http://localhost:${PORT}/admin (static dir: ${ADMIN_UI_DIR})`);

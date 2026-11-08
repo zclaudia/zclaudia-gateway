@@ -6,12 +6,15 @@
  */
 
 export type {
+  AdminBackendDisconnectEvent,
+  AdminBackendDisconnectReason,
   AdminCredentialCounters,
   AdminOverview,
   AdminOverviewPeer,
   AdminBackendIdentity as BackendIdentity,
   AdminSessionInfo,
   BindBackendCredentialRequest,
+  GatewayBuildInfo,
   IssueCredentialRequest,
   IssuedGatewayCredential as IssuedCredential,
   RevokeCredentialsRequest,

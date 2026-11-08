@@ -17,6 +17,7 @@ import {
   dialChannel,
   GatewayChannel,
   toWsBase,
+  waitForSocketOpen,
   type SocketFactory,
   type WebSocketLike,
 } from '@zclaudia/gateway-client';
@@ -55,6 +56,12 @@ export interface GatewayBackendOptions {
   reconnect?: boolean;
   reconnectMinMs?: number;
   reconnectMaxMs?: number;
+  /**
+   * Bound for each connect phase: waiting for the socket to open, waiting
+   * for `peer_ready`, and dialing an offered channel's data socket.
+   * Default 10_000.
+   */
+  connectTimeoutMs?: number;
 }
 
 export type GatewayBackendState = 'idle' | 'connecting' | 'connected' | 'closed';
@@ -180,6 +187,7 @@ export class GatewayBackend {
   private readonly opts: GatewayBackendOptions;
   private readonly factory: SocketFactory;
   private readonly wsBase: string;
+  private readonly connectTimeoutMs: number;
   private socket: WebSocketLike | null = null;
   private backendId = '';
   private epoch = 0;
@@ -190,6 +198,18 @@ export class GatewayBackend {
   private state: GatewayBackendState = 'idle';
   private failure: BackendErrorInfo | null = null;
   private reconnectAttempt = 0;
+  /**
+   * Lifecycle generation: bumped by close() and by every fresh attempt.
+   * In-flight attempts capture it at start and abort (close their socket,
+   * never adopt a late result) once it changes — a close()d backend cannot
+   * be revived by a late open/peer_ready, and a pending reconnect timer
+   * cannot race a fresh connect into a second socket.
+   */
+  private generation = 0;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private inFlight: Promise<{ backendId: string; epoch: number }> | null = null;
+  /** Aborts in-flight channel-offer dials when the backend closes. */
+  private readonly offerDialAborts = new Set<AbortController>();
   /**
    * Access token exchanged from a zgb_ enrollment credential, reused across
    * reconnects until shortly before it expires: every exchange rotates the
@@ -207,6 +227,7 @@ export class GatewayBackend {
     this.opts = options;
     this.factory = options.socketFactory ?? defaultSocketFactory;
     this.wsBase = toWsBase(options.url);
+    this.connectTimeoutMs = options.connectTimeoutMs ?? 10_000;
   }
 
   get id(): string { return this.backendId; }
@@ -257,6 +278,9 @@ export class GatewayBackend {
   }
 
   private setState(state: GatewayBackendState): void {
+    // Transitions only: a repeated close() must not re-emit 'closed' to
+    // state handlers.
+    if (this.state === state) return;
     this.state = state;
     for (const handler of this.stateHandlers) handler(state);
   }
@@ -313,13 +337,26 @@ export class GatewayBackend {
     });
   }
 
-  async connect(): Promise<{ backendId: string; epoch: number }> {
+  /**
+   * Connect, register and start heartbeating. The returned promise settles
+   * exactly once: resolved with the assigned identity, rejected when any
+   * phase fails, times out (per `connectTimeoutMs`), is aborted via
+   * `signal`, or the backend is closed mid-connect. A failed initial
+   * connect leaves the backend in `'idle'` (retryable) — never a wedged
+   * `'connecting'`. While an attempt is already running (manual or
+   * background), concurrent calls await that same attempt.
+   */
+  async connect(options: { signal?: AbortSignal } = {}): Promise<{ backendId: string; epoch: number }> {
+    if (this.inFlight) return this.inFlight;
     this.closed = false;
     this.failure = null;
     try {
-      return await this.establish();
+      return await this.startAttempt(options.signal);
     } catch (error) {
       this.recordFailure(error);
+      // A failed manual connect ends retryable ('idle') unless close() or a
+      // background reconnect cycle has since taken over the lifecycle.
+      if (!this.closed && this.inFlight === null && this.reconnectTimer === null) this.setState('idle');
       throw error;
     }
   }
@@ -329,29 +366,46 @@ export class GatewayBackend {
     this.failure = describeFailure(error);
   }
 
-  private async establish(): Promise<{ backendId: string; epoch: number }> {
+  /** Start (or join) the single current connection attempt. */
+  private startAttempt(signal?: AbortSignal): Promise<{ backendId: string; epoch: number }> {
+    if (this.inFlight) return this.inFlight;
+    // A fresh attempt supersedes any pending reconnect timer.
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    const generation = ++this.generation;
+    // Only one attempt is ever tracked: the entry guard above ensures it, so
+    // its finally may clear the field unconditionally.
+    const run = this.establish(generation, signal).finally(() => { this.inFlight = null; });
+    this.inFlight = run;
+    return run;
+  }
+
+  private async establish(generation: number, signal?: AbortSignal): Promise<{ backendId: string; epoch: number }> {
     this.setState('connecting');
     // Resolved on every attempt, but an unexpired exchanged access token is
     // reused rather than exchanged again (see resolveCredential).
     const { credential, cached } = await this.resolveCredential();
+    if (this.closed || generation !== this.generation) throw new AttemptError('CONNECT_FAILED', 'Closed while connecting');
     try {
-      return await this.attempt(credential);
+      return await this.attempt(credential, generation, signal);
     } catch (error) {
       // The gateway no longer accepts the cached token (revoked, its database
       // replaced, ...): drop it and exchange afresh within this attempt. A
       // refused enrollment credential still fails the attempt.
       if (!cached || !(error instanceof AttemptError) || error.gatewayCode !== 'UNAUTHORIZED') throw error;
       this.accessToken = null;
-      return await this.attempt((await this.resolveCredential()).credential);
+      return await this.attempt((await this.resolveCredential()).credential, generation, signal);
     }
   }
 
-  private async attempt(credential: string): Promise<{ backendId: string; epoch: number }> {
+  private async attempt(credential: string, generation: number, signal?: AbortSignal): Promise<{ backendId: string; epoch: number }> {
     const socket = this.factory(`${this.wsBase}/ws`);
     socket.binaryType = 'arraybuffer';
     this.socket = socket;
     try {
-      return await this.handshake(socket, credential);
+      return await this.handshake(socket, credential, generation, signal);
     } catch (error) {
       // A failed attempt must not leave a half-open socket behind: the retry
       // loop would otherwise stack one per attempt.
@@ -361,20 +415,36 @@ export class GatewayBackend {
     }
   }
 
-  private async handshake(socket: WebSocketLike, credential: string): Promise<{ backendId: string; epoch: number }> {
-    await new Promise<void>((resolve, reject) => {
-      socket.addEventListener('open', () => resolve());
-      socket.addEventListener('error', () => reject(new AttemptError('GATEWAY_UNREACHABLE', 'WebSocket error')));
+  private async handshake(
+    socket: WebSocketLike,
+    credential: string,
+    generation: number,
+    signal?: AbortSignal,
+  ): Promise<{ backendId: string; epoch: number }> {
+    await waitForSocketOpen(socket, { timeoutMs: this.connectTimeoutMs, signal }).catch((error: unknown) => {
+      // No usable link: never opened, closed before open, timed out, or aborted.
+      throw new AttemptError('GATEWAY_UNREACHABLE', error instanceof Error ? error.message : 'WebSocket failed to open');
     });
+    if (this.closed || generation !== this.generation) throw new AttemptError('CONNECT_FAILED', 'Closed while connecting');
 
     const ready = new Promise<PeerReadyV4>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new AttemptError('HANDSHAKE_TIMEOUT', 'peer_ready timeout')), 10_000);
-      socket.addEventListener('message', (event) => {
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(new AttemptError('HANDSHAKE_TIMEOUT', 'peer_ready timeout'));
+      }, this.connectTimeoutMs);
+      const onAbort = () => {
+        cleanup();
+        reject(signal!.reason);
+      };
+      const onMessage = (event: { data: unknown }) => {
         if (typeof event.data !== 'string') return;
-        const msg = JSON.parse(event.data);
-        if (msg.type === 'peer_ready') { clearTimeout(timer); resolve(msg); }
-        else if (msg.type === 'gateway_error') {
-          clearTimeout(timer);
+        let msg: Record<string, unknown> & { type?: string };
+        try { msg = JSON.parse(event.data); } catch { return; }
+        if (msg.type === 'peer_ready') {
+          cleanup();
+          resolve(msg as unknown as PeerReadyV4);
+        } else if (msg.type === 'gateway_error') {
+          cleanup();
           const code = String(msg.code);
           reject(new AttemptError(
             code === 'UNAUTHORIZED' ? 'AUTH_FAILED' : 'GATEWAY_REJECTED',
@@ -382,14 +452,20 @@ export class GatewayBackend {
             code,
           ));
         }
-      });
-      socket.addEventListener('close', () => {
-        clearTimeout(timer);
+      };
+      const onClose = () => {
+        cleanup();
         reject(new AttemptError('GATEWAY_UNREACHABLE', 'Connection closed before peer_ready'));
-      });
+      };
+      function cleanup() {
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
+      }
+      socket.addEventListener('message', onMessage);
+      socket.addEventListener('close', onClose);
+      signal?.addEventListener('abort', onAbort, { once: true });
     });
 
-    ready.catch(() => { /* surfaced by `await ready` below */ });
     socket.send(JSON.stringify({
       type: 'peer_hello',
       protocolVersion: GATEWAY_PROTOCOL_V4,
@@ -406,6 +482,9 @@ export class GatewayBackend {
     }));
 
     const readyMsg = await ready;
+    // A late peer_ready must not revive a closed backend (identity,
+    // listeners, or the heartbeat timer).
+    if (this.closed || generation !== this.generation) throw new AttemptError('CONNECT_FAILED', 'Closed while connecting');
     if (!readyMsg.backend) throw new AttemptError('PROTOCOL_ERROR', 'Gateway did not assign a backend identity');
     this.backendId = readyMsg.backend.backendId;
     this.epoch = readyMsg.backend.epoch;
@@ -420,6 +499,7 @@ export class GatewayBackend {
     socket.addEventListener('close', (event) => this.handleClose(socket, event?.code));
 
     const interval = this.opts.heartbeatIntervalMs ?? 10_000;
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.heartbeatTimer = setInterval(() => {
       if (this.socket && this.socket.readyState === 1) {
         this.socket.send(JSON.stringify({ type: 'backend_heartbeat', epoch: this.epoch, observedAt: Date.now() }));
@@ -438,6 +518,7 @@ export class GatewayBackend {
     if (this.heartbeatTimer) { clearInterval(this.heartbeatTimer); this.heartbeatTimer = null; }
     if (code === GATEWAY_CLOSE_BACKEND_REPLACED && !this.closed) {
       // Replaced, not dropped: stand down rather than replace the newer one back.
+      this.generation += 1; // invalidate anything still in flight
       this.failure = { code: 'REPLACED', message: ERROR_MESSAGES.REPLACED, occurredAt: Date.now() };
       this.setState('closed');
       return;
@@ -451,14 +532,20 @@ export class GatewayBackend {
   }
 
   private scheduleReconnect(): void {
+    const generation = this.generation;
     const minMs = this.opts.reconnectMinMs ?? 1000;
     const maxMs = this.opts.reconnectMaxMs ?? 30_000;
     const delay = Math.min(minMs * 2 ** this.reconnectAttempt, maxMs);
     this.reconnectAttempt += 1;
-    setTimeout(() => {
-      if (this.closed) return;
-      this.establish().catch((error: unknown) => {
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (this.closed || generation !== this.generation) return;
+      this.startAttempt().catch((error: unknown) => {
         this.recordFailure(error);
+        // Keep retrying unless a newer attempt (manual connect) or close()
+        // has taken over the lifecycle.
+        if (this.closed || this.inFlight !== null) return;
         this.scheduleReconnect();
       });
     }, delay);
@@ -506,11 +593,23 @@ export class GatewayBackend {
       this.socket?.send(JSON.stringify({ type: 'channel_reject', channelId: offer.channelId, reason: 'no_handler' }));
       return;
     }
+    const controller = new AbortController();
+    this.offerDialAborts.add(controller);
     try {
-      const channel = await dialChannel(this.wsBase, offer.dataPath, offer.ticket, offer.channelId, this.factory, offer.kind);
+      const channel = await dialChannel(this.wsBase, offer.dataPath, offer.ticket, offer.channelId, this.factory, offer.kind, {
+        timeoutMs: this.connectTimeoutMs,
+        signal: controller.signal,
+      });
+      if (this.closed) {
+        // close() won the race: the dial finished, but the backend is gone.
+        channel.close();
+        return;
+      }
       handler(channel, { channelId: offer.channelId, kind: offer.kind, sourcePeerSessionId: offer.sourcePeerSessionId });
     } catch {
       this.socket?.send(JSON.stringify({ type: 'channel_reject', channelId: offer.channelId, reason: 'dial_failed' }));
+    } finally {
+      this.offerDialAborts.delete(controller);
     }
   }
 
@@ -519,8 +618,22 @@ export class GatewayBackend {
     this.socket.send(JSON.stringify({ type: 'topic_publish', topic, payload, retain: options?.retain }));
   }
 
+  /**
+   * Close for good. Idempotent. In-flight work ends definitively: the
+   * socket is closed (a connecting attempt rejects promptly), channel-offer
+   * dials are aborted, and a late open/peer_ready can never re-enter
+   * `'connected'` or restart heartbeats. Being REPLACED keeps its own
+   * stand-down semantics (see {@link lastError}).
+   */
   close(): void {
     this.closed = true;
+    this.generation += 1; // invalidate in-flight attempts and pending timers
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    for (const controller of this.offerDialAborts) controller.abort(new Error('Backend closed during channel dial'));
+    this.offerDialAborts.clear();
     this.setState('closed');
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.heartbeatTimer = null;

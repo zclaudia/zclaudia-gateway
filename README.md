@@ -40,7 +40,7 @@ mobile ── HTTP /api/proxy ┘      │
 - 撤销立即生效：在线连接被断开（close 1008），后续认证被拒；撤销 `zgb_*` 级联撤销其交换出的 `zga_*`。
 - 凭证在 WS（`peer_hello.gatewaySecret` 字段，名称保留以稳定 wire）与 HTTP（`Bearer <token>`）两侧通用。
 - 管理端点（需 `GATEWAY_ADMIN_TOKEN`，必填——它是签发凭证的信任根）：`POST/GET /api/admin/credentials`、`DELETE /api/admin/credentials/:id`（吊销）、`POST /api/admin/credentials/revoke`（批量吊销，`{ids}`；未知或已吊销的 id 跳过并在 `skipped` 中返回）、`POST /api/admin/credentials/purge`（永久删除已吊销凭证，可传 `ids`，缺省清理全部）；`POST /api/admin/credentials/:id/bind`（旧版后端凭证原地绑定）、`PATCH /api/admin/credentials/:id`（修改设备后端范围）、`GET /api/admin/backends` 与 `DELETE /api/admin/backends/:backendId`（后端身份列表与清理）；命令行封装见 [scripts/gateway-admin.sh](scripts/gateway-admin.sh)（`issue-backend` / `issue-device` / `list` / `backends` / `bind` / `scope` / `forget-backend` / `revoke` / `purge`，自动读取 `.env`）。
-- **Web 管理控制台**（[ADR-0005](docs/adr/0005-admin-web-ui.md)）：容器镜像内置 UI，访问 `/admin`（本地 `http://localhost:3200/admin`）用管理员令牌登录，即可签发、吊销（支持勾选批量吊销）凭证、设置设备的后端范围、查看在线连接与凭证状态，在“后端”页管理后端身份，并按观测结果迁移旧版后端凭证（[ADR-0009](docs/adr/0009-credential-bound-backend-identity.md)）。登录用令牌换取 HttpOnly + SameSite=Strict 会话 Cookie（默认 12h，重启即登出），令牌本身不落浏览器；`/api/admin/*` 同时继续接受 Bearer 令牌，CLI 不受影响。源码在 [packages/admin-ui](packages/admin-ui)，开发用 `pnpm --filter @zclaudia/admin-ui dev`；非容器部署需设置 `GATEWAY_ADMIN_UI_DIR` 指向构建产物（`pnpm --filter @zclaudia/admin-ui build`）。
+- **Web 管理控制台**（[ADR-0005](docs/adr/0005-admin-web-ui.md)）：容器镜像内置 UI，访问 `/admin`（本地 `http://localhost:3200/admin`）用管理员令牌登录，即可签发、吊销（支持勾选批量吊销）凭证、设置设备的后端范围、查看运行构建、在线连接、Channel 数与最近 Backend 断线原因（见“构建信息与连接诊断”），在“后端”页管理后端身份，并按观测结果迁移旧版后端凭证（[ADR-0009](docs/adr/0009-credential-bound-backend-identity.md)）。登录用令牌换取 HttpOnly + SameSite=Strict 会话 Cookie（默认 12h，重启即登出），令牌本身不落浏览器；`/api/admin/*` 同时继续接受 Bearer 令牌，CLI 不受影响。源码在 [packages/admin-ui](packages/admin-ui)，开发用 `pnpm --filter @zclaudia/admin-ui dev`；非容器部署需设置 `GATEWAY_ADMIN_UI_DIR` 指向构建产物（`pnpm --filter @zclaudia/admin-ui build`）。
 
 ## 本地开发
 
@@ -65,11 +65,46 @@ docker compose up -d        # 容器部署（读取 .env）
 | `GATEWAY_PROXY_RATE_LIMIT` | | `1200` | 已认证代理请求按**凭证（租户）**的每 60s 限额：同一租户的设备共享额度，互相不占用（旧版默认 200 且按客户端 IP 计，NAT 后多设备共用出口 IP 时极易误伤，故上调并改按租户）；429 响应带 `Retry-After` |
 | `GATEWAY_PROXY_IP_RATE_LIMIT` | | 无（关闭） | 可选的每客户端 IP 代理请求上限（每 60s，跨该 IP 上所有凭证求和）：只用于压制单一来源持有很多凭证的情况，不用于限制正常用量 |
 | `GATEWAY_AUTH_FAIL_RATE_LIMIT` | | `10` | 未认证请求（任何路由返回 401 的尝试）每客户端 IP 每 60s 的额度，超过后所有路由一律回 429（暴力破解保护） |
+| `GATEWAY_MAX_WS_CONNECTIONS_PER_IP` | | `10` | 每客户端 IP 的**控制连接**（`/ws`）并发上限：从 TCP 建连（认证前，未认证连接同样占额）计到连接关闭，被拒绝的连接不占额；Channel 数据连接（`/channel/*`）是独立连接、不计入。`0` = 不限 |
 | `GATEWAY_ALLOWED_ORIGINS` | | 无（通配符） | 逗号分隔的 CORS Origin allowlist，设置后仅列表内 Origin 可跨域（带 credentials） |
 | `GATEWAY_ADMIN_UI_DIR` | | 无（容器镜像内默认 `/app/zclaudia/admin-ui`） | 管理控制台静态产物目录；未设置时网关为纯 API（见 [ADR-0005](docs/adr/0005-admin-web-ui.md)） |
 | `GATEWAY_ADMIN_SESSION_TTL_HOURS` | | `12` | 管理控制台会话时长（小时）；会话在内存中，重启即全部登出 |
 | `ZCLAUDIA_DATA_DIR` | | `~/.zclaudia` | SQLite 数据目录（实际路径 `<dir>/gateway/gateway.db`） |
 | `NTFY_*` | | 见 [.env.example](.env.example) 与 [src/index.ts](src/index.ts) | ntfy 推送通知配置。backend 事件发布到 `${NTFY_TOPIC}-${backendId}`（per-backend 路由，app 按订阅的后端各自订阅派生 topic）；ntfy topic 上限 64 字符，`NTFY_TOPIC` 需 ≤27 字符（启用通知时启动校验）。`POST /api/notifications/test` 可带 body `{"backendId"}` 指定派生 topic |
+
+### 构建信息与连接诊断
+
+运行构建标识（版本、commit、构建时间、协议版本）在**镜像构建时**经 `GATEWAY_BUILD_VERSION` / `GATEWAY_BUILD_COMMIT` / `GATEWAY_BUILD_TIME` 注入：Dockerfile 把同名 ARG 固化为运行时 ENV，docker compose 从 `.env` 透传同名变量作为 build args。运行时只读取环境变量，**不读取 `.git`、不执行 git 命令**；未注入的本地开发进程（`pnpm dev`）在启动日志与管理概览中明确显示 `unknown`——以此区分开发进程与真实部署。协议版本是代码常量（`GATEWAY_PROTOCOL_V4 = 4`），始终可知。
+
+```bash
+docker build \
+  --build-arg GATEWAY_BUILD_VERSION="$(node -p "require('./package.json').version")" \
+  --build-arg GATEWAY_BUILD_COMMIT="$(git rev-parse --short HEAD)" \
+  --build-arg GATEWAY_BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  -t zclaudia-gateway .
+```
+
+管理概览（`GET /api/admin/overview`）在原有字段之外返回：
+
+| 字段 | 含义 |
+| --- | --- |
+| `build.version` / `build.commit` / `build.buildTime` | 构建时注入的版本 / commit / 构建时间（ISO 8601）；未注入为 `"unknown"` |
+| `build.protocolVersion` | 服务端唯一支持的 Gateway Protocol 版本（当前 4） |
+| `diagnostics.channels` | 当前跟踪的 Channel 数（拨号中 + 已建立），复用网关既有连接状态 |
+| `diagnostics.recentBackendDisconnects` | 最近 20 条 Backend 控制连接断线记录（新→旧）：`{ at, backendId, reason }` |
+
+`reason` 为归一化枚举：`closed`（无特定服务器侧原因的连接关闭）、`replaced`（同 backendId 被新连接顶替，close 4001）、`lease_expired`（心跳停止、租约过期）、`ping_timeout`（控制连接 Ping 超时）、`credential_revoked`（凭证吊销，close 1008）。
+
+诊断状态在内存中且有界（最多 20 条），只记录 backendId 与归一化原因，不采集业务 payload、token 或 ticket；进程重启即清空。
+
+### 容量与慢消费者验证
+
+两层验证，职责分离：
+
+- **CI 回归**（每次 `pnpm test` 必跑）：[`src/__tests__/capacity-regression.test.ts`](src/__tests__/capacity-regression.test.ts) 以小规模、有界用例固定行为——每 IP 控制连接限额的默认值/自定义/额度释放/关闭、慢消费者不阻塞其他 Channel、取消与反复重连后诊断计数回落。这些是**严格保证**。
+- **持续负载验证**（显式运行，不进 CI）：`pnpm capacity` 启动隔离网关（临时端口、临时 SQLite、独立签发的 Echo Backend 与测试设备凭证，不触碰任何真实部署），跑多 Backend × 多设备 × 多 Channel 的 text/binary 双向 echo 饱和负载、慢消费者停滞/恢复、取消与重连 churn，并输出吞吐/RTT/内存趋势/连接与 Channel 峰值的 Markdown 报告。常用参数：`--duration-ms`、`--backends`、`--devices`、`--channels-per-device`、`--frame-bytes`、`--slow-mib`、`--out=<file>`。
+
+采样数字只反映当次运行环境（单机、单进程回环），不构成对部署容量的承诺；基线样例见 [docs/capacity-validation-2026-11-08.md](docs/capacity-validation-2026-11-08.md)。
 
 ## 显式约束（当前实现的已知边界）
 
@@ -94,7 +129,7 @@ docker compose up -d        # 容器部署（读取 .env）
 | --- | --- | ---: |
 | WS 最大消息 | 50 MB | `server.ts` maxPayload |
 | JSON 请求体 | 15 MB | `express.json` |
-| 每 IP WS 连接数 | 10 | `MAX_WS_CONNECTIONS_PER_IP` |
+| 每 IP WS 控制连接数 | 10（可配 `GATEWAY_MAX_WS_CONNECTIONS_PER_IP`，`0` = 不限） | `maxWsConnectionsPerIp` |
 | 未认证失败限流 | 10 次/分钟/IP（共享一个桶，含 WS 握手失败；`authFailRateLimit` 可配） | `AUTH_FAIL_LIMIT` |
 | 代理请求限流 | 1200 次/分钟/凭证（租户维度；`proxyRateLimit` 可配） | `PROXY_RATE_LIMIT` |
 | 代理请求 IP 兜底上限 | 默认关闭（`proxyIpRateLimit` 可选） | `PROXY_IP_RATE_LIMIT` |
@@ -123,7 +158,7 @@ docker compose up -d        # 容器部署（读取 .env）
 | 包 | 内容 |
 | --- | --- |
 | `@zclaudia/gateway-protocol` | v4 wire 类型与常量，零依赖 |
-| `@zclaudia/gateway-client` | 控制连接、Channel、Topic、指数退避重连（快速重开模型）、配对发现（`discoverBackends`）；面向 WHATWG WebSocket，可注入 socketFactory |
+| `@zclaudia/gateway-client` | 控制连接、Channel（含发送背压 `sendBounded`，见包 README）、Topic、指数退避重连（快速重开模型）、配对发现（`discoverBackends`）；面向 WHATWG WebSocket，可注入 socketFactory |
 | `@zclaudia/gateway-backend` | Backend 注册与心跳、channel offer 处理（拨号即接受）、Topic 发布、`serveHttp` HTTP channel 服务 |
 
 Python 后端可用官方 Python SDK（[packages/python](packages/python)，[ADR-0006](docs/adr/0006-python-backend-sdk.md)，PyPI 名 `zclaudia-gateway`）：`GatewayBackend` 等价实现注册/心跳/Channel/Topic/`serve_http`，asyncio + `websockets`，需 Python ≥ 3.11。

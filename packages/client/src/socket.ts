@@ -7,6 +7,13 @@
 export interface WebSocketLike {
   binaryType: string;
   readyState: number;
+  /**
+   * Bytes queued locally but not yet handed to the OS, when the
+   * implementation reports it (browser/undici/ws WebSocket all do). No
+   * implementation offers a drain event, so this is a poll-only signal;
+   * sockets without the property are treated as 0 (unobservable).
+   */
+  readonly bufferedAmount?: number;
   send(data: string | ArrayBufferLike | ArrayBufferView): void;
   close(code?: number, reason?: string): void;
   addEventListener(type: 'open', listener: () => void): void;
@@ -34,10 +41,44 @@ export function normalizeMessageData(data: unknown): string | Uint8Array {
   return new Uint8Array(data as ArrayBufferLike);
 }
 
-export function waitForSocketOpen(socket: WebSocketLike): Promise<void> {
+export interface WaitForOpenOptions {
+  /**
+   * Bound the wait for the open event; rejects with an Error on expiry.
+   * Default: unbounded (back-compat for external callers; the SDK always
+   * passes a bound).
+   */
+  timeoutMs?: number;
+  /** Rejects with the signal's reason when aborted. */
+  signal?: AbortSignal;
+}
+
+/**
+ * Wait for a socket to open. The socket itself stays the caller's
+ * responsibility: on any rejection the caller must close it (the SDK's
+ * connect/dial paths do). A close before open settles the wait — some stacks
+ * tear a failed connection down without ever firing error.
+ */
+export function waitForSocketOpen(socket: WebSocketLike, options: WaitForOpenOptions = {}): Promise<void> {
+  const { timeoutMs, signal } = options;
+  if (signal?.aborted) return Promise.reject(signal.reason);
   return new Promise((resolve, reject) => {
-    socket.addEventListener('open', () => resolve());
-    socket.addEventListener('error', (err) => reject(err instanceof Error ? err : new Error('WebSocket error')));
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finish = (settle: () => void) => {
+      if (settled) return;
+      settled = true;
+      if (timer !== undefined) clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      settle();
+    };
+    const onAbort = () => finish(() => reject(signal!.reason));
+    socket.addEventListener('open', () => finish(resolve));
+    socket.addEventListener('error', () => finish(() => reject(new Error('WebSocket error'))));
+    socket.addEventListener('close', () => finish(() => reject(new Error('WebSocket closed before open'))));
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (timeoutMs !== undefined) {
+      timer = setTimeout(() => finish(() => reject(new Error(`WebSocket open timeout after ${timeoutMs}ms`))), timeoutMs);
+    }
   });
 }
 

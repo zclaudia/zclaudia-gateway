@@ -42,8 +42,52 @@ export interface AdminCredentialCounters {
   byType: Record<string, number>;
 }
 
+/**
+ * Identity of the running gateway build. Values are injected at build time
+ * (image build); fields that were not injected read 'unknown' — local dev
+ * processes therefore identify themselves as unknown, by design. The
+ * protocol version is a code constant of the build, always known.
+ */
+export interface GatewayBuildInfo {
+  /** Package version at build time, or 'unknown'. */
+  version: string;
+  /** Source commit at build time, or 'unknown'. */
+  commit: string;
+  /** Build timestamp (ISO 8601), or 'unknown'. */
+  buildTime: string;
+  /** Gateway Protocol version this server speaks (peer_hello.protocolVersion). */
+  protocolVersion: number;
+}
+
+/**
+ * Normalized cause for a backend's control connection going away. Fixed
+ * enum: diagnostics never carry free-form text, payloads, tokens, or
+ * tickets.
+ */
+export type AdminBackendDisconnectReason =
+  /** Connection closed without a more specific server-side cause. */
+  | 'closed'
+  /** A newer connection for the same backendId took over (close 4001). */
+  | 'replaced'
+  /** Backend heartbeats stopped; the lease expired. */
+  | 'lease_expired'
+  /** Control WebSocket missed pongs. */
+  | 'ping_timeout'
+  /** The backend's credential was revoked (close 1008). */
+  | 'credential_revoked';
+
+/** One entry of AdminOverview.diagnostics.recentBackendDisconnects. */
+export interface AdminBackendDisconnectEvent {
+  /** Epoch milliseconds. */
+  at: number;
+  backendId: string;
+  reason: AdminBackendDisconnectReason;
+}
+
 /** GET /api/admin/overview data body. */
 export interface AdminOverview {
+  /** Identity of the running build (build-time injected; 'unknown' fields in dev). */
+  build: GatewayBuildInfo;
   /** Online backends. */
   backends: number;
   /** Known backend identities, online or not (ADR-0009). */
@@ -53,6 +97,16 @@ export interface AdminOverview {
   peers: AdminOverviewPeer[];
   credentials: AdminCredentialCounters;
   uptimeSec: number;
+  /**
+   * Live connection diagnostics: in-memory, bounded, and derived from the
+   * existing connection state (no independent tracking).
+   */
+  diagnostics: {
+    /** Channels currently tracked (dialing or established). */
+    channels: number;
+    /** Most recent backend disconnects, newest first, capped by the server. */
+    recentBackendDisconnects: AdminBackendDisconnectEvent[];
+  };
 }
 
 // ============================================================================

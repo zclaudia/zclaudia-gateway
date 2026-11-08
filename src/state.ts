@@ -42,6 +42,13 @@ export interface PeerSession {
   name: string;
   recoveryToken: string;
   isAlive: boolean;
+  /**
+   * Diagnostics hint: the administratively initiated close cause (credential
+   * revocation), set when the server initiates the close and consumed by the
+   * disconnect handler when the close event fires. Undefined for organic
+   * disconnects.
+   */
+  closeReasonHint?: 'credential_revoked';
 
   /** If peerType === 'client+backend', the registered backend info. */
   backendId?: BackendId;

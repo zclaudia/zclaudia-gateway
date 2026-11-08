@@ -57,6 +57,16 @@ COPY --from=builder /app/zclaudia/packages/admin-ui/dist admin-ui
 # Create data directories
 RUN mkdir -p /data/gateway /data/files
 
+# Build identity, baked in at image build time (docker build --build-arg …).
+# The runtime image carries no .git and the server never executes git: empty
+# args surface as 'unknown' in the admin overview and startup log.
+ARG GATEWAY_BUILD_VERSION=""
+ARG GATEWAY_BUILD_COMMIT=""
+ARG GATEWAY_BUILD_TIME=""
+ENV GATEWAY_BUILD_VERSION=${GATEWAY_BUILD_VERSION} \
+    GATEWAY_BUILD_COMMIT=${GATEWAY_BUILD_COMMIT} \
+    GATEWAY_BUILD_TIME=${GATEWAY_BUILD_TIME}
+
 # SQLite data and file storage will be persisted via volume
 ENV GATEWAY_PORT=3200
 ENV HOME=/data

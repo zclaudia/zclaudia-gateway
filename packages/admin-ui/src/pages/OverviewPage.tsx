@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react';
 import { api, localizeApiError } from '../api.js';
-import { formatUptime } from '../format.js';
+import { formatDateTime, formatUptime } from '../format.js';
 import { useI18n, type MsgKey } from '../i18n.js';
-import type { CredentialType, Overview } from '../types.js';
+import type { AdminBackendDisconnectReason, CredentialType, Overview } from '../types.js';
 
 const REFRESH_MS = 30_000;
 
@@ -13,6 +13,20 @@ const TYPE_KEYS: Record<CredentialType, MsgKey> = {
   backend: 'type.backend',
   'backend-access': 'type.backendAccess',
 };
+
+const DISCONNECT_REASON_KEYS: Record<AdminBackendDisconnectReason, MsgKey> = {
+  closed: 'disc.closed',
+  replaced: 'disc.replaced',
+  lease_expired: 'disc.lease_expired',
+  ping_timeout: 'disc.ping_timeout',
+  credential_revoked: 'disc.credential_revoked',
+};
+
+/** 'unknown' (uninjected dev build) renders verbatim; ISO timestamps render locally. */
+function formatBuildTime(buildTime: string): string {
+  const ts = Date.parse(buildTime);
+  return Number.isNaN(ts) ? buildTime : formatDateTime(ts);
+}
 
 export function OverviewPage({ onSessionLost }: { onSessionLost: (err: unknown) => void }) {
   const { t } = useI18n();
@@ -103,6 +117,16 @@ export function OverviewPage({ onSessionLost }: { onSessionLost: (err: unknown) 
       </div>
 
       <section className="panel">
+        <h3>{t('overview.build')}</h3>
+        <div className="badge-row">
+          <span className="badge">{t('overview.buildVersion')}: <code>{overview.build.version}</code></span>
+          <span className="badge">{t('overview.buildCommit')}: <code>{overview.build.commit}</code></span>
+          <span className="badge">{t('overview.buildTime')}: {formatBuildTime(overview.build.buildTime)}</span>
+          <span className="badge">{t('overview.protocolVersion')}: v{overview.build.protocolVersion}</span>
+        </div>
+      </section>
+
+      <section className="panel">
         <h3>{t('overview.typeDistribution')}</h3>
         <div className="badge-row">
           {CREDENTIAL_TYPES.map((type) => (
@@ -111,6 +135,40 @@ export function OverviewPage({ onSessionLost }: { onSessionLost: (err: unknown) 
             </span>
           ))}
         </div>
+      </section>
+
+      <section className="panel">
+        <h3>{t('overview.diagnostics')}</h3>
+        <div className="badge-row">
+          <span className="badge">{t('overview.channels')}: {overview.diagnostics.channels}</span>
+        </div>
+        <h3>{t('overview.recentDisconnects', { count: overview.diagnostics.recentBackendDisconnects.length })}</h3>
+        {overview.diagnostics.recentBackendDisconnects.length === 0 ? (
+          <p className="muted">{t('overview.noDisconnects')}</p>
+        ) : (
+          <table className="table">
+            <thead>
+              <tr>
+                <th>{t('overview.disconnectAt')}</th>
+                <th>{t('overview.backendId')}</th>
+                <th>{t('overview.disconnectReason')}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {overview.diagnostics.recentBackendDisconnects.map((event, index) => (
+                <tr key={`${event.backendId}-${event.at}-${index}`}>
+                  <td>{formatDateTime(event.at)}</td>
+                  <td><code>{event.backendId.slice(0, 8)}…</code></td>
+                  <td>
+                    <span className={`badge badge-disc-${event.reason}`}>
+                      {t(DISCONNECT_REASON_KEYS[event.reason])}
+                    </span>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
       </section>
 
       <section className="panel">

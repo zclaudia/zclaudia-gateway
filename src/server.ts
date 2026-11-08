@@ -24,9 +24,15 @@ import type {
 } from '@zclaudia/gateway-protocol';
 import { GATEWAY_CLOSE_BACKEND_REPLACED } from '@zclaudia/gateway-protocol';
 import type {
+  AdminBackendDisconnectEvent,
+  AdminBackendDisconnectReason,
+  GatewayBuildInfo,
+} from '@zclaudia/gateway-protocol/admin';
+import type {
   GatewayNotificationConfig as NotificationConfig,
   PushNotificationRequestMessage,
 } from '@zclaudia/gateway-protocol/notifications';
+import { readBuildInfoFromEnv } from './build-info.js';
 import { GatewayStorage, CREDENTIAL_TOKEN_PREFIXES, type CredentialInfo, type CredentialType } from './storage.js';
 import { validateGatewayMessage, filterProxyResponseHeaders, PROXY_REQUEST_HEADER_ALLOWLIST } from './validation.js';
 import { GatewayState, type PeerSession } from './state.js';
@@ -47,6 +53,11 @@ interface GatewayConfig {
    * no peer could ever connect.
    */
   adminToken: string;
+  /**
+   * Build identity surfaced on the admin overview and startup log. Defaults
+   * to the build-time env injection ('unknown' fields when not injected).
+   */
+  buildInfo?: GatewayBuildInfo;
   /** TTL for exchanged backend access credentials. Default 24h. */
   backendAccessTokenTtlMs?: number;
   notificationConfig?: Partial<NotificationConfig>;
@@ -81,6 +92,14 @@ interface GatewayConfig {
    * route answers 429 instead of 401 (brute-force protection). Default 10.
    */
   authFailRateLimit?: number;
+  /**
+   * Max concurrent control-plane (/ws) WebSocket connections per client IP.
+   * Counted from the TCP accept (pre-auth — unauthenticated connections hold
+   * quota too) until the socket closes; rejected connections never consume
+   * quota. Channel data-plane dials (/channel/*) are separate connections
+   * and are not counted. Default 10; 0 disables the cap.
+   */
+  maxWsConnectionsPerIp?: number;
   /** Trust X-Forwarded-For header for IP extraction. Only enable behind a trusted reverse proxy. */
   trustProxy?: boolean;
   /**
@@ -162,6 +181,21 @@ export function createGatewayServer(config: GatewayConfig): Server {
   const storage = config.storage ?? new GatewayStorage();
   const pushNotificationService = new GatewayPushNotificationService(config.notificationConfig);
   const state = new GatewayState();
+  const buildInfo = config.buildInfo ?? readBuildInfoFromEnv();
+  // --- Backend disconnect diagnostics (bounded, in-memory) ---
+  // Reuses the existing connection lifecycle — no independent connection
+  // tracking, and only backendId + a normalized reason: no payloads, tokens,
+  // or tickets are ever recorded. Lost on restart, same as all peer state.
+  const MAX_RECENT_BACKEND_DISCONNECTS = 20;
+  const recentBackendDisconnects: AdminBackendDisconnectEvent[] = [];
+
+  function noteBackendDisconnect(backendId: string, reason: AdminBackendDisconnectReason): void {
+    recentBackendDisconnects.unshift({ at: Date.now(), backendId, reason });
+    if (recentBackendDisconnects.length > MAX_RECENT_BACKEND_DISCONNECTS) {
+      recentBackendDisconnects.length = MAX_RECENT_BACKEND_DISCONNECTS;
+    }
+  }
+
   const recoveryTokens = new Map<string, string>();
   const authTimeoutMs = config.authTimeoutMs ?? 10_000;
   const proxyRequestTimeoutMs = config.proxyRequestTimeoutMs ?? 30_000;
@@ -707,6 +741,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
     res.json({
       success: true,
       data: {
+        build: buildInfo,
         backends: state.registry.items.size,
         backendIdentities: storage.listBackendIdentities().length,
         legacyBackendCredentials: credentials.filter((c) => c.type === 'backend' && c.revokedAt === null && c.backendId === null).length,
@@ -721,6 +756,11 @@ export function createGatewayServer(config: GatewayConfig): Server {
         })),
         credentials: counters,
         uptimeSec: Math.floor(process.uptime()),
+        diagnostics: {
+          // Live set reuse: pairing (not yet dialed) and established channels.
+          channels: channels.size,
+          recentBackendDisconnects: [...recentBackendDisconnects],
+        },
       },
     });
   });
@@ -906,6 +946,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
     for (const peer of state.peers.values()) {
       if (peer.credentialId && revokedSet.has(peer.credentialId)) {
         audit('credential.peer_disconnected', { id: peer.credentialId, peerSessionId: peer.peerSessionId });
+        peer.closeReasonHint = 'credential_revoked';
         peer.ws.close(1008, 'Credential revoked');
       }
     }
@@ -1060,7 +1101,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
   const httpServer = createHttpServer(app);
   const sockets = new Set<Socket>();
   const wsConnectionsPerIp = new Map<string, number>();
-  const MAX_WS_CONNECTIONS_PER_IP = 10;
+  const maxWsConnectionsPerIp = config.maxWsConnectionsPerIp ?? 10;
   // Control plane (/ws) and data plane (/channel/:id) are separate WS
   // servers routed manually off the single HTTP server (ADR-0003).
   const wss = new WebSocketServer({ noServer: true, maxPayload: 50 * 1024 * 1024 });
@@ -1521,7 +1562,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
 
   const pingInterval = setInterval(() => {
     state.peers.forEach((peer, peerSessionId) => {
-      if (!peer.isAlive) { console.log(`[Gateway] Peer ${peerSessionId} ping timeout`); handlePeerDisconnect(peerSessionId); return; }
+      if (!peer.isAlive) { console.log(`[Gateway] Peer ${peerSessionId} ping timeout`); handlePeerDisconnect(peerSessionId, 'ping_timeout'); return; }
       peer.isAlive = false; peer.ws.ping();
     });
   }, 30_000);
@@ -1543,7 +1584,9 @@ export function createGatewayServer(config: GatewayConfig): Server {
   wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
     const ip = extractIp(req);
     const currentCount = wsConnectionsPerIp.get(ip) || 0;
-    if (currentCount >= MAX_WS_CONNECTIONS_PER_IP) { ws.close(1008, 'Too many connections'); return; }
+    // Pre-auth cap: an unauthenticated connection holds quota until it
+    // closes (auth timeout or error), and a rejected one never counts.
+    if (maxWsConnectionsPerIp > 0 && currentCount >= maxWsConnectionsPerIp) { ws.close(1008, 'Too many connections'); return; }
     wsConnectionsPerIp.set(ip, currentCount + 1);
     let peerSessionId: string | null = null;
     const authTimeout = setTimeout(() => { if (!peerSessionId) ws.close(1008, 'Authentication timeout'); }, authTimeoutMs);
@@ -1860,6 +1903,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
     const lease = state.leases.get(backendId);
     if (!lease) return;
     const peer = state.peers.get(lease.peerSessionId);
+    noteBackendDisconnect(backendId, 'lease_expired');
     closeChannelsForBackend(backendId, 'backend_offline');
     removeTopicsForBackend(backendId);
     state.registryRemove(backendId);
@@ -1875,11 +1919,14 @@ export function createGatewayServer(config: GatewayConfig): Server {
     }
   }
 
-  function handlePeerDisconnect(peerSessionId: string): void {
+  function handlePeerDisconnect(peerSessionId: string, reason: AdminBackendDisconnectReason = 'closed'): void {
     const peer = state.peers.get(peerSessionId);
     if (!peer) return;
     audit('peer.disconnected', { peerSessionId, namespace: peer.namespace, backendId: peer.backendId ?? 'none' });
     if (peer.backendId && isCurrentBackendOwner(peer)) {
+      // An administratively initiated close (revocation) names its own cause;
+      // anything else falls back to the reason of the disconnect call site.
+      noteBackendDisconnect(peer.backendId, peer.closeReasonHint ?? reason);
       // Close backend-side channels first so they carry backend_offline,
       // not the generic per-peer 'closed' from the cleanup below.
       closeChannelsForBackend(peer.backendId, 'backend_offline');
@@ -1936,6 +1983,7 @@ export function createGatewayServer(config: GatewayConfig): Server {
   ): void {
     // v4: the gateway is the authority on epoch invalidation — all channels
     // bound to the previous epoch are closed here, not inferred client-side.
+    noteBackendDisconnect(backendId, 'replaced');
     closeChannelsForBackend(backendId, 'epoch_changed');
     removeTopicsForBackend(backendId);
     state.removeLease(backendId);
